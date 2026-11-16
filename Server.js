@@ -8821,3 +8821,186 @@ handleProtectedRoutes=async function(request,env,ctx,route){
   }
   return await ciChapter15RoutesBeforeFallback(request,env,ctx,route);
 };
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 16 — CANAL TELEGRAM PRIVÉ, ALERTES CONTRÔLÉES ET HISTORIQUE       */
+/* -------------------------------------------------------------------------- */
+
+const CI_TELEGRAM_ALERT_CATEGORIES = [
+  "critical_security","new_token","liquidity_change","whale_activity",
+  "investment_opportunity","prediction","system"
+];
+
+
+async function ensureCITelegramTables(db){
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_telegram_alert_queue (
+      alert_id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE,
+      category TEXT NOT NULL, asset_name TEXT, asset_symbol TEXT,
+      chain TEXT, contract_address TEXT, details TEXT NOT NULL,
+      app_url TEXT, status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+      telegram_message_id TEXT, last_error TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, sent_at TEXT
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_telegram_queue_ready ON ci_telegram_alert_queue(status,next_attempt_at,created_at)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_telegram_alert_history (
+      history_id TEXT PRIMARY KEY, alert_id TEXT NOT NULL,
+      category TEXT NOT NULL, asset_symbol TEXT, chain TEXT,
+      contract_address TEXT, status TEXT NOT NULL,
+      telegram_message_id TEXT, error TEXT, event_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_telegram_history_date ON ci_telegram_alert_history(event_at DESC)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_telegram_rate_limits (
+      category TEXT NOT NULL, dedupe_key TEXT NOT NULL,
+      last_sent_at TEXT NOT NULL, PRIMARY KEY(category,dedupe_key)
+    )`)
+  ]);
+}
+
+function ciTelegramAssetIdentity(asset){
+  return [
+    safeString(asset?.chain||"unknown",60).toLowerCase(),
+    safeString(asset?.contract_address||asset?.pair_address||asset?.symbol||asset?.name||"unknown",160).toLowerCase()
+  ].join(":");
+}
+
+function ciTelegramDedupeKey(asset,category,details){
+  const identity=ciTelegramAssetIdentity(asset);
+  const normalized=safeString(details||"",2000).toLowerCase().replace(/\\s+/g," ").trim();
+  let hash=2166136261;
+  const source=category+":"+identity+":"+normalized;
+  for(let i=0;i<source.length;i++){hash^=source.charCodeAt(i);hash=Math.imul(hash,16777619);}
+  return category+":"+identity+":"+((hash>>>0).toString(16));
+}
+
+async function enqueueCITelegramAlert(db,body,env){
+  await ensureCITelegramTables(db);
+  const asset=body.asset||{};
+  const category=safeString(body.category||"",60).toLowerCase();
+  const details=safeString(body.details||"",2000).trim();
+  if(!CI_TELEGRAM_ALERT_CATEGORIES.includes(category))throw new Error("Catégorie d'alerte non autorisée.");
+  if(!details)throw new Error("Le détail de l'alerte est obligatoire.");
+  const name=safeString(asset.name||"Token inconnu",100);
+  const symbol=safeString(asset.symbol||"N/A",30);
+  const chain=safeString(asset.chain||"Chaîne inconnue",60);
+  const contract=safeString(asset.contract_address||asset.pair_address||"",160);
+  if(!asset.name&&!asset.symbol&&!asset.contract_address)throw new Error("L'alerte doit identifier son actif.");
+  const dedupe=ciTelegramDedupeKey(asset,category,details);
+  const existing=await db.prepare("SELECT alert_id,status FROM ci_telegram_alert_queue WHERE dedupe_key=?").bind(dedupe).first();
+  if(existing)return {alert_id:existing.alert_id,status:existing.status,deduplicated:true};
+  const id=cryptoRandomId(),timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_telegram_alert_queue (alert_id,dedupe_key,category,asset_name,asset_symbol,chain,contract_address,details,app_url,status,attempts,next_attempt_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,'pending',0,?,?,?)").bind(
+    id,dedupe,category,name,symbol,chain,contract,details,
+    safeString(body.app_url||env.APP_ORIGIN||"",500),timestamp,timestamp,timestamp
+  ).run();
+  await db.prepare("INSERT INTO ci_telegram_alert_history (history_id,alert_id,category,asset_symbol,chain,contract_address,status,event_at) VALUES (?,?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),id,category,symbol,chain,contract,"queued",timestamp
+  ).run();
+  return {alert_id:id,status:"pending",deduplicated:false};
+}
+
+async function verifyCITelegramChannel(env){
+  if(!env.TELEGRAM_BOT_TOKEN||!env.TELEGRAM_CHAT_ID)throw new Error("Secrets Telegram absents. Configurez-les dans Cloudflare Worker.");
+  const base="https://api.telegram.org/bot"+env.TELEGRAM_BOT_TOKEN+"/";
+  const me=await externalJSON(base+"getMe");
+  if(!me.data?.ok||!me.data.result?.id)throw new Error("Impossible de vérifier l'identité du bot Telegram.");
+  const chat=await externalJSON(base+"getChat?chat_id="+encodeURIComponent(env.TELEGRAM_CHAT_ID));
+  if(!chat.data?.ok||chat.data.result?.type!=="channel")throw new Error("La destination configurée n'est pas un canal Telegram.");
+  const member=await externalJSON(base+"getChatMember?chat_id="+encodeURIComponent(env.TELEGRAM_CHAT_ID)+"&user_id="+me.data.result.id);
+  const role=member.data?.result;
+  const canPost=Boolean(role&&(role.status==="creator"||(role.status==="administrator"&&role.can_post_messages!==false)));
+  return {
+    bot_username:me.data.result.username||null,
+    channel_title:chat.data.result.title||null,
+    channel_type:chat.data.result.type,
+    bot_status:role?.status||"unknown",
+    bot_can_post:canPost,
+    verified:canPost,
+    subscribers_read_only_by_channel_type:true,
+    only_application_backend_exposes_posting_routes:true
+  };
+}
+
+async function dispatchCITelegramAlerts(db,env,limit=10){
+  await ensureCITelegramTables(db);
+  const max=Math.max(1,Math.min(25,Number(limit)||10));
+  const ready=await db.prepare("SELECT * FROM ci_telegram_alert_queue WHERE status='pending' AND next_attempt_at<=? ORDER BY created_at ASC LIMIT ?").bind(nowISO(),max).all();
+  const results=[];
+  for(const alert of ready.results||[]){
+    const claim=await db.prepare("UPDATE ci_telegram_alert_queue SET status='sending',attempts=attempts+1,updated_at=? WHERE alert_id=? AND status='pending'").bind(nowISO(),alert.alert_id).run();
+    if(!claim.meta?.changes)continue;
+    try{
+      const message=buildAssetAlert({
+        name:alert.asset_name,symbol:alert.asset_symbol,chain:alert.chain,
+        contract_address:alert.contract_address
+      },alert.category,alert.details,alert.app_url);
+      const sent=await sendTelegram(env,message);
+      const timestamp=nowISO();
+      await db.prepare("UPDATE ci_telegram_alert_queue SET status='sent',telegram_message_id=?,last_error=NULL,sent_at=?,updated_at=? WHERE alert_id=?").bind(
+        String(sent.message_id||""),timestamp,timestamp,alert.alert_id
+      ).run();
+      await db.prepare("INSERT INTO ci_telegram_alert_history (history_id,alert_id,category,asset_symbol,chain,contract_address,status,telegram_message_id,event_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(
+        cryptoRandomId(),alert.alert_id,alert.category,alert.asset_symbol,alert.chain,alert.contract_address,"sent",String(sent.message_id||""),timestamp
+      ).run();
+      results.push({alert_id:alert.alert_id,status:"sent",message_id:sent.message_id});
+    }catch(error){
+      const message=safeString(error.message||"Erreur Telegram.",700);
+      const attempts=Number(alert.attempts)+1,canRetry=attempts<4;
+      const next=new Date(Date.now()+Math.min(3600000,60000*Math.pow(2,attempts-1))).toISOString();
+      const timestamp=nowISO();
+      await db.prepare("UPDATE ci_telegram_alert_queue SET status=?,next_attempt_at=?,last_error=?,updated_at=? WHERE alert_id=?").bind(
+        canRetry?"pending":"failed",next,message,timestamp,alert.alert_id
+      ).run();
+      await db.prepare("INSERT INTO ci_telegram_alert_history (history_id,alert_id,category,asset_symbol,chain,contract_address,status,error,event_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(
+        cryptoRandomId(),alert.alert_id,alert.category,alert.asset_symbol,alert.chain,alert.contract_address,canRetry?"retry_scheduled":"failed",message,timestamp
+      ).run();
+      results.push({alert_id:alert.alert_id,status:canRetry?"retry_scheduled":"failed",error:message});
+    }
+  }
+  return {processed:results.length,results,posting_identity:"application_backend_bot_only"};
+}
+
+async function getCITelegramAlertHistory(db,limit=100){
+  await ensureCITelegramTables(db);
+  const rows=await db.prepare("SELECT alert_id,category,asset_symbol,chain,contract_address,status,telegram_message_id,error,event_at FROM ci_telegram_alert_history ORDER BY event_at DESC LIMIT ?").bind(Math.max(1,Math.min(500,Number(limit)||100))).all();
+  const queue=await db.prepare("SELECT alert_id,category,asset_symbol,chain,contract_address,status,attempts,last_error,created_at,sent_at FROM ci_telegram_alert_queue ORDER BY created_at DESC LIMIT ?").bind(Math.max(1,Math.min(200,Number(limit)||100))).all();
+  return {events:rows.results||[],queue:queue.results||[]};
+}
+
+
+const ciChapter16PreviousRoutes=handleProtectedRoutes;
+handleProtectedRoutes=async function(request,env,ctx,route){
+  const {path,method,url}=route;
+  const telegramPaths=["/api/telegram/verify","/api/telegram/queue","/api/telegram/queue/process","/api/telegram/history"];
+  if(telegramPaths.includes(path)||(path==="/api/telegram/alert"&&method==="POST")){
+    const db=getDB(env);await initializeBackendTables(db);await ensureCITelegramTables(db);
+    if(method==="POST"&&path==="/api/telegram/verify"){
+      try{return json({success:true,telegram:await verifyCITelegramChannel(env)});}
+      catch(error){return errorResponse(safeString(error.message||"Vérification Telegram impossible.",1000),400);}
+    }
+    if(method==="POST"&&path==="/api/telegram/alert"){
+      try{
+        const queued=await enqueueCITelegramAlert(db,await readBody(request),env);
+        await audit(db,"telegram_alert_queued",queued.alert_id);
+        return json({success:true,telegram:queued},queued.deduplicated?200:202);
+      }catch(error){return errorResponse(safeString(error.message||"Alerte Telegram refusée.",1000),400);}
+    }
+    if(method==="POST"&&path==="/api/telegram/queue"){
+      try{return json({success:true,telegram:await enqueueCITelegramAlert(db,await readBody(request),env)},202);}
+      catch(error){return errorResponse(safeString(error.message||"Mise en file Telegram refusée.",1000),400);}
+    }
+    if(method==="POST"&&path==="/api/telegram/queue/process"){
+      try{return json({success:true,telegram:await dispatchCITelegramAlerts(db,env,(await readBody(request)).limit)});}
+      catch(error){return errorResponse(safeString(error.message||"Distribution Telegram impossible.",1000),500);}
+    }
+    if(method==="GET"&&path==="/api/telegram/history"){
+      return json({success:true,telegram:await getCITelegramAlertHistory(db,url.searchParams.get("limit")||100)});
+    }
+    if(method==="GET"&&path==="/api/telegram/queue"){
+      return json({success:true,telegram:await getCITelegramAlertHistory(db,url.searchParams.get("limit")||100)});
+    }
+  }
+  return await ciChapter16PreviousRoutes(request,env,ctx,route);
+};
