@@ -20,5 +20,11 @@
       "database_name": "crypto-intelligence-db",
       "database_id": "a03f9008-0859-4134-8d9e-491af70c922b"
     }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVES",
+      "bucket_name": "conan-data-archives-2026"
+    }
   ]
 }
