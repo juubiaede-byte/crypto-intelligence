@@ -94,6 +94,8 @@ const ARCHIVE_TABLES = [
   "ci_cache",
   "ci_provider_usage",
   "ci_radar_lp_history",
+  "ci_radar_asset_lifecycle",
+  "ci_radar_asset_lifecycle_history",
   "ci_radar_identity_checks",
   "ci_radar_onchain_liquidity_assessments",
   "ci_radar_onchain_pool_history",
@@ -389,6 +391,10 @@ async function initializeBackendTables(db) {
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_history_pair ON ci_radar_onchain_pool_history(chain_id, pair_address, checked_at DESC)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_history_discovery ON ci_radar_onchain_pool_history(discovery_key, checked_at DESC)`)
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_identity_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'GeckoTerminal', outcome TEXT NOT NULL DEFAULT 'unknown', checked_at TEXT NOT NULL, network_id TEXT, token_address TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_asset_lifecycle (discovery_key TEXT PRIMARY KEY, current_stage TEXT NOT NULL DEFAULT 'quarantine', entered_stage_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_transition_reason TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}')`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_asset_lifecycle_stage ON ci_radar_asset_lifecycle(current_stage, updated_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_asset_lifecycle_history (event_id TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, from_stage TEXT NOT NULL, to_stage TEXT NOT NULL, reason TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', transitioned_at TEXT NOT NULL, actor TEXT NOT NULL DEFAULT 'api')`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_asset_lifecycle_history_discovery ON ci_radar_asset_lifecycle_history(discovery_key, transitioned_at DESC)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_identity_checks_discovery ON ci_radar_identity_checks(discovery_key, checked_at DESC)`)
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_onchain_liquidity_assessments (assessment_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT NOT NULL, pair_address TEXT NOT NULL, checked_at TEXT NOT NULL, outcome TEXT NOT NULL, estimated_pool_depth_usd REAL, quote_token_price_usd REAL, base_token_price_usd REAL, estimated_buy_impact_json TEXT NOT NULL DEFAULT '[]', estimated_sell_impact_json TEXT NOT NULL DEFAULT '[]', evidence_json TEXT NOT NULL DEFAULT '{}')`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_liquidity_discovery ON ci_radar_onchain_liquidity_assessments(discovery_key, checked_at DESC)`)
@@ -2129,6 +2135,86 @@ function geckoTokenAddress(pool, included) {
     name: attrs.name || null,
     symbol: attrs.symbol || null
   };
+}
+
+
+const RADAR_LIFECYCLE_STAGES = [
+  "crypto_universe",
+  "quarantine",
+  "precursors",
+  "investigation_lab",
+  "potential_investment_circle"
+];
+
+async function syncRadarAssetLifecycle(db, limit = 1000) {
+  const rows = await db.prepare(
+    "SELECT discovery_key, first_seen_at FROM ci_radar_discoveries ORDER BY first_seen_at ASC LIMIT ?"
+  ).bind(Math.max(1, Math.min(5000, Number(limit) || 1000))).all();
+  let initialized = 0;
+  for (const row of rows.results || []) {
+    const existing = await db.prepare(
+      "SELECT discovery_key FROM ci_radar_asset_lifecycle WHERE discovery_key = ?"
+    ).bind(row.discovery_key).first();
+    if (existing) continue;
+    const timestamp = row.first_seen_at || nowISO();
+    const reason = "Actif découvert par le radar et placé en quarantaine pour vérification; étape précédente enregistrée comme univers crypto.";
+    await db.prepare(
+      "INSERT OR IGNORE INTO ci_radar_asset_lifecycle (discovery_key, current_stage, entered_stage_at, updated_at, last_transition_reason, evidence_json) VALUES (?, 'quarantine', ?, ?, ?, '{}')"
+    ).bind(row.discovery_key, timestamp, timestamp, reason).run();
+    await db.prepare(
+      "INSERT OR IGNORE INTO ci_radar_asset_lifecycle_history (event_id, discovery_key, from_stage, to_stage, reason, evidence_json, transitioned_at, actor) VALUES (?, ?, 'crypto_universe', 'quarantine', ?, '{}', ?, 'radar')"
+    ).bind(cryptoRandomId(), row.discovery_key, reason, timestamp).run();
+    initialized++;
+  }
+  return { scanned: rows.results?.length || 0, initialized };
+}
+
+async function transitionRadarAssetLifecycle(db, body) {
+  const discoveryKey = safeString(body.discovery_key || "", 200);
+  const targetStage = safeString(body.to_stage || "", 80);
+  const reason = safeString(body.reason || "", 2000).trim();
+  if (!discoveryKey || !RADAR_LIFECYCLE_STAGES.includes(targetStage) || !reason) {
+    return { error: "discovery_key, to_stage valide et reason documentée sont requis." };
+  }
+  const lowerReason = reason.toLowerCase();
+  if ((lowerReason.includes("hausse du prix") || lowerReason.includes("price increase") || lowerReason.includes("pump")) &&
+      !(body.evidence && typeof body.evidence === "object" && !Array.isArray(body.evidence))) {
+    return { error: "Une hausse de prix seule ne justifie pas un changement d'étape; des preuves complémentaires sont requises." };
+  }
+  const asset = await db.prepare(
+    "SELECT discovery_key FROM ci_radar_discoveries WHERE discovery_key = ?"
+  ).bind(discoveryKey).first();
+  if (!asset) return { error: "Actif radar introuvable." };
+  let state = await db.prepare(
+    "SELECT * FROM ci_radar_asset_lifecycle WHERE discovery_key = ?"
+  ).bind(discoveryKey).first();
+  if (!state) {
+    await syncRadarAssetLifecycle(db, 5000);
+    state = await db.prepare(
+      "SELECT * FROM ci_radar_asset_lifecycle WHERE discovery_key = ?"
+    ).bind(discoveryKey).first();
+  }
+  if (!state) return { error: "État du cycle de vie indisponible." };
+  const fromIndex = RADAR_LIFECYCLE_STAGES.indexOf(state.current_stage);
+  const toIndex = RADAR_LIFECYCLE_STAGES.indexOf(targetStage);
+  if (fromIndex < 0 || Math.abs(toIndex - fromIndex) !== 1) {
+    return { error: "Transition refusée : les étapes doivent être parcourues dans l'ordre, sans saut." };
+  }
+  const evidence = body.evidence && typeof body.evidence === "object" && !Array.isArray(body.evidence) ? body.evidence : {};
+  const evidenceJson = JSON.stringify(evidence);
+  const timestamp = nowISO();
+  const eventId = cryptoRandomId();
+  await db.prepare(
+    "INSERT INTO ci_radar_asset_lifecycle_history (event_id, discovery_key, from_stage, to_stage, reason, evidence_json, transitioned_at, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(eventId, discoveryKey, state.current_stage, targetStage, reason, evidenceJson, timestamp, safeString(body.actor || "api", 80)).run();
+  await db.prepare(
+    "UPDATE ci_radar_asset_lifecycle SET current_stage = ?, entered_stage_at = ?, updated_at = ?, last_transition_reason = ?, evidence_json = ? WHERE discovery_key = ?"
+  ).bind(targetStage, timestamp, timestamp, reason, evidenceJson, discoveryKey).run();
+  await db.prepare(
+    "UPDATE ci_radar_discoveries SET status = ?, review_reason = ?, updated_at = ? WHERE discovery_key = ?"
+  ).bind(targetStage, reason, timestamp, discoveryKey).run();
+  await audit(db, "radar_lifecycle_transition", discoveryKey + ": " + state.current_stage + " -> " + targetStage + " — " + reason);
+  return { event_id: eventId, discovery_key: discoveryKey, from_stage: state.current_stage, to_stage: targetStage, transitioned_at: timestamp, reason, evidence };
 }
 
 async function persistRadarDiscoveries(db, discoveries) {
@@ -3978,6 +4064,35 @@ async function handleProtectedRoutes(request, env, ctx, route) {
       : await db.prepare("SELECT * FROM ci_radar_onchain_liquidity_assessments ORDER BY checked_at DESC LIMIT ?").bind(limit).all();
     return json({success:true,count:result.results?.length||0,assessments:result.results||[],
       note:"Profondeur USD estimée à partir de réserves on-chain et d'un prix fournisseur; estimation non exécutable."});
+  }
+
+
+  if (method === "GET" && path === "/api/radar/lifecycle") {
+    const synchronization = await syncRadarAssetLifecycle(db, 5000);
+    const stage = safeString(url.searchParams.get("stage") || "", 80);
+    if (stage && !RADAR_LIFECYCLE_STAGES.includes(stage)) return errorResponse("Étape de cycle de vie invalide.");
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 200));
+    const result = stage
+      ? await db.prepare("SELECT l.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol, d.first_seen_at FROM ci_radar_asset_lifecycle l JOIN ci_radar_discoveries d ON d.discovery_key = l.discovery_key WHERE l.current_stage = ? ORDER BY l.updated_at DESC LIMIT ?").bind(stage, limit).all()
+      : await db.prepare("SELECT l.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol, d.first_seen_at FROM ci_radar_asset_lifecycle l JOIN ci_radar_discoveries d ON d.discovery_key = l.discovery_key ORDER BY l.updated_at DESC LIMIT ?").bind(limit).all();
+    const counts = await db.prepare("SELECT current_stage, COUNT(*) AS count FROM ci_radar_asset_lifecycle GROUP BY current_stage").all();
+    return json({ success: true, stages: RADAR_LIFECYCLE_STAGES, counts: counts.results || [], count: result.results?.length || 0, assets: result.results || [], synchronization });
+  }
+
+  if (method === "GET" && path === "/api/radar/lifecycle-history") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 200));
+    const result = discoveryKey
+      ? await db.prepare("SELECT * FROM ci_radar_asset_lifecycle_history WHERE discovery_key = ? ORDER BY transitioned_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_radar_asset_lifecycle_history ORDER BY transitioned_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, history: result.results || [] });
+  }
+
+  if (method === "POST" && path === "/api/radar/lifecycle/transition") {
+    const body = await readBody(request);
+    const result = await transitionRadarAssetLifecycle(db, body);
+    if (result.error) return errorResponse(result.error, 400);
+    return json({ success: true, transition: result }, 201);
   }
 
   if (method === "GET" && path === "/api/radar/status") {
