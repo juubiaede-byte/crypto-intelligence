@@ -7193,3 +7193,279 @@ handleProtectedRoutes = async function(request,env,ctx,route){
   }
   return await conanChapter11OriginalProtectedRoutes(request,env,ctx,route);
 };
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 12 — INCUBATEUR D'APPRENTISSAGE ET D'EVOLUTION TECHNIQUE CONAN    */
+/* -------------------------------------------------------------------------- */
+const CONAN_INCUBATOR_METHODOLOGY = "conan-autonomous-research-incubator-v1";
+const CONAN_INCUBATOR_ALLOWED_TOOL_STATUSES = ["proposed","prototype","tested","suspended","rejected"];
+const CONAN_INCUBATOR_ALLOWED_EXPERIMENT_STATUSES = ["proposed","running","completed","failed","suspended"];
+
+async function ensureConanIncubatorTables(db){
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_incubator_state (
+      state_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'active',
+      generation INTEGER NOT NULL DEFAULT 1,
+      last_backup_id TEXT,
+      suspended_at TEXT,
+      updated_at TEXT NOT NULL,
+      state_json TEXT NOT NULL DEFAULT '{}'
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_incubator_tools (
+      tool_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      purpose TEXT NOT NULL,
+      design_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_incubator_experiments (
+      experiment_id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      hypothesis TEXT NOT NULL,
+      strategy_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      dataset_fingerprint TEXT,
+      dataset_size INTEGER NOT NULL DEFAULT 0,
+      results_json TEXT NOT NULL DEFAULT '{}',
+      limitations_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      completed_at TEXT
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_incubator_observations (
+      observation_id TEXT PRIMARY KEY,
+      experiment_id TEXT NOT NULL,
+      observation_index INTEGER NOT NULL,
+      observed_at TEXT,
+      value_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_improvement_proposals (
+      proposal_id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      problem TEXT NOT NULL,
+      proposed_change TEXT NOT NULL,
+      expected_benefit TEXT,
+      risks_json TEXT NOT NULL DEFAULT '[]',
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'pending_review',
+      reviewed_at TEXT,
+      reviewer_note TEXT,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_incubator_events (
+      event_id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      entity_id TEXT,
+      details_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_incubator_backups (
+      backup_id TEXT PRIMARY KEY,
+      generation INTEGER NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      verified INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_incubator_tools_status ON ci_conan_incubator_tools(status,updated_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_incubator_experiments_status ON ci_conan_incubator_experiments(status,created_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_incubator_proposals_status ON ci_conan_improvement_proposals(status,created_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_incubator_events_created ON ci_conan_incubator_events(created_at DESC)")
+  ]);
+  const timestamp=nowISO();
+  await db.prepare("INSERT OR IGNORE INTO ci_conan_incubator_state (state_id,status,generation,updated_at,state_json) VALUES ('primary','active',1,?,'{}')").bind(timestamp).run();
+  for(const table of ["ci_conan_incubator_state","ci_conan_incubator_tools","ci_conan_incubator_experiments","ci_conan_incubator_observations","ci_conan_improvement_proposals","ci_conan_incubator_events","ci_conan_incubator_backups"]){
+    if(!ARCHIVE_TABLES.includes(table))ARCHIVE_TABLES.push(table);
+  }
+}
+
+async function recordConanIncubatorEvent(db,eventType,entityId,details){
+  await db.prepare("INSERT INTO ci_conan_incubator_events (event_id,event_type,entity_id,details_json,created_at) VALUES (?,?,?,?,?)").bind(
+    cryptoRandomId(),safeString(eventType,100),entityId?safeString(entityId,160):null,JSON.stringify(details||{}),nowISO()
+  ).run();
+}
+
+async function getConanIncubatorState(db){
+  await ensureConanIncubatorTables(db);
+  const state=await db.prepare("SELECT * FROM ci_conan_incubator_state WHERE state_id='primary'").first();
+  const counts=await db.prepare("SELECT (SELECT COUNT(*) FROM ci_conan_incubator_tools) AS tools,(SELECT COUNT(*) FROM ci_conan_incubator_experiments) AS experiments,(SELECT COUNT(*) FROM ci_conan_improvement_proposals WHERE status='pending_review') AS pending_proposals").first();
+  return { ...state,counts,permissions:{may_design_tools:true,may_run_isolated_experiments:true,may_read_available_historical_data:true,may_propose_code_changes:true,may_modify_main_code:false,may_delete_protections:false,may_change_permissions:false,may_delete_backups:false,may_purchase_paid_services:false} };
+}
+
+async function createConanIncubatorBackup(db){
+  await ensureConanIncubatorTables(db);
+  const names=["ci_conan_incubator_state","ci_conan_incubator_tools","ci_conan_incubator_experiments","ci_conan_incubator_observations","ci_conan_improvement_proposals","ci_conan_incubator_events"];
+  const snapshot={schema:CONAN_INCUBATOR_METHODOLOGY,tables:{}};
+  for(const name of names){
+    const result=await db.prepare("SELECT * FROM "+name).all();
+    snapshot.tables[name]=result.results||[];
+  }
+  const serialized=JSON.stringify(snapshot);
+  let checksum=0;
+  for(let i=0;i<serialized.length;i++)checksum=(Math.imul(checksum,31)+serialized.charCodeAt(i))|0;
+  const backupId=cryptoRandomId(),timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_conan_incubator_backups (backup_id,generation,snapshot_json,checksum,verified,created_at) SELECT ?,generation,?,?,0,? FROM ci_conan_incubator_state WHERE state_id='primary'").bind(backupId,serialized,String(checksum),timestamp).run();
+  const stored=await db.prepare("SELECT snapshot_json,checksum FROM ci_conan_incubator_backups WHERE backup_id=?").bind(backupId).first();
+  const verified=Boolean(stored&&stored.snapshot_json===serialized&&stored.checksum===String(checksum));
+  if(!verified)throw new Error("La vérification de la sauvegarde de l'incubateur a échoué; aucune opération de réinitialisation ne peut continuer.");
+  await db.prepare("UPDATE ci_conan_incubator_backups SET verified=1 WHERE backup_id=?").bind(backupId).run();
+  await db.prepare("UPDATE ci_conan_incubator_state SET last_backup_id=?,updated_at=? WHERE state_id='primary'").bind(backupId,timestamp).run();
+  await recordConanIncubatorEvent(db,"backup_created_and_verified",backupId,{checksum:String(checksum),tables:names});
+  return {backup_id:backupId,verified:true,checksum:String(checksum),tables:names};
+}
+
+function conanIncubatorFingerprint(values){
+  const textValue=JSON.stringify(values);
+  let hash=2166136261;
+  for(let i=0;i<textValue.length;i++){hash^=textValue.charCodeAt(i);hash=Math.imul(hash,16777619);}
+  return (hash>>>0).toString(16);
+}
+
+function evaluateConanHistoricalExperiment(strategyKey,observations){
+  const rows=observations.map((item,index)=>({index,price:radarFiniteMetric(item?.price_usd??item?.price),timestamp:item?.observed_at||item?.timestamp||null})).filter(x=>x.price!==null&&x.price>0);
+  if(rows.length<12)throw new Error("Au moins 12 observations historiques valides sont nécessaires; aucun résultat n'est extrapolé.");
+  if(strategyKey!=="sma_crossover_v1")throw new Error("Stratégie expérimentale inconnue ou non autorisée.");
+  let position=false,entry=0,capital=1,peak=1,maxDrawdown=0,trades=0,wins=0;
+  const fast=3,slow=7;
+  for(let i=slow;i<rows.length;i++){
+    const fastAvg=rows.slice(i-fast+1,i+1).reduce((a,b)=>a+b.price,0)/fast;
+    const slowAvg=rows.slice(i-slow+1,i+1).reduce((a,b)=>a+b.price,0)/slow;
+    const price=rows[i].price;
+    if(!position&&fastAvg>slowAvg){position=true;entry=price;trades++;}
+    else if(position&&fastAvg<slowAvg){const tradeReturn=price/entry-1;capital*=price/entry;if(tradeReturn>0)wins++;position=false;}
+    peak=Math.max(peak,capital);maxDrawdown=Math.max(maxDrawdown,(peak-capital)/peak);
+  }
+  if(position){const tradeReturn=rows[rows.length-1].price/entry-1;capital*=rows[rows.length-1].price/entry;if(tradeReturn>0)wins++;}
+  const buyHold=rows[rows.length-1].price/rows[0].price;
+  return {strategy_key:strategyKey,observations:rows.length,closed_and_finalized_trades:trades,profitable_trades:wins,win_rate_percent:trades?wins/trades*100:null,strategy_return_percent:(capital-1)*100,buy_and_hold_return_percent:(buyHold-1)*100,max_drawdown_percent:maxDrawdown*100,fees_included:false,slippage_included:false,gas_included:false,out_of_sample:false,limitations:["Prototype de recherche uniquement; ce résultat n'est pas une recommandation financière.","Les données historiques sont fournies par l'appelant et leur provenance doit être vérifiée.","Pas de frais, glissement, gas, MEV ni contraintes d'exécution.","Un seul actif et une seule série; aucun test hors échantillon automatique.","Les performances passées ne préjugent pas des résultats futurs."]};
+}
+
+async function createConanIncubatorExperiment(db,body){
+  await ensureConanIncubatorTables(db);
+  const state=await db.prepare("SELECT status FROM ci_conan_incubator_state WHERE state_id='primary'").first();
+  if(state?.status!=="active")throw new Error("L'incubateur est suspendu; les expériences sont bloquées.");
+  const title=safeString(body.title||"Expérience Conan",180),hypothesis=safeString(body.hypothesis||"",1200);
+  const strategyKey=safeString(body.strategy_key||"sma_crossover_v1",80);
+  const observations=Array.isArray(body.historical_observations)?body.historical_observations.slice(0,5000):[];
+  if(!hypothesis)throw new Error("Une hypothèse explicite est obligatoire.");
+  if(!observations.length)throw new Error("Fournis un jeu de données historiques indépendant et documenté; aucune donnée fictive ne sera générée.");
+  const result=evaluateConanHistoricalExperiment(strategyKey,observations);
+  const experimentId=cryptoRandomId(),timestamp=nowISO(),fingerprint=conanIncubatorFingerprint(observations);
+  await db.prepare("INSERT INTO ci_conan_incubator_experiments (experiment_id,title,hypothesis,strategy_key,status,dataset_fingerprint,dataset_size,results_json,limitations_json,created_at,completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(
+    experimentId,title,hypothesis,strategyKey,"completed",fingerprint,result.observations,JSON.stringify(result),JSON.stringify(result.limitations),timestamp,timestamp
+  ).run();
+  const inserts=observations.slice(0,5000).map((item,index)=>db.prepare("INSERT INTO ci_conan_incubator_observations (observation_id,experiment_id,observation_index,observed_at,value_json,created_at) VALUES (?,?,?,?,?,?)").bind(
+    cryptoRandomId(),experimentId,index,safeString(item?.observed_at||item?.timestamp||"",100)||null,JSON.stringify(item),timestamp
+  ));
+  for(let i=0;i<inserts.length;i+=50)await db.batch(inserts.slice(i,i+50));
+  await recordConanIncubatorEvent(db,"historical_experiment_completed",experimentId,{strategy_key:strategyKey,dataset_fingerprint:fingerprint,observations:result.observations});
+  return {experiment_id:experimentId,status:"completed",dataset_fingerprint:fingerprint,results:result};
+}
+
+async function createConanImprovementProposal(db,body){
+  await ensureConanIncubatorTables(db);
+  const title=safeString(body.title||"",180),problem=safeString(body.problem||"",1500),proposed=safeString(body.proposed_change||"",2500);
+  if(!title||!problem||!proposed)throw new Error("title, problem et proposed_change sont obligatoires.");
+  const id=cryptoRandomId(),timestamp=nowISO(),risks=Array.isArray(body.risks)?body.risks.slice(0,30):[];
+  await db.prepare("INSERT INTO ci_conan_improvement_proposals (proposal_id,title,problem,proposed_change,expected_benefit,risks_json,evidence_json,status,created_at) VALUES (?,?,?,?,?,?,?,'pending_review',?)").bind(
+    id,title,problem,proposed,safeString(body.expected_benefit||"",1000)||null,JSON.stringify(risks),JSON.stringify(body.evidence&&typeof body.evidence==="object"?body.evidence:{}),timestamp
+  ).run();
+  await recordConanIncubatorEvent(db,"improvement_proposal_created",id,{title,status:"pending_review"});
+  return {proposal_id:id,status:"pending_review",main_code_modified:false,requires_human_review:true};
+}
+
+const conanChapter12OriginalProtectedRoutes = handleProtectedRoutes;
+handleProtectedRoutes = async function(request,env,ctx,route){
+  const {path,method,url}=route;
+  const chapter12Routes=[
+    "/api/conan/incubator",
+    "/api/conan/incubator/tools",
+    "/api/conan/incubator/experiments",
+    "/api/conan/incubator/proposals",
+    "/api/conan/incubator/proposals/review",
+    "/api/conan/incubator/suspend",
+    "/api/conan/incubator/resume",
+    "/api/conan/incubator/reset",
+    "/api/conan/incubator/backups",
+    "/api/conan/incubator/events"
+  ];
+  if(chapter12Routes.includes(path)){
+    const db=getDB(env);
+    await initializeBackendTables(db);
+    await ensureConanIncubatorTables(db);
+    if(method==="GET"&&path==="/api/conan/incubator")return json({success:true,methodology:CONAN_INCUBATOR_METHODOLOGY,state:await getConanIncubatorState(db)});
+    if(method==="GET"&&path==="/api/conan/incubator/tools"){
+      const rows=await db.prepare("SELECT * FROM ci_conan_incubator_tools ORDER BY created_at DESC LIMIT 200").all();
+      return json({success:true,count:rows.results?.length||0,tools:rows.results||[]});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/tools"){
+      const body=await readBody(request),name=safeString(body.name||"",160),purpose=safeString(body.purpose||"",1000);
+      if(!name||!purpose)return errorResponse("name et purpose sont obligatoires.");
+      const id=cryptoRandomId(),timestamp=nowISO();
+      await db.prepare("INSERT INTO ci_conan_incubator_tools (tool_id,name,purpose,design_json,status,evidence_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").bind(id,name,purpose,JSON.stringify(body.design&&typeof body.design==="object"?body.design:{}),"proposed",JSON.stringify({source:"human_or_conan_proposal",code_execution:false}),timestamp,timestamp).run();
+      await recordConanIncubatorEvent(db,"tool_design_proposed",id,{name,purpose});
+      return json({success:true,tool_id:id,status:"proposed",code_execution:false,main_code_modified:false},201);
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/experiments"){
+      const rows=await db.prepare("SELECT * FROM ci_conan_incubator_experiments ORDER BY created_at DESC LIMIT 200").all();
+      return json({success:true,count:rows.results?.length||0,experiments:rows.results||[]});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/experiments"){
+      try{return json({success:true,...await createConanIncubatorExperiment(db,await readBody(request))},201);}
+      catch(error){return errorResponse(safeString(error.message||"Expérience refusée.",1000),400);}
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/proposals"){
+      const rows=await db.prepare("SELECT * FROM ci_conan_improvement_proposals ORDER BY created_at DESC LIMIT 200").all();
+      return json({success:true,count:rows.results?.length||0,proposals:rows.results||[]});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/proposals"){
+      try{return json({success:true,...await createConanImprovementProposal(db,await readBody(request))},201);}
+      catch(error){return errorResponse(safeString(error.message||"Proposition invalide.",1000),400);}
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/proposals/review"){
+      const body=await readBody(request),id=safeString(body.proposal_id||"",160),decision=safeString(body.decision||"",30);
+      if(!id||!["approve","reject"].includes(decision))return errorResponse("proposal_id et decision approve/reject sont requis.");
+      const proposal=await db.prepare("SELECT * FROM ci_conan_improvement_proposals WHERE proposal_id=?").bind(id).first();
+      if(!proposal)return errorResponse("Proposition introuvable.",404);
+      if(proposal.status!=="pending_review")return errorResponse("Cette proposition a déjà été examinée.",409);
+      const status=decision==="approve"?"approved_for_separate_implementation_review":"rejected";
+      await db.prepare("UPDATE ci_conan_improvement_proposals SET status=?,reviewed_at=?,reviewer_note=? WHERE proposal_id=? AND status='pending_review'").bind(status,nowISO(),safeString(body.reviewer_note||"",1500)||null,id).run();
+      await recordConanIncubatorEvent(db,"improvement_proposal_reviewed",id,{decision,status,main_code_modified:false});
+      return json({success:true,proposal_id:id,status,main_code_modified:false,note:"L'approbation autorise uniquement une revue d'implémentation séparée; elle ne modifie jamais automatiquement le code principal."});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/suspend"){
+      const timestamp=nowISO();
+      await db.prepare("UPDATE ci_conan_incubator_state SET status='suspended',suspended_at=?,updated_at=? WHERE state_id='primary'").bind(timestamp,timestamp).run();
+      await recordConanIncubatorEvent(db,"incubator_suspended",null,{timestamp});
+      return json({success:true,status:"suspended"});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/resume"){
+      const timestamp=nowISO();
+      await db.prepare("UPDATE ci_conan_incubator_state SET status='active',suspended_at=NULL,updated_at=? WHERE state_id='primary'").bind(timestamp).run();
+      await recordConanIncubatorEvent(db,"incubator_resumed",null,{timestamp});
+      return json({success:true,status:"active"});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/reset"){
+      const backup=await createConanIncubatorBackup(db);
+      const timestamp=nowISO();
+      await db.prepare("UPDATE ci_conan_incubator_state SET status='active',generation=generation+1,suspended_at=NULL,updated_at=?,state_json='{}' WHERE state_id='primary'").bind(timestamp).run();
+      await recordConanIncubatorEvent(db,"incubator_generation_reset_after_verified_backup",backup.backup_id,{backup_id:backup.backup_id,backup_verified:backup.verified,note:"Les historiques et prototypes précédents sont conservés; aucune ligne n'est supprimée."});
+      return json({success:true,status:"active",backup,generation_reset:true,history_preserved:true,rows_deleted:0});
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/backups"){
+      const rows=await db.prepare("SELECT backup_id,generation,checksum,verified,created_at FROM ci_conan_incubator_backups ORDER BY created_at DESC LIMIT 100").all();
+      return json({success:true,count:rows.results?.length||0,backups:rows.results||[]});
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/events"){
+      const limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
+      const rows=await db.prepare("SELECT * FROM ci_conan_incubator_events ORDER BY created_at DESC LIMIT ?").bind(limit).all();
+      return json({success:true,count:rows.results?.length||0,events:rows.results||[]});
+    }
+  }
+  return await conanChapter12OriginalProtectedRoutes(request,env,ctx,route);
+};
