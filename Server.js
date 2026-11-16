@@ -110,6 +110,12 @@ const ARCHIVE_TABLES = [
   ,"ci_collective_opportunity_runs"
   ,"ci_collective_opportunity_signals"
   ,"ci_collective_opportunity_history"
+
+  ,"ci_wallet_watchlist"
+  ,"ci_wallet_scan_cursors"
+  ,"ci_wallet_events"
+  ,"ci_wallet_behavior_signals"
+  ,"ci_wallet_clusters"
 ];
 
 const ARCHIVE_PREFIX = "conan/backups/";
@@ -478,6 +484,82 @@ async function initializeBackendTables(db) {
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_collective_opportunity_history (history_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, discovery_key TEXT NOT NULL, classification TEXT NOT NULL, opportunity_score REAL NOT NULL DEFAULT 0, confidence_percent REAL NOT NULL DEFAULT 0, price_change_24h REAL, activity_ratio REAL, buy_pressure REAL, liquidity_usd REAL, pool_depth_usd REAL, market_cap_usd REAL, fdv_usd REAL, circulating_supply REAL, total_supply REAL, sellability_status TEXT NOT NULL DEFAULT 'unknown', critical_risk INTEGER NOT NULL DEFAULT 0, evidence_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`)
     ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_history_asset ON ci_collective_opportunity_history(discovery_key, created_at DESC)")
     ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_history_run ON ci_collective_opportunity_history(run_id, created_at DESC)")
+
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_watchlist (
+      wallet_key TEXT PRIMARY KEY,
+      chain_id TEXT NOT NULL,
+      wallet_address TEXT NOT NULL,
+      label TEXT,
+      wallet_type TEXT NOT NULL DEFAULT 'unknown',
+      profile_status TEXT NOT NULL DEFAULT 'user_supplied_unverified',
+      source_reference TEXT,
+      notes TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(chain_id, wallet_address)
+    )`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_watchlist_address ON ci_wallet_watchlist(chain_id, wallet_address)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_scan_cursors (
+      cursor_key TEXT PRIMARY KEY,
+      chain_id TEXT NOT NULL,
+      pair_address TEXT NOT NULL,
+      last_scanned_block INTEGER NOT NULL DEFAULT 0,
+      last_scan_at TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      error_message TEXT
+    )`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_events (
+      event_id TEXT PRIMARY KEY,
+      chain_id TEXT NOT NULL,
+      discovery_key TEXT NOT NULL,
+      pair_address TEXT NOT NULL,
+      wallet_address TEXT NOT NULL,
+      recipient_address TEXT,
+      transaction_hash TEXT NOT NULL,
+      log_index INTEGER NOT NULL,
+      block_number INTEGER NOT NULL,
+      observed_at TEXT NOT NULL,
+      trade_side TEXT NOT NULL,
+      target_token_amount REAL,
+      estimated_usd_value REAL,
+      value_source TEXT NOT NULL DEFAULT 'unknown',
+      wallet_category TEXT NOT NULL DEFAULT 'unknown',
+      watchlist_status TEXT NOT NULL DEFAULT 'unknown',
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      UNIQUE(chain_id, transaction_hash, log_index)
+    )`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_events_asset ON ci_wallet_events(discovery_key, observed_at DESC)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_events_wallet ON ci_wallet_events(chain_id, wallet_address, observed_at DESC)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_events_block ON ci_wallet_events(chain_id, pair_address, block_number DESC)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_behavior_signals (
+      signal_id TEXT PRIMARY KEY,
+      chain_id TEXT NOT NULL,
+      discovery_key TEXT NOT NULL,
+      wallet_address TEXT,
+      signal_type TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      confidence_percent REAL,
+      window_start TEXT,
+      window_end TEXT,
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_signals_asset ON ci_wallet_behavior_signals(discovery_key, created_at DESC)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_signals_wallet ON ci_wallet_behavior_signals(chain_id, wallet_address, created_at DESC)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_clusters (
+      cluster_id TEXT PRIMARY KEY,
+      chain_id TEXT NOT NULL,
+      discovery_key TEXT NOT NULL,
+      cluster_type TEXT NOT NULL,
+      verification_status TEXT NOT NULL DEFAULT 'unverified_candidate',
+      member_wallets_json TEXT NOT NULL DEFAULT '[]',
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      first_observed_at TEXT NOT NULL,
+      last_observed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_clusters_asset ON ci_wallet_clusters(discovery_key, last_observed_at DESC)")
+
 
 
 
@@ -4748,6 +4830,66 @@ async function handleProtectedRoutes(request, env, ctx, route) {
 
   /* ---------------- CHAPITRE 6 — INTELLIGENCE COLLECTIVE ------------------ */
 
+
+  /* ---------------- CHAPITRE 7 — BALEINES ET PORTEFEUILLES --------------- */
+
+  if (method === "POST" && path === "/api/wallets/scan") {
+    const body = await readBody(request);
+    const result = await runRadarWalletScan(db, {
+      discovery_key: safeString(body.discovery_key || "", 200),
+      chain_id: safeString(body.chain_id || "", 80),
+      pair_limit: body.pair_limit
+    });
+    return json({ success: true, scan: result }, result.status === "partial" ? 207 : 201);
+  }
+
+  if (method === "POST" && path === "/api/wallets/watchlist") {
+    const body = await readBody(request);
+    const result = await upsertRadarWalletWatchlist(db, body);
+    if (result.error) return errorResponse(result.error, 400);
+    return json({ success: true, wallet: result }, 201);
+  }
+
+  if (method === "GET" && path === "/api/wallets/watchlist") {
+    const chain = safeString(url.searchParams.get("chain_id") || "", 80);
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const result = chain
+      ? await db.prepare("SELECT * FROM ci_wallet_watchlist WHERE chain_id = ? ORDER BY updated_at DESC LIMIT ?").bind(chain, limit).all()
+      : await db.prepare("SELECT * FROM ci_wallet_watchlist ORDER BY updated_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, wallets: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/api/wallets/events") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const wallet = safeString(url.searchParams.get("wallet_address") || "", 100).toLowerCase();
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 100));
+    if (!discoveryKey && !wallet) return errorResponse("discovery_key ou wallet_address requis.");
+    const result = discoveryKey
+      ? await db.prepare("SELECT * FROM ci_wallet_events WHERE discovery_key = ? ORDER BY observed_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_wallet_events WHERE wallet_address = ? ORDER BY observed_at DESC LIMIT ?").bind(wallet, limit).all();
+    return json({ success: true, count: result.results?.length || 0, events: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/api/wallets/signals") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const wallet = safeString(url.searchParams.get("wallet_address") || "", 100).toLowerCase();
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    if (!discoveryKey && !wallet) return errorResponse("discovery_key ou wallet_address requis.");
+    const result = discoveryKey
+      ? await db.prepare("SELECT * FROM ci_wallet_behavior_signals WHERE discovery_key = ? ORDER BY created_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_wallet_behavior_signals WHERE wallet_address = ? ORDER BY created_at DESC LIMIT ?").bind(wallet, limit).all();
+    return json({ success: true, count: result.results?.length || 0, signals: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/api/wallets/clusters") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const limit = Math.max(1, Math.min(300, Number(url.searchParams.get("limit")) || 100));
+    const result = discoveryKey
+      ? await db.prepare("SELECT * FROM ci_wallet_clusters WHERE discovery_key = ? ORDER BY last_observed_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_wallet_clusters ORDER BY last_observed_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, clusters: result.results || [] });
+  }
+
   if (method === "POST" && path === "/api/collective-intelligence/scan") {
     const body = await readBody(request);
     const result = await runCollectiveOpportunityScan(db, body.limit);
@@ -5861,6 +6003,258 @@ async function recordCollectiveCouncilComparison(db, discoveryKey) {
   ).run();
   await audit(db, "collective_council_comparison", discoveryKey + " — " + (critical ? "risque critique" : "comparaison des avis"));
   return { run_id: runId, discovery_key: discoveryKey, session_id: session.session_id, experts_compared: experts.length, arbiter_available: !!arbiter, critical_risk_veto: critical, disagreement_detected: disagreement, risks: riskStatements, hypotheses, facts, evidence, created_at: createdAt };
+}
+
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 7 — SURVEILLANCE DES BALEINES ET PETITS PORTEFEUILLES              */
+/* -------------------------------------------------------------------------- */
+
+const RADAR_WALLET_SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const RADAR_WALLET_THRESHOLDS_USD = { small_trade_max: 500, whale_trade_min: 10000 };
+const RADAR_WALLET_SCAN_MAX_BLOCK_RANGE = 2000;
+const RADAR_WALLET_SCAN_DEFAULT_BLOCK_RANGE = 1000;
+
+async function ensureRadarWalletTables(db) {
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_watchlist (wallet_key TEXT PRIMARY KEY,chain_id TEXT NOT NULL,wallet_address TEXT NOT NULL,label TEXT,wallet_type TEXT NOT NULL DEFAULT 'unknown',profile_status TEXT NOT NULL DEFAULT 'user_supplied_unverified',source_reference TEXT,notes TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(chain_id,wallet_address))`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_scan_cursors (cursor_key TEXT PRIMARY KEY,chain_id TEXT NOT NULL,pair_address TEXT NOT NULL,last_scanned_block INTEGER NOT NULL DEFAULT 0,last_scan_at TEXT,status TEXT NOT NULL DEFAULT 'pending',error_message TEXT)`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_events (event_id TEXT PRIMARY KEY,chain_id TEXT NOT NULL,discovery_key TEXT NOT NULL,pair_address TEXT NOT NULL,wallet_address TEXT NOT NULL,recipient_address TEXT,transaction_hash TEXT NOT NULL,log_index INTEGER NOT NULL,block_number INTEGER NOT NULL,observed_at TEXT NOT NULL,trade_side TEXT NOT NULL,target_token_amount REAL,estimated_usd_value REAL,value_source TEXT NOT NULL DEFAULT 'unknown',wallet_category TEXT NOT NULL DEFAULT 'unknown',watchlist_status TEXT NOT NULL DEFAULT 'unknown',evidence_json TEXT NOT NULL DEFAULT '{}',UNIQUE(chain_id,transaction_hash,log_index))`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_behavior_signals (signal_id TEXT PRIMARY KEY,chain_id TEXT NOT NULL,discovery_key TEXT NOT NULL,wallet_address TEXT,signal_type TEXT NOT NULL,severity TEXT NOT NULL,confidence_percent REAL,window_start TEXT,window_end TEXT,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_wallet_clusters (cluster_id TEXT PRIMARY KEY,chain_id TEXT NOT NULL,discovery_key TEXT NOT NULL,cluster_type TEXT NOT NULL,verification_status TEXT NOT NULL DEFAULT 'unverified_candidate',member_wallets_json TEXT NOT NULL DEFAULT '[]',evidence_json TEXT NOT NULL DEFAULT '{}',first_observed_at TEXT NOT NULL,last_observed_at TEXT NOT NULL,created_at TEXT NOT NULL)`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_events_asset ON ci_wallet_events(discovery_key,observed_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_events_wallet ON ci_wallet_events(chain_id,wallet_address,observed_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_signals_asset ON ci_wallet_behavior_signals(discovery_key,created_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_clusters_asset ON ci_wallet_clusters(discovery_key,last_observed_at DESC)")
+  ]);
+}
+
+function radarWalletDecodeWord(data, index) {
+  const value = safeString(data || "", 20000).replace(/^0x/i, "");
+  const word = value.slice(index * 64, (index + 1) * 64);
+  return word.length === 64 && /^[0-9a-fA-F]+$/.test(word) ? BigInt("0x" + word) : null;
+}
+
+function radarWalletTopicAddress(topic) {
+  const value = safeString(topic || "", 100);
+  return /^0x[0-9a-fA-F]{64}$/.test(value) ? "0x" + value.slice(-40).toLowerCase() : null;
+}
+
+async function radarWalletRpcRequest(rpcUrl, method, params) {
+  const response = await externalJSON(rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+  }, 12000);
+  const payload = response.data || {};
+  if (payload.error) {
+    const error = new Error(safeString(payload.error.message || "Erreur RPC wallet.", 400));
+    error.status = payload.error.code || response.status || 502;
+    throw error;
+  }
+  return payload.result;
+}
+
+function radarWalletTradeCategory(usdValue) {
+  if (usdValue === null || usdValue === undefined) return "unknown";
+  if (usdValue >= RADAR_WALLET_THRESHOLDS_USD.whale_trade_min) return "whale_trade";
+  if (usdValue <= RADAR_WALLET_THRESHOLDS_USD.small_trade_max) return "small_wallet_trade";
+  return "mid_size_trade";
+}
+
+async function upsertRadarWalletWatchlist(db, body = {}) {
+  await ensureRadarWalletTables(db);
+  const chain = safeString(body.chain_id || "", 80).toLowerCase();
+  const address = safeString(body.wallet_address || "", 100).toLowerCase();
+  if (!radarPublicRpc(chain)) return { error: "Réseau non pris en charge par la surveillance on-chain actuelle (Ethereum, BSC et Base)." };
+  if (!/^0x[a-f0-9]{40}$/.test(address)) return { error: "Adresse EVM invalide." };
+  const walletType = ["whale","small","known","unknown","other"].includes(body.wallet_type) ? body.wallet_type : "unknown";
+  const label = safeString(body.label || "", 120) || null;
+  const source = safeString(body.source_reference || "", 500) || null;
+  const notes = safeString(body.notes || "", 1000) || null;
+  const key = chain + ":" + address;
+  const timestamp = nowISO();
+  await db.prepare(`INSERT INTO ci_wallet_watchlist (wallet_key,chain_id,wallet_address,label,wallet_type,profile_status,source_reference,notes,created_at,updated_at)
+    VALUES (?,?,?,?,?,'user_supplied_unverified',?,?,?,?)
+    ON CONFLICT(wallet_key) DO UPDATE SET label=excluded.label,wallet_type=excluded.wallet_type,source_reference=excluded.source_reference,notes=excluded.notes,updated_at=excluded.updated_at`).bind(
+      key, chain, address, label, walletType, source, notes, timestamp, timestamp
+    ).run();
+  await audit(db,"wallet_watchlist_updated",chain+":"+address+" — profil utilisateur non vérifié");
+  return { wallet_key:key, chain_id:chain, wallet_address:address, label, wallet_type:walletType, profile_status:"user_supplied_unverified", source_reference:source, notes, updated_at:timestamp };
+}
+
+async function recordRadarWalletBehavior(db, chain, discoveryKey) {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const rows = await db.prepare("SELECT wallet_address,trade_side,estimated_usd_value,observed_at,block_number,pair_address,wallet_category FROM ci_wallet_events WHERE chain_id = ? AND discovery_key = ? AND observed_at >= ? ORDER BY observed_at DESC LIMIT 1000").bind(chain, discoveryKey, cutoff).all();
+  const events = rows.results || [];
+  const byWallet = new Map();
+  for (const event of events) {
+    if (!byWallet.has(event.wallet_address)) byWallet.set(event.wallet_address, []);
+    byWallet.get(event.wallet_address).push(event);
+  }
+  let signals = 0;
+  for (const [wallet, activity] of byWallet) {
+    const buys = activity.filter(item => item.trade_side === "buy");
+    const sells = activity.filter(item => item.trade_side === "sell");
+    if (buys.length >= 3) {
+      const total = buys.reduce((sum,item)=>sum+(radarFiniteMetric(item.estimated_usd_value)||0),0);
+      const first = buys[buys.length-1].observed_at, last = buys[0].observed_at;
+      await db.prepare("INSERT INTO ci_wallet_behavior_signals (signal_id,chain_id,discovery_key,wallet_address,signal_type,severity,confidence_percent,window_start,window_end,evidence_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(
+        crypto.randomUUID(),chain,discoveryKey,wallet,"repeated_accumulation","watch",Math.min(90,55+buys.length*5),first,last,
+        JSON.stringify({buy_count:buys.length,sell_count:sells.length,estimated_buy_value_usd:total,wallet_category:activity[0]?.wallet_category||"unknown",note:"Achats répétés observés sur des événements Swap; intention ou solde net non déduits."}),nowISO()
+      ).run();
+      signals++;
+    }
+    if (sells.length >= 3) {
+      await db.prepare("INSERT INTO ci_wallet_behavior_signals (signal_id,chain_id,discovery_key,wallet_address,signal_type,severity,confidence_percent,window_start,window_end,evidence_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(
+        crypto.randomUUID(),chain,discoveryKey,wallet,"repeated_distribution","watch",Math.min(90,55+sells.length*5),sells[sells.length-1].observed_at,sells[0].observed_at,
+        JSON.stringify({sell_count:sells.length,buy_count:buys.length,note:"Ventes répétées observées sur des événements Swap; solde total du portefeuille non connu."}),nowISO()
+      ).run();
+      signals++;
+    }
+  }
+
+  // Plusieurs adresses actives dans une fenêtre de blocs rapprochée: piste de comportement similaire,
+  // jamais preuve d'une identité commune, d'un financement commun ou d'une coordination.
+  const buckets = new Map();
+  for (const event of events.filter(item => item.trade_side === "buy" && Number.isFinite(Number(item.block_number)))) {
+    const bucket = Math.floor(Number(event.block_number) / 100);
+    if (!buckets.has(bucket)) buckets.set(bucket, new Map());
+    const wallets = buckets.get(bucket);
+    if (!wallets.has(event.wallet_address)) wallets.set(event.wallet_address, []);
+    wallets.get(event.wallet_address).push(event);
+  }
+  for (const [bucket, wallets] of buckets) {
+    const small = [...wallets.entries()].filter(([,items])=>items.some(item=>item.wallet_category==="small_wallet_trade"));
+    if (small.length < 5) continue;
+    const members = small.map(([wallet])=>wallet).sort();
+    const first = small.flatMap(([,items])=>items.map(item=>item.observed_at)).sort()[0];
+    const last = small.flatMap(([,items])=>items.map(item=>item.observed_at)).sort().slice(-1)[0];
+    const clusterKey = chain+":"+discoveryKey+":small-buys:"+bucket;
+    await db.prepare("INSERT OR IGNORE INTO ci_wallet_clusters (cluster_id,chain_id,discovery_key,cluster_type,verification_status,member_wallets_json,evidence_json,first_observed_at,last_observed_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(
+      clusterKey,chain,discoveryKey,"temporally_similar_small_wallet_buys","unverified_candidate",JSON.stringify(members),
+      JSON.stringify({block_bucket_100:bucket,member_count:members.length,note:"Proximité temporelle seulement. Aucun lien d'identité, financement, contrôle commun ou coordination n'est prouvé."}),
+      first,last,nowISO()
+    ).run();
+    await db.prepare("INSERT INTO ci_wallet_behavior_signals (signal_id,chain_id,discovery_key,wallet_address,signal_type,severity,confidence_percent,window_start,window_end,evidence_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(
+      crypto.randomUUID(),chain,discoveryKey,null,"small_wallet_co_accumulation_candidate","research",45,first,last,
+      JSON.stringify({cluster_id:clusterKey,member_wallets:members,verification_status:"unverified_candidate",note:"Regroupement temporel exploratoire, pas preuve de coordination."}),nowISO()
+    ).run();
+    signals++;
+  }
+  return {events_examined:events.length,wallets_observed:byWallet.size,signals_created:signals};
+}
+
+async function runRadarWalletScan(db, options = {}) {
+  await ensureRadarWalletTables(db);
+  const chainFilter = safeString(options.chain_id || "",80).toLowerCase();
+  const discoveryFilter = safeString(options.discovery_key || "",200);
+  const pairLimit = Math.max(1,Math.min(20,Number(options.pair_limit)||5));
+  const pairs = await db.prepare(
+    "SELECT p.chain_id,p.pair_address,p.token_address,p.token_symbol,p.pair_key,d.discovery_key FROM ci_radar_pairs p JOIN ci_radar_discoveries d ON lower(d.chain_id)=lower(p.chain_id) AND lower(d.contract_address)=lower(p.token_address) WHERE (?='' OR lower(p.chain_id)=?) AND (?='' OR d.discovery_key=?) ORDER BY p.last_seen_at DESC LIMIT ?"
+  ).bind(chainFilter,chainFilter,discoveryFilter,discoveryFilter,pairLimit).all();
+  const results = [];
+  let eventsSaved=0, signalsCreated=0, errors=0;
+  for (const pair of pairs.results || []) {
+    const rpc = radarPublicRpc(pair.chain_id);
+    if (!rpc) { results.push({pair_address:pair.pair_address,status:"unsupported_chain"}); continue; }
+    const cursorKey = (pair.chain_id+":"+pair.pair_address).toLowerCase();
+    try {
+      const latestHex = await radarWalletRpcRequest(rpc.url,"eth_blockNumber",[]);
+      const latestBlock = Number(BigInt(latestHex));
+      if (!Number.isSafeInteger(latestBlock) || latestBlock < 1) throw new Error("Hauteur de bloc RPC invalide.");
+      const cursor = await db.prepare("SELECT last_scanned_block FROM ci_wallet_scan_cursors WHERE cursor_key = ?").bind(cursorKey).first();
+      const configuredRange = Math.max(1,Math.min(RADAR_WALLET_SCAN_MAX_BLOCK_RANGE,Number(options.block_range)||RADAR_WALLET_SCAN_DEFAULT_BLOCK_RANGE));
+      const fromBlock = cursor ? Math.max(0,Number(cursor.last_scanned_block)+1) : Math.max(0,latestBlock-configuredRange+1);
+      const toBlock = Math.min(latestBlock,fromBlock+configuredRange-1);
+      if (fromBlock>toBlock) { results.push({pair_address:pair.pair_address,status:"up_to_date",last_scanned_block:latestBlock}); continue; }
+      const logs = await radarWalletRpcRequest(rpc.url,"eth_getLogs",[{address:pair.pair_address,fromBlock:"0x"+fromBlock.toString(16),toBlock:"0x"+toBlock.toString(16),topics:[RADAR_WALLET_SWAP_TOPIC] }]);
+      if (!Array.isArray(logs)) throw new Error("Réponse eth_getLogs invalide.");
+      await recordProviderUsage(db,"publicnode_wallet_rpc",true,200);
+      const tokenCheck = await db.prepare("SELECT token0_address,token1_address,token0_decimals,token1_decimals FROM ci_radar_onchain_pool_checks WHERE chain_id = ? AND pair_address = ? AND outcome = 'onchain_reserves_read' ORDER BY checked_at DESC LIMIT 1").bind(pair.chain_id,pair.pair_address).first();
+      let token0=tokenCheck?.token0_address||null,token1=tokenCheck?.token1_address||null;
+      let decimals0=radarFiniteMetric(tokenCheck?.token0_decimals),decimals1=radarFiniteMetric(tokenCheck?.token1_decimals);
+      if (!token0 || !token1) {
+        const values=await Promise.all([
+          radarRpcCall(rpc.url,"eth_call",[{to:pair.pair_address,data:"0x0dfe1681"},"latest"]),
+          radarRpcCall(rpc.url,"eth_call",[{to:pair.pair_address,data:"0xd21220a7"},"latest"])
+        ]);
+        token0=radarDecodeAddress(values[0]);token1=radarDecodeAddress(values[1]);
+      }
+      const target=String(pair.token_address||"").toLowerCase();
+      const targetIndex=String(token0||"").toLowerCase()===target?0:String(token1||"").toLowerCase()===target?1:-1;
+      if (targetIndex<0) throw new Error("Le token surveillé ne correspond pas aux tokens on-chain de la paire.");
+      const targetDecimals=targetIndex===0?decimals0:decimals1;
+      let resolvedDecimals=targetDecimals;
+      if (resolvedDecimals===null || resolvedDecimals===undefined) {
+        const tokenResult=await radarRpcCall(rpc.url,"eth_call",[{to:target,data:"0x313ce567"},"latest"]);
+        const word=radarHexWord(tokenResult,0);
+        resolvedDecimals=word?Number(BigInt("0x"+word)):null;
+      }
+      if (!Number.isInteger(resolvedDecimals)||resolvedDecimals<0||resolvedDecimals>36) throw new Error("Décimales du token indisponibles ou invalides.");
+      const priceRow=await db.prepare("SELECT price_usd FROM ci_radar_pool_metrics WHERE discovery_key = ? AND pair_address = ? ORDER BY observed_at DESC LIMIT 1").bind(pair.discovery_key,pair.pair_address).first();
+      const tokenPrice=radarFiniteMetric(priceRow?.price_usd);
+      let pairEvents=0;
+      for (const log of logs.slice(0,100)) {
+        if (!Array.isArray(log.topics)||log.topics.length<3||!log.transactionHash) continue;
+        const words=[0,1,2,3].map(index=>radarWalletDecodeWord(log.data,index));
+        if (words.some(value=>value===null)) continue;
+        const targetIn=words[targetIndex],targetOut=words[targetIndex+2];
+        let side="unknown",rawAmount=null;
+        if (targetOut>0n && targetIn===0n) { side="buy";rawAmount=targetOut; }
+        else if (targetIn>0n && targetOut===0n) { side="sell";rawAmount=targetIn; }
+        else continue;
+        const tx=await radarWalletRpcRequest(rpc.url,"eth_getTransactionByHash",[log.transactionHash]);
+        const wallet=String(tx?.from||"").toLowerCase();
+        if (!/^0x[a-f0-9]{40}$/.test(wallet)) continue;
+        const tokenAmount=Number(rawAmount)/Math.pow(10,resolvedDecimals);
+        const usdValue=tokenPrice!==null&&tokenPrice>0&&Number.isFinite(tokenAmount)?tokenAmount*tokenPrice:null;
+        const category=radarWalletTradeCategory(usdValue);
+        const watch=await db.prepare("SELECT wallet_type,profile_status FROM ci_wallet_watchlist WHERE chain_id = ? AND wallet_address = ?").bind(pair.chain_id,wallet).first();
+        const blockNumber=Number(BigInt(log.blockNumber));
+        const recipient=radarWalletTopicAddress(log.topics[2]);
+        const observedAt=nowISO();
+        const evidence={
+          source:"PublicNode eth_getLogs + eth_getTransactionByHash",
+          event:"Uniswap-V2-compatible Swap",
+          transaction_origin_wallet:wallet,
+          pair_address:pair.pair_address,
+          target_token_address:target,
+          target_token_index:targetIndex,
+          raw_amounts:{amount0_in:words[0].toString(),amount1_in:words[1].toString(),amount0_out:words[2].toString(),amount1_out:words[3].toString()},
+          token_decimals:resolvedDecimals,
+          token_price_usd_reference:tokenPrice,
+          usd_value_is_estimate:true,
+          recipient_address:recipient,
+          wallet_identity_verified:false,
+          trade_classification:"Swap event decoded; transaction origin used as wallet actor. Smart routers/contract wallets may represent an intermediary.",
+          transfer_only_events_excluded:true
+        };
+        const inserted=await db.prepare("INSERT OR IGNORE INTO ci_wallet_events (event_id,chain_id,discovery_key,pair_address,wallet_address,recipient_address,transaction_hash,log_index,block_number,observed_at,trade_side,target_token_amount,estimated_usd_value,value_source,wallet_category,watchlist_status,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+          crypto.randomUUID(),pair.chain_id,pair.discovery_key,pair.pair_address,wallet,recipient,log.transactionHash,Number(BigInt(log.logIndex)),blockNumber,observedAt,side,tokenAmount,usdValue,
+          tokenPrice!==null?"provider_price_estimate":"unknown",category,watch?.profile_status||"unknown",JSON.stringify(evidence)
+        ).run();
+        if (Number(inserted.meta?.changes||0)>0) { eventsSaved++;pairEvents++; }
+      }
+      await db.prepare("INSERT INTO ci_wallet_scan_cursors (cursor_key,chain_id,pair_address,last_scanned_block,last_scan_at,status,error_message) VALUES (?,?,?,?,?,'completed',NULL) ON CONFLICT(cursor_key) DO UPDATE SET last_scanned_block=excluded.last_scanned_block,last_scan_at=excluded.last_scan_at,status='completed',error_message=NULL").bind(
+        cursorKey,pair.chain_id,pair.pair_address,toBlock,nowISO()
+      ).run();
+      results.push({pair_address:pair.pair_address,chain_id:pair.chain_id,status:"completed",from_block:fromBlock,to_block:toBlock,swap_logs_found:logs.length,events_saved:pairEvents});
+      const behavior=await recordRadarWalletBehavior(db,pair.chain_id,pair.discovery_key);
+      signalsCreated+=behavior.signals_created;
+    } catch(error) {
+      errors++;
+      await db.prepare("INSERT INTO ci_wallet_scan_cursors (cursor_key,chain_id,pair_address,last_scanned_block,last_scan_at,status,error_message) VALUES (?,?,?,0,?,'error',?) ON CONFLICT(cursor_key) DO UPDATE SET last_scan_at=excluded.last_scan_at,status='error',error_message=excluded.error_message").bind(
+        cursorKey,pair.chain_id,pair.pair_address,nowISO(),safeString(error.message||"Erreur scan wallet.",500)
+      ).run();
+      await recordProviderUsage(db,"publicnode_wallet_rpc",false,error.status||500);
+      results.push({pair_address:pair.pair_address,chain_id:pair.chain_id,status:"error",error:safeString(error.message||"Erreur RPC.",300)});
+    }
+  }
+  const status=errors?(results.length===errors?"failed":"partial"):"completed";
+  await audit(db,"wallet_monitoring_scan",eventsSaved+" événements Swap ajoutés; "+signalsCreated+" signaux comportementaux; "+errors+" erreurs.");
+  return {status,pairs_examined:results.length,events_saved:eventsSaved,signals_created:signalsCreated,errors,results,thresholds_usd:RADAR_WALLET_THRESHOLDS_USD,supported_chains:["Ethereum","BSC","Base"],limitations:["Lecture des événements Swap V2 compatibles uniquement; les autres AMM ne sont pas couverts par ce parseur.","L'adresse from de la transaction est l'initiateur, pas nécessairement le bénéficiaire économique.","Les valeurs USD sont estimées avec le dernier prix DexScreener connu.","Les transferts ERC-20 simples ne sont jamais comptés comme achats ou ventes.","Les clusters temporels restent non vérifiés et ne prouvent aucune relation entre portefeuilles."]};
 }
 
 
