@@ -297,7 +297,48 @@ async function initializeBackendTables(db) {
     db.prepare(`
       CREATE INDEX IF NOT EXISTS idx_ci_usage_provider_date
       ON ci_provider_usage(provider, created_at)
+    `),
+
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ci_radar_discoveries (
+        discovery_key TEXT PRIMARY KEY,
+        chain_id TEXT NOT NULL,
+        contract_address TEXT NOT NULL,
+        token_name TEXT,
+        token_symbol TEXT,
+        pair_addresses_json TEXT NOT NULL DEFAULT '[]',
+        sources_json TEXT NOT NULL DEFAULT '[]',
+        source_details_json TEXT NOT NULL DEFAULT '{}',
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        pair_created_at TEXT,
+        status TEXT NOT NULL DEFAULT 'quarantine',
+        review_reason TEXT NOT NULL DEFAULT 'Nouvelle découverte : vérification en attente.',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(chain_id, contract_address)
+      )
+    `),
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_ci_radar_first_seen
+      ON ci_radar_discoveries(first_seen_at DESC)
+    `),
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_ci_radar_status
+      ON ci_radar_discoveries(status, last_seen_at DESC)
+    `),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ci_radar_scans (
+        id TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        status TEXT NOT NULL,
+        discovered_count INTEGER NOT NULL DEFAULT 0,
+        source_results_json TEXT NOT NULL DEFAULT '{}',
+        error_summary TEXT
+      )
     `)
+
   ]);
 }
 
@@ -1984,6 +2025,223 @@ async function getGoPlusTokenSecurity(chainId, contractAddress) {
   };
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* RADAR AUTOMATIQUE DES NOUVEAUX TOKENS ET PAIRES                             */
+/* -------------------------------------------------------------------------- */
+
+async function fetchRadarSource(db, provider, url) {
+  try {
+    const { data, status } = await externalJSON(url);
+    await recordProviderUsage(db, provider, true, status);
+    return { ok: true, data };
+  } catch (error) {
+    await recordProviderUsage(db, provider, false, error.status || 500);
+    return { ok: false, error: safeString(error.message || "Erreur fournisseur.", 500) };
+  }
+}
+
+function radarArray(value) {
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value?.data)) return value.data;
+  return [];
+}
+
+function normalizeRadarToken(chain, address, name, symbol, source, details = {}) {
+  const chainId = safeString(chain, 80).trim();
+  const contract = safeString(address, 200).trim();
+  if (!chainId || !contract) return null;
+  return {
+    chain_id: chainId,
+    contract_address: contract,
+    token_name: safeString(name || "", 180) || null,
+    token_symbol: safeString(symbol || "", 60) || null,
+    source,
+    pair_address: safeString(details.pair_address || "", 200) || null,
+    pair_created_at: details.pair_created_at || null,
+    details
+  };
+}
+
+function geckoTokenAddress(pool, included) {
+  const relation = pool.relationships?.base_token?.data ||
+    pool.relationships?.quote_token?.data;
+  if (!relation?.id) return null;
+  const token = (included || []).find((item) => item.id === relation.id);
+  const attrs = token?.attributes || {};
+  const id = String(relation.id);
+  return {
+    address: attrs.address || id.slice(id.indexOf("_") + 1),
+    name: attrs.name || null,
+    symbol: attrs.symbol || null
+  };
+}
+
+async function persistRadarDiscoveries(db, discoveries) {
+  let inserted = 0;
+  for (const item of discoveries) {
+    if (!item) continue;
+    const key = (item.chain_id + ":" + item.contract_address).toLowerCase();
+    const existing = await db.prepare(
+      "SELECT pair_addresses_json, sources_json, source_details_json " +
+      "FROM ci_radar_discoveries WHERE discovery_key = ?"
+    ).bind(key).first();
+
+    const pairs = new Set();
+    const sources = new Set();
+    let sourceDetails = {};
+    if (existing) {
+      try { for (const value of JSON.parse(existing.pair_addresses_json || "[]")) pairs.add(value); } catch {}
+      try { for (const value of JSON.parse(existing.sources_json || "[]")) sources.add(value); } catch {}
+      try { sourceDetails = JSON.parse(existing.source_details_json || "{}"); } catch {}
+    }
+    if (item.pair_address) pairs.add(item.pair_address);
+    for (const source of String(item.source).split("+")) sources.add(source);
+    sourceDetails = { ...sourceDetails, ...(item.details || {}) };
+
+    const timestamp = nowISO();
+    if (!existing) {
+      await db.prepare(`
+        INSERT INTO ci_radar_discoveries
+        (discovery_key, chain_id, contract_address, token_name, token_symbol,
+         pair_addresses_json, sources_json, source_details_json, first_seen_at,
+         last_seen_at, pair_created_at, status, review_reason, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'quarantine',
+                'Nouvelle découverte : identité, contrat, liquidité et possibilité de vente à vérifier.',
+                ?, ?)
+      `).bind(
+        key, item.chain_id, item.contract_address, item.token_name,
+        item.token_symbol, JSON.stringify([...pairs]), JSON.stringify([...sources]),
+        JSON.stringify(sourceDetails), timestamp, timestamp,
+        item.pair_created_at, timestamp, timestamp
+      ).run();
+      inserted++;
+    } else {
+      await db.prepare(`
+        UPDATE ci_radar_discoveries
+        SET token_name = COALESCE(token_name, ?),
+            token_symbol = COALESCE(token_symbol, ?),
+            pair_addresses_json = ?, sources_json = ?,
+            source_details_json = ?, last_seen_at = ?, updated_at = ?,
+            pair_created_at = COALESCE(pair_created_at, ?)
+        WHERE discovery_key = ?
+      `).bind(
+        item.token_name, item.token_symbol, JSON.stringify([...pairs]),
+        JSON.stringify([...sources]), JSON.stringify(sourceDetails),
+        timestamp, timestamp, item.pair_created_at, key
+      ).run();
+    }
+  }
+  return inserted;
+}
+
+async function runRadarDiscovery(db) {
+  await initializeBackendTables(db);
+  const scanId = crypto.randomUUID();
+  const startedAt = nowISO();
+  await db.prepare(`
+    INSERT INTO ci_radar_scans (id, started_at, status)
+    VALUES (?, ?, 'running')
+  `).bind(scanId, startedAt).run();
+
+  const endpoints = [
+    { provider: "dexscreener_profiles", url: "https://api.dexscreener.com/token-profiles/latest/v1" },
+    { provider: "dexscreener_boosts", url: "https://api.dexscreener.com/token-boosts/latest/v1" },
+    { provider: "geckoterminal_new_pools", url: "https://api.geckoterminal.com/api/v2/networks/new_pools?include=base_token,quote_token,network,dex" }
+  ];
+  const responses = await Promise.all(
+    endpoints.map((source) => fetchRadarSource(db, source.provider, source.url))
+  );
+  const discoveries = [];
+  const sourceResults = {};
+
+  for (let index = 0; index < responses.length; index++) {
+    const response = responses[index];
+    const provider = endpoints[index].provider;
+    sourceResults[provider] = response.ok
+      ? { success: true, items: radarArray(response.data).length }
+      : { success: false, error: response.error };
+    if (!response.ok) continue;
+
+    if (provider === "dexscreener_profiles" || provider === "dexscreener_boosts") {
+      for (const token of radarArray(response.data)) {
+        discoveries.push(normalizeRadarToken(
+          token.chainId, token.tokenAddress, token.name, token.symbol, provider,
+          { url: token.url || null, description: token.description || null,
+            icon: token.icon || null, links: token.links || [] }
+        ));
+      }
+    }
+
+    if (provider === "geckoterminal_new_pools") {
+      const pools = radarArray(response.data);
+      const included = response.data?.included || [];
+      for (const pool of pools) {
+        const token = geckoTokenAddress(pool, included);
+        if (!token) continue;
+        const network = pool.relationships?.network?.data?.id ||
+          String(pool.id || "").split("_")[0];
+        const attrs = pool.attributes || {};
+        discoveries.push(normalizeRadarToken(
+          network, token.address, token.name, token.symbol, provider,
+          { pair_address: attrs.address || null, pair_name: attrs.name || null,
+            pair_created_at: attrs.pool_created_at || null,
+            reserve_in_usd: attrs.reserve_in_usd ?? null,
+            volume_usd: attrs.volume_usd || null }
+        ));
+      }
+    }
+  }
+
+  const unique = new Map();
+  for (const item of discoveries) {
+    if (!item) continue;
+    const key = (item.chain_id + ":" + item.contract_address).toLowerCase();
+    const previous = unique.get(key);
+    if (!previous) unique.set(key, item);
+    else {
+      if (item.pair_address) previous.pair_address = item.pair_address;
+      if (item.token_name && !previous.token_name) previous.token_name = item.token_name;
+      if (item.token_symbol && !previous.token_symbol) previous.token_symbol = item.token_symbol;
+      previous.details = { ...(previous.details || {}), [item.source]: item.details };
+      previous.source = previous.source + "+" + item.source;
+    }
+  }
+
+  let inserted = 0;
+  let status = "partial";
+  let errorSummary = null;
+  try {
+    inserted = await persistRadarDiscoveries(db, [...unique.values()]);
+    const successfulSources = Object.values(sourceResults).filter((value) => value.success).length;
+    status = successfulSources === endpoints.length ? "completed" :
+      successfulSources > 0 ? "partial" : "failed";
+    if (status === "failed") errorSummary = "Aucune source de découverte n'a répondu correctement.";
+  } catch (error) {
+    status = "failed";
+    errorSummary = safeString(error.message || "Erreur d'enregistrement.", 1000);
+  }
+
+  await db.prepare(`
+    UPDATE ci_radar_scans
+    SET completed_at = ?, status = ?, discovered_count = ?,
+        source_results_json = ?, error_summary = ?
+    WHERE id = ?
+  `).bind(
+    nowISO(), status, inserted, JSON.stringify(sourceResults), errorSummary, scanId
+  ).run();
+  await audit(
+    db, "radar_scan_" + status,
+    "Radar : " + inserted + " nouveau(x) contrat(s) ; sources : " +
+    Object.keys(sourceResults).filter((key) => sourceResults[key].success).join(", ")
+  );
+  return {
+    scan_id: scanId, status, newly_discovered_contracts: inserted,
+    candidates_received: discoveries.length, sources: sourceResults,
+    quarantine: true, scanned_at: startedAt, completed_at: nowISO()
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* FOURNISSEURS D'INTELLIGENCE ARTIFICIELLE                                   */
 /* -------------------------------------------------------------------------- */
@@ -2767,6 +3025,42 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, asset }, 201);
   }
 
+  /* ------------------------------ RADAR ---------------------------------- */
+
+  if (method === "GET" && path === "/api/radar/discoveries") {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const status = url.searchParams.get("status");
+    const result = status
+      ? await db.prepare(
+          "SELECT * FROM ci_radar_discoveries WHERE status = ? ORDER BY first_seen_at DESC LIMIT ?"
+        ).bind(status, limit).all()
+      : await db.prepare(
+          "SELECT * FROM ci_radar_discoveries ORDER BY first_seen_at DESC LIMIT ?"
+        ).bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, discoveries: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/api/radar/status") {
+    const [totals, latest] = await Promise.all([
+      db.prepare("SELECT status, COUNT(*) AS count FROM ci_radar_discoveries GROUP BY status").all(),
+      db.prepare("SELECT * FROM ci_radar_scans ORDER BY started_at DESC LIMIT 1").first()
+    ]);
+    return json({
+      success: true,
+      radar: {
+        implemented: true,
+        automatic_schedule: "*/5 * * * *",
+        sources: ["DexScreener token profiles", "DexScreener latest boosts", "GeckoTerminal new pools"],
+        status_counts: totals.results || [],
+        latest_scan: latest || null
+      }
+    });
+  }
+
+  if (method === "POST" && path === "/api/radar/scan") {
+    return json({ success: true, scan: await runRadarDiscovery(db) });
+  }
+
   /* -------------------------- DONNÉES DE MARCHÉ -------------------------- */
 
   if (method === "GET" && path === "/api/market/search") {
@@ -3119,5 +3413,12 @@ export default {
       statusText: response.statusText,
       headers
     });
+  },
+
+  async scheduled(controller, env, ctx) {
+    const db = getDB(env);
+    const task = runRadarDiscovery(db);
+    if (ctx?.waitUntil) ctx.waitUntil(task);
+    else await task;
   }
 };
