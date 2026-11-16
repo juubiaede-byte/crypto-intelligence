@@ -2194,6 +2194,32 @@ async function syncRadarAssetLifecycleMissing(db, limit = 1000) {
   return { scanned: rows.results?.length || 0, initialized, has_more: (rows.results || []).length === batchLimit };
 }
 
+function validateRadarLifecycleEvidenceSubstance(evidence) {
+  const priceOnlyTerms = /^(price|price increase|price rise|pump|dump|variation|price change|price change 24h|percentage change|roi)$/i;
+  const priceKey = /(price|pump|dump|variation|percent|percentage|roi)/i;
+  const inspect = (value, key = "") => {
+    if (priceKey.test(key)) return false;
+    if (value === null || value === undefined) return false;
+    if (typeof value === "string") {
+      const normalized = value.trim();
+      return normalized.length > 0 && !priceOnlyTerms.test(normalized);
+    }
+    if (typeof value === "number") return Number.isFinite(value);
+    if (typeof value === "boolean") return true;
+    if (Array.isArray(value)) return value.some(item => inspect(item, key));
+    if (typeof value === "object") {
+      return Object.entries(value).some(([childKey, childValue]) => inspect(childValue, childKey));
+    }
+    return false;
+  };
+  const observationKeys = ["observation", "observations", "finding", "findings", "checks", "metrics", "identity", "contract", "liquidity", "security", "onchain", "holders", "volume", "market_data"];
+  const observation = Object.entries(evidence || {}).find(([key]) => observationKeys.includes(key.toLowerCase()));
+  if (!observation || !inspect(observation[1], observation[0])) {
+    return "Les preuves doivent contenir un constat concret autre qu'une simple hausse ou variation de prix.";
+  }
+  return null;
+}
+
 function validateRadarLifecycleEvidence(evidence) {
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
     return "Les preuves doivent être un objet structuré.";
@@ -2259,6 +2285,8 @@ async function transitionRadarAssetLifecycle(db, body) {
   const evidence = body.evidence && typeof body.evidence === "object" && !Array.isArray(body.evidence) ? body.evidence : {};
   const evidenceError = validateRadarLifecycleEvidence(evidence);
   if (evidenceError) return { error: evidenceError };
+  const substanceError = validateRadarLifecycleEvidenceSubstance(evidence);
+  if (substanceError) return { error: substanceError };
   const evidenceJson = JSON.stringify(evidence);
   const timestamp = nowISO();
   const eventId = cryptoRandomId();
