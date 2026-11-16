@@ -7688,3 +7688,311 @@ function validateConanOwnedCodeSource(source){
   for(const item of forbidden)if(item.pattern.test(code))issues.push("API non autorisée dans l'espace de code isolé : "+item.label+".");
   return {valid:issues.length===0,issues,source_characters:code.length,execution_status:"not_executable_by_application_worker",note:"Validation statique uniquement; aucune exécution de code arbitraire n'est autorisée."};
 }
+
+
+// CHAPTER 13 — CONAN INTELLIGENT MEMORY, SEMANTIC RECALL AND ARCHIVES.
+// Memory tiers: essential, useful, experimental, archives.
+// Personal memory is stored in a separate table from operational memory.
+// Raw source records remain untouched; archive-tier entries are references/copies,
+// never permission to delete original operational or historical records.
+const CONAN_MEMORY_METHODOLOGY = "conan-four-tier-semantic-recall-v1";
+const CONAN_MEMORY_TIERS = ["essential","useful","experimental","archives"];
+
+async function ensureConanMemoryTables(db){
+  await db.batch([
+    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_records (
+      memory_id TEXT PRIMARY KEY,
+      memory_scope TEXT NOT NULL,
+      tier TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      structured_data_json TEXT NOT NULL DEFAULT '{}',
+      exact_values_json TEXT NOT NULL DEFAULT '{}',
+      source_refs_json TEXT NOT NULL DEFAULT '[]',
+      observed_at TEXT,
+      confidence_percent REAL,
+      uncertainty_json TEXT NOT NULL DEFAULT '[]',
+      context_tags_json TEXT NOT NULL DEFAULT '[]',
+      outcome_json TEXT NOT NULL DEFAULT '{}',
+      content_fingerprint TEXT NOT NULL,
+      original_record_ref TEXT,
+      duplicate_of TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )\`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_memory_scope_tier ON ci_conan_memory_records(memory_scope,tier,status,updated_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_memory_fingerprint ON ci_conan_memory_records(memory_scope,content_fingerprint)"),
+    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_links (
+      link_id TEXT PRIMARY KEY,
+      from_memory_id TEXT NOT NULL,
+      to_memory_id TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )\`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_memory_links_from ON ci_conan_memory_links(from_memory_id,created_at DESC)"),
+    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_recall_log (
+      recall_id TEXT PRIMARY KEY,
+      memory_scope TEXT NOT NULL,
+      query_text TEXT NOT NULL,
+      context_json TEXT NOT NULL DEFAULT '{}',
+      results_json TEXT NOT NULL DEFAULT '[]',
+      methodology TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )\`),
+    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_tier_history (
+      event_id TEXT PRIMARY KEY,
+      memory_id TEXT NOT NULL,
+      from_tier TEXT,
+      to_tier TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    )\`),
+    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_personal_memory (
+      personal_memory_id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      structured_data_json TEXT NOT NULL DEFAULT '{}',
+      source_refs_json TEXT NOT NULL DEFAULT '[]',
+      confidence_percent REAL,
+      uncertainty_json TEXT NOT NULL DEFAULT '[]',
+      content_fingerprint TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )\`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_personal_memory_fingerprint ON ci_conan_personal_memory(content_fingerprint)"),
+    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_backups (
+      backup_id TEXT PRIMARY KEY,
+      memory_scope TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      verified INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    )\`)
+  ]);
+  for(const table of ["ci_conan_memory_records","ci_conan_memory_links","ci_conan_memory_recall_log","ci_conan_memory_tier_history","ci_conan_personal_memory","ci_conan_memory_backups"]){
+    if(!ARCHIVE_TABLES.includes(table))ARCHIVE_TABLES.push(table);
+  }
+}
+
+function conanMemoryNormalize(value){
+  return String(value??"").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9_$.-]+/g," ").trim();
+}
+
+function conanMemoryTokens(value){
+  const stop=new Set(["avec","dans","pour","mais","donc","this","that","from","with","have","will","were","been","the","and","for","are","was","une","des","les","est","sur","par","qui","que"]);
+  return [...new Set(conanMemoryNormalize(value).split(/\s+/).filter(token=>token.length>2&&!stop.has(token)))].slice(0,160);
+}
+
+function conanMemoryFingerprint(payload){
+  const normalized={
+    title:conanMemoryNormalize(payload.title),
+    summary:conanMemoryNormalize(payload.summary),
+    exact_values:payload.exact_values||{},
+    source_refs:payload.source_refs||[],
+    observed_at:payload.observed_at||null
+  };
+  return conanIncubatorFingerprint(normalized);
+}
+
+function scoreConanMemoryRelevance(record,query,context){
+  const queryTokens=conanMemoryTokens(query);
+  const titleTokens=conanMemoryTokens(record.title);
+  const summaryTokens=conanMemoryTokens(record.summary);
+  const tags=Array.isArray(record.context_tags)?record.context_tags:[];
+  const recordTokens=new Set([...titleTokens,...summaryTokens,...conanMemoryTokens(tags.join(" "))]);
+  if(!queryTokens.length)return {score:0,matched_terms:[]};
+  const matched=queryTokens.filter(token=>recordTokens.has(token));
+  const overlap=matched.length/queryTokens.length;
+  const titleBoost=matched.some(token=>titleTokens.includes(token))?0.15:0;
+  const contextTags=Array.isArray(context?.context_tags)?context.context_tags:[];
+  const contextMatches=contextTags.filter(tag=>tags.some(existing=>conanMemoryNormalize(existing)===conanMemoryNormalize(tag))).length;
+  const contextBoost=Math.min(0.2,contextMatches*0.05);
+  const outcomeText=JSON.stringify(record.outcome||{});
+  const outcomeBoost=context?.outcome_type&&outcomeText.toLowerCase().includes(String(context.outcome_type).toLowerCase())?0.05:0;
+  return {score:Math.min(1,overlap*0.6+titleBoost+contextBoost+outcomeBoost),matched_terms:matched};
+}
+
+async function createConanMemoryRecord(db,body){
+  await ensureConanMemoryTables(db);
+  const scope=body.memory_scope==="personal"?"personal":"operational";
+  const tier=CONAN_MEMORY_TIERS.includes(body.tier)?body.tier:"useful";
+  const title=safeString(body.title||"",200);
+  const summary=safeString(body.summary||"",5000);
+  if(!title||!summary)throw new Error("title et summary sont obligatoires.");
+  const confidence=body.confidence_percent===null||body.confidence_percent===undefined?null:radarFiniteMetric(body.confidence_percent);
+  if(confidence!==null&&(confidence<0||confidence>100))throw new Error("confidence_percent doit être compris entre 0 et 100.");
+  const exactValues=body.exact_values&&typeof body.exact_values==="object"?body.exact_values:{};
+  const structured=body.structured_data&&typeof body.structured_data==="object"?body.structured_data:{};
+  const sourceRefs=Array.isArray(body.source_refs)?body.source_refs.slice(0,100):[];
+  const uncertainties=Array.isArray(body.uncertainties)?body.uncertainties.slice(0,100):[];
+  const tags=Array.isArray(body.context_tags)?body.context_tags.slice(0,100):[];
+  const observedAt=safeString(body.observed_at||"",100)||null;
+  const fingerprint=conanMemoryFingerprint({title,summary,exact_values:exactValues,source_refs:sourceRefs,observed_at:observedAt});
+  const table=scope==="personal"?"ci_conan_personal_memory":"ci_conan_memory_records";
+  const existing=await db.prepare("SELECT * FROM "+table+" WHERE content_fingerprint=? ORDER BY created_at ASC LIMIT 1").bind(fingerprint).first();
+  if(existing){
+    const duplicateId=cryptoRandomId(),timestamp=nowISO();
+    if(scope==="operational"){
+      await db.prepare("INSERT INTO ci_conan_memory_links (link_id,from_memory_id,to_memory_id,relation_type,details_json,created_at) VALUES (?,?,?,?,?,?)").bind(duplicateId,existing.memory_id,existing.memory_id,"duplicate_observation",JSON.stringify({new_source_refs:sourceRefs,uncertainties,observed_at:observedAt,note:"Doublon détecté; l'original est conservé et les nouveaux éléments de provenance sont ajoutés au lien."}),timestamp).run();
+      const priorSources=JSON.parse(existing.source_refs_json||"[]");
+      const merged=[...priorSources,...sourceRefs].filter((item,index,array)=>array.findIndex(other=>JSON.stringify(other)===JSON.stringify(item))===index);
+      await db.prepare("UPDATE ci_conan_memory_records SET source_refs_json=?,updated_at=? WHERE memory_id=?").bind(JSON.stringify(merged),timestamp,existing.memory_id).run();
+    }
+    return {memory_id:existing.memory_id,duplicate:true,scope,original_preserved:true,additional_provenance_recorded:scope==="operational"};
+  }
+  const id=cryptoRandomId(),timestamp=nowISO();
+  if(scope==="personal"){
+    await db.prepare("INSERT INTO ci_conan_personal_memory (personal_memory_id,title,content,structured_data_json,source_refs_json,confidence_percent,uncertainty_json,content_fingerprint,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(
+      id,title,summary,JSON.stringify({...structured,exact_values:exactValues,observed_at:observedAt}),JSON.stringify(sourceRefs),confidence,JSON.stringify(uncertainties),fingerprint,timestamp,timestamp
+    ).run();
+  }else{
+    await db.prepare("INSERT INTO ci_conan_memory_records (memory_id,memory_scope,tier,title,summary,structured_data_json,exact_values_json,source_refs_json,observed_at,confidence_percent,uncertainty_json,context_tags_json,outcome_json,content_fingerprint,original_record_ref,created_at,updated_at) VALUES (?,'operational',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+      id,tier,title,summary,JSON.stringify(structured),JSON.stringify(exactValues),JSON.stringify(sourceRefs),observedAt,confidence,JSON.stringify(uncertainties),JSON.stringify(tags),JSON.stringify(body.outcome&&typeof body.outcome==="object"?body.outcome:{}),fingerprint,safeString(body.original_record_ref||"",300)||null,timestamp,timestamp
+    ).run();
+    await db.prepare("INSERT INTO ci_conan_memory_tier_history (event_id,memory_id,from_tier,to_tier,reason,evidence_json,created_at) VALUES (?,?,NULL,?,?,?,?)").bind(
+      cryptoRandomId(),id,tier,"initial_memory_classification",JSON.stringify({source_refs:sourceRefs,confidence_percent:confidence}),timestamp
+    ).run();
+  }
+  return {memory_id:id,duplicate:false,scope,tier,confidence_percent:confidence,original_record_ref:safeString(body.original_record_ref||"",300)||null};
+}
+
+async function searchConanMemory(db,query,options={}){
+  await ensureConanMemoryTables(db);
+  const scope=options.memory_scope==="personal"?"personal":"operational";
+  const limit=Math.max(1,Math.min(100,Number(options.limit)||20));
+  if(scope==="personal"){
+    const rows=await db.prepare("SELECT * FROM ci_conan_personal_memory ORDER BY updated_at DESC LIMIT 1000").all();
+    return (rows.results||[]).map(row=>{
+      const score=scoreConanMemoryRelevance({title:row.title,summary:row.content,context_tags:[],outcome:{}},query,{});
+      return {...row,score:score.score,matched_terms:score.matched_terms};
+    }).filter(row=>row.score>0).sort((a,b)=>b.score-a.score).slice(0,limit);
+  }
+  const rows=await db.prepare("SELECT * FROM ci_conan_memory_records WHERE memory_scope='operational' AND status='active' ORDER BY updated_at DESC LIMIT 2000").all();
+  return (rows.results||[]).map(row=>{
+    const record={...row,context_tags:JSON.parse(row.context_tags_json||"[]"),outcome:JSON.parse(row.outcome_json||"{}")};
+    const score=scoreConanMemoryRelevance(record,query,options.context||{});
+    return {...row,score:score.score,matched_terms:score.matched_terms};
+  }).filter(row=>row.score>0).sort((a,b)=>b.score-a.score).slice(0,limit);
+}
+
+async function recallConanMemoryForSignal(db,signal,options={}){
+  const query=[signal?.title,signal?.description,signal?.symbol,signal?.chain,signal?.contract,signal?.signal_type].filter(Boolean).join(" ");
+  const results=await searchConanMemory(db,query,{memory_scope:"operational",limit:options.limit||10,context:{context_tags:signal?.context_tags||[],outcome_type:signal?.outcome_type}});
+  const recallId=cryptoRandomId(),timestamp=nowISO();
+  const context={signal_type:signal?.signal_type||null,asset:signal?.symbol||null,chain:signal?.chain||null,contract:signal?.contract||null,similarity_is_not_proof:true};
+  await db.prepare("INSERT INTO ci_conan_memory_recall_log (recall_id,memory_scope,query_text,context_json,results_json,methodology,created_at) VALUES (?,'operational',?,?,?,?,?)").bind(
+    recallId,query,JSON.stringify(context),JSON.stringify(results.map(item=>({memory_id:item.memory_id,score:item.score,matched_terms:item.matched_terms}))),CONAN_MEMORY_METHODOLOGY,timestamp
+  ).run();
+  return {recall_id:recallId,methodology:CONAN_MEMORY_METHODOLOGY,similarity_is_not_proof:true,semantic_engine:"contextual_token_and_metadata_similarity_heuristic",vector_embeddings:false,results};
+}
+
+async function changeConanMemoryTier(db,body){
+  await ensureConanMemoryTables(db);
+  const id=safeString(body.memory_id||"",160),tier=safeString(body.tier||"",40),reason=safeString(body.reason||"",1000);
+  if(!id||!CONAN_MEMORY_TIERS.includes(tier)||!reason)throw new Error("memory_id, tier valide et reason sont obligatoires.");
+  const row=await db.prepare("SELECT tier FROM ci_conan_memory_records WHERE memory_id=? AND memory_scope='operational'").bind(id).first();
+  if(!row)throw new Error("Mémoire opérationnelle introuvable.");
+  if(row.tier===tier)return {memory_id:id,tier,changed:false};
+  const timestamp=nowISO();
+  await db.prepare("UPDATE ci_conan_memory_records SET tier=?,updated_at=? WHERE memory_id=?").bind(tier,timestamp,id).run();
+  await db.prepare("INSERT INTO ci_conan_memory_tier_history (event_id,memory_id,from_tier,to_tier,reason,evidence_json,created_at) VALUES (?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),id,row.tier,tier,reason,JSON.stringify(body.evidence&&typeof body.evidence==="object"?body.evidence:{}),timestamp
+  ).run();
+  return {memory_id:id,from_tier:row.tier,to_tier:tier,changed:true,original_record_preserved:true};
+}
+
+async function createConanMemoryBackup(db,scope="operational"){
+  await ensureConanMemoryTables(db);
+  const names=scope==="personal"?["ci_conan_personal_memory"]:["ci_conan_memory_records","ci_conan_memory_links","ci_conan_memory_recall_log","ci_conan_memory_tier_history"];
+  const snapshot={schema:CONAN_MEMORY_METHODOLOGY,memory_scope:scope,tables:{}};
+  for(const name of names){
+    const rows=await db.prepare("SELECT * FROM "+name).all();
+    snapshot.tables[name]=rows.results||[];
+  }
+  const serialized=JSON.stringify(snapshot),checksum=conanIncubatorFingerprint(snapshot),id=cryptoRandomId(),timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_conan_memory_backups (backup_id,memory_scope,snapshot_json,checksum,verified,created_at) VALUES (?,?,?,?,0,?)").bind(id,scope,serialized,checksum,timestamp).run();
+  const stored=await db.prepare("SELECT snapshot_json,checksum FROM ci_conan_memory_backups WHERE backup_id=?").bind(id).first();
+  const verified=Boolean(stored&&stored.snapshot_json===serialized&&stored.checksum===checksum);
+  if(!verified)throw new Error("Sauvegarde mémoire non vérifiée; aucune opération destructive ne peut être effectuée.");
+  await db.prepare("UPDATE ci_conan_memory_backups SET verified=1 WHERE backup_id=?").bind(id).run();
+  return {backup_id:id,memory_scope:scope,verified:true,checksum,tables:names};
+}
+
+const conanChapter13OriginalProtectedRoutes = handleProtectedRoutes;
+handleProtectedRoutes = async function(request,env,ctx,route){
+  const {path,method,url}=route;
+  const memoryRoutes=[
+    "/api/conan/memory",
+    "/api/conan/memory/records",
+    "/api/conan/memory/search",
+    "/api/conan/memory/recall",
+    "/api/conan/memory/tier",
+    "/api/conan/memory/history",
+    "/api/conan/memory/backups",
+    "/api/conan/memory/personal"
+  ];
+  if(memoryRoutes.includes(path)){
+    const db=getDB(env);
+    await initializeBackendTables(db);
+    await ensureConanMemoryTables(db);
+    if(method==="GET"&&path==="/api/conan/memory"){
+      const counts=await db.prepare("SELECT COUNT(*) AS operational_count FROM ci_conan_memory_records WHERE memory_scope='operational'").first();
+      const personal=await db.prepare("SELECT COUNT(*) AS personal_count FROM ci_conan_personal_memory").first();
+      const tiers=await db.prepare("SELECT tier,COUNT(*) AS count FROM ci_conan_memory_records WHERE memory_scope='operational' GROUP BY tier").all();
+      return json({success:true,methodology:CONAN_MEMORY_METHODOLOGY,tiers:CONAN_MEMORY_TIERS,operational_memory:counts,personal_memory:personal,counts_by_tier:tiers.results||[],raw_archives_separate:true,similarity_is_not_proof:true,semantic_engine:"contextual_token_and_metadata_similarity_heuristic",vector_embeddings:false,automatic_deletion:false});
+    }
+    if(method==="POST"&&path==="/api/conan/memory/records"){
+      try{return json({success:true,...await createConanMemoryRecord(db,await readBody(request))},201);}
+      catch(error){return errorResponse(safeString(error.message||"Enregistrement mémoire refusé.",1000),400);}
+    }
+    if(method==="GET"&&path==="/api/conan/memory/records"){
+      const scope=url.searchParams.get("memory_scope")==="personal"?"personal":"operational";
+      const tier=url.searchParams.get("tier");
+      if(scope==="personal"){
+        const rows=await db.prepare("SELECT * FROM ci_conan_personal_memory ORDER BY updated_at DESC LIMIT 200").all();
+        return json({success:true,memory_scope:scope,records:rows.results||[]});
+      }
+      const rows=tier&&CONAN_MEMORY_TIERS.includes(tier)
+        ?await db.prepare("SELECT * FROM ci_conan_memory_records WHERE memory_scope='operational' AND tier=? ORDER BY updated_at DESC LIMIT 200").bind(tier).all()
+        :await db.prepare("SELECT * FROM ci_conan_memory_records WHERE memory_scope='operational' ORDER BY updated_at DESC LIMIT 200").all();
+      return json({success:true,memory_scope:scope,records:rows.results||[]});
+    }
+    if(method==="GET"&&path==="/api/conan/memory/personal"){
+      const rows=await db.prepare("SELECT * FROM ci_conan_personal_memory ORDER BY updated_at DESC LIMIT 200").all();
+      return json({success:true,count:rows.results?.length||0,personal_memory:rows.results||[],operational_memory_accessed:false});
+    }
+    if(method==="GET"&&path==="/api/conan/memory/search"){
+      const query=safeString(url.searchParams.get("q")||"",1000);
+      if(!query)return errorResponse("Le paramètre q est obligatoire.");
+      const results=await searchConanMemory(db,query,{memory_scope:url.searchParams.get("memory_scope"),limit:url.searchParams.get("limit")});
+      return json({success:true,methodology:CONAN_MEMORY_METHODOLOGY,similarity_is_not_proof:true,vector_embeddings:false,results});
+    }
+    if(method==="POST"&&path==="/api/conan/memory/recall"){
+      try{return json({success:true,...await recallConanMemoryForSignal(db,await readBody(request))});}
+      catch(error){return errorResponse(safeString(error.message||"Rappel mémoire impossible.",1000),400);}
+    }
+    if(method==="POST"&&path==="/api/conan/memory/tier"){
+      try{return json({success:true,...await changeConanMemoryTier(db,await readBody(request))});}
+      catch(error){return errorResponse(safeString(error.message||"Changement de niveau refusé.",1000),400);}
+    }
+    if(method==="GET"&&path==="/api/conan/memory/history"){
+      const id=safeString(url.searchParams.get("memory_id")||"",160);
+      if(!id)return errorResponse("memory_id est obligatoire.");
+      const rows=await db.prepare("SELECT * FROM ci_conan_memory_tier_history WHERE memory_id=? ORDER BY created_at ASC").bind(id).all();
+      return json({success:true,history:rows.results||[]});
+    }
+    if(method==="POST"&&path==="/api/conan/memory/backups"){
+      const body=await readBody(request);
+      try{return json({success:true,...await createConanMemoryBackup(db,body.memory_scope==="personal"?"personal":"operational")},201);}
+      catch(error){return errorResponse(safeString(error.message||"Sauvegarde mémoire échouée.",1000),500);}
+    }
+    if(method==="GET"&&path==="/api/conan/memory/backups"){
+      const rows=await db.prepare("SELECT backup_id,memory_scope,checksum,verified,created_at FROM ci_conan_memory_backups ORDER BY created_at DESC LIMIT 100").all();
+      return json({success:true,count:rows.results?.length||0,backups:rows.results||[]});
+    }
+  }
+  return await conanChapter13OriginalProtectedRoutes(request,env,ctx,route);
+};
