@@ -2391,6 +2391,7 @@ async function runRadarVerification(db) {
     if (goPlusResult.outcome !== 'unsupported' && goPlusResult.outcome !== 'unknown') {
       goPlusResult.outcome = goPlusSignals.length ? 'risk_signals' : 'no_flags_returned';
       goPlusResult.evidence = { ...(goPlusResult.evidence || {}), interpreted_risk_signals: goPlusSignals, risk_assessment_version: 2 };
+      goPlusResult.evidence.liquidity_assessment = goPlusLiquidityAssessment(goPlusResult.evidence.token_security);
     }
     const marketResult = await verifyRadarMarketData(db, item);
     await persistRadarMarketCheck(db, marketResult);
@@ -3773,6 +3774,50 @@ function goPlusValueIsEnabled(value) {
   const normalized = String(value).trim().toLowerCase();
   return normalized === "1" || normalized === "true" || normalized === "yes";
 }
+function goPlusLiquidityAssessment(token) {
+  if (!token || typeof token !== "object" || !Array.isArray(token.lp_holders)) {
+    return {
+      status: "unknown",
+      reason: "GoPlus n'a pas fourni de liste lp_holders exploitable.",
+      provider: "GoPlus",
+      coverage: "Aucune conclusion sur le verrouillage ou la distribution des LP."
+    };
+  }
+  const holders = token.lp_holders.filter((holder) => holder && typeof holder === "object");
+  const parsed = holders.map((holder) => ({
+    percent: radarFiniteMetric(holder.percent),
+    locked: goPlusValueIsEnabled(holder.is_locked),
+    address: safeString(holder.address || "", 160) || null,
+    tag: safeString(holder.tag || "", 120) || null,
+    locked_detail: Array.isArray(holder.locked_detail) ? holder.locked_detail : []
+  }));
+  const known = parsed.filter((holder) => holder.percent !== null);
+  const lockedShare = known.filter((holder) => holder.locked).reduce((sum, holder) => sum + holder.percent, 0);
+  const unlockedShare = known.filter((holder) => !holder.locked).reduce((sum, holder) => sum + holder.percent, 0);
+  const topHolderShare = known.length ? Math.max(...known.map((holder) => holder.percent)) : null;
+  const topThreeShare = known.slice(0, 3).reduce((sum, holder) => sum + holder.percent, 0);
+  const unlockEvents = parsed.flatMap((holder) => holder.locked_detail.map((detail) => ({
+    holder: holder.address,
+    tag: holder.tag,
+    end_time: detail?.end_time ?? null,
+    amount: detail?.amount ?? null
+  })));
+  return {
+    status: holders.length ? "observed" : "unknown",
+    provider: "GoPlus",
+    lp_holder_count_reported: radarFiniteMetric(token.lp_holder_count),
+    lp_total_supply_reported: token.lp_total_supply ?? null,
+    top_lp_holders_returned: holders.length,
+    top_holders_with_percentage: known.length,
+    top10_locked_share_percent: known.length ? lockedShare * 100 : null,
+    top10_unlocked_share_percent: known.length ? unlockedShare * 100 : null,
+    largest_reported_lp_holder_percent: topHolderShare === null ? null : topHolderShare * 100,
+    first_three_reported_lp_holders_percent: known.length ? topThreeShare * 100 : null,
+    unlock_events: unlockEvents,
+    coverage: "Analyse limitée aux détenteurs LP renvoyés par GoPlus (jusqu'aux dix premiers) et aux lockers reconnus par ce fournisseur. Les absences de données ne prouvent pas l'absence de verrouillage."
+  };
+}
+
 function goPlusRiskSignals(token) {
   if (!token || typeof token !== "object") return [];
   const signals = [];
