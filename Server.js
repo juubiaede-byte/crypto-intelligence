@@ -371,6 +371,8 @@ async function initializeBackendTables(db) {
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_pool_metrics (metric_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT, pair_address TEXT NOT NULL, dex_id TEXT, pair_url TEXT, base_token_address TEXT, base_token_symbol TEXT, quote_token_address TEXT, quote_token_symbol TEXT, price_usd REAL, liquidity_usd REAL, base_reserve REAL, quote_reserve REAL, volume_24h_usd REAL, buys_24h INTEGER, sells_24h INTEGER, pair_created_at TEXT, observed_at TEXT NOT NULL, source TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}' )`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_pool_metrics_discovery ON ci_radar_pool_metrics(discovery_key, observed_at DESC)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_pool_metrics_pair ON ci_radar_pool_metrics(chain_id, pair_address, observed_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_pool_metric_assets (relation_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, metric_key TEXT NOT NULL, linked_at TEXT NOT NULL)`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_pool_metric_assets_discovery ON ci_radar_pool_metric_assets(discovery_key, linked_at DESC)`)
 
   ]);
 }
@@ -2325,6 +2327,22 @@ async function persistRadarPoolMetrics(db, discoveryKey, marketResult) {
   return { pairs_received: Array.isArray(marketResult?.evidence?.returned_pairs) ? marketResult.evidence.returned_pairs.length : 0, pair_metrics_saved: saved, per_token_storage_limit: 20, liquidity_semantics: "provider-reported pool liquidity, not verified executable depth" };
 }
 
+
+async function persistRadarPoolMetricAssetLinks(db, discoveryKey, marketResult) {
+  const pairs = Array.isArray(marketResult?.evidence?.returned_pairs) ? marketResult.evidence.returned_pairs.slice(0, 20) : [];
+  let linked = 0;
+  for (const pair of pairs) {
+    const address = safeString(pair.pairAddress || "", 160);
+    if (!address) continue;
+    const chain = safeString(pair.chainId || marketResult.evidence?.dex_chain || "", 80);
+    const metricKey = (chain + ":" + address).toLowerCase();
+    const relationKey = discoveryKey + ":" + metricKey;
+    await db.prepare("INSERT INTO ci_radar_pool_metric_assets (relation_key, discovery_key, metric_key, linked_at) VALUES (?, ?, ?, ?) ON CONFLICT(relation_key) DO UPDATE SET linked_at = excluded.linked_at").bind(relationKey, discoveryKey, metricKey, nowISO()).run();
+    linked++;
+  }
+  return linked;
+}
+
 async function runRadarVerification(db) {
   const pending = await db.prepare(`SELECT d.discovery_key, d.chain_id, d.contract_address, d.pair_addresses_json FROM ci_radar_discoveries d LEFT JOIN ci_radar_verifications v ON v.discovery_key = d.discovery_key WHERE d.status = 'quarantine' AND (v.discovery_key IS NULL OR (v.next_check_at IS NOT NULL AND v.next_check_at <= ?)) ORDER BY d.first_seen_at ASC LIMIT 5`).bind(nowISO()).all();
   const summary = { attempted: 0, honeypot_detected: 0, simulation_passed: 0, unknown: 0, unsupported: 0, errors: 0, batch_limit: 5 };
@@ -2339,6 +2357,7 @@ async function runRadarVerification(db) {
     const marketResult = await verifyRadarMarketData(db, item);
     await persistRadarMarketCheck(db, marketResult);
     marketResult.pool_metrics = await persistRadarPoolMetrics(db, item.discovery_key, marketResult);
+    marketResult.pool_metrics.asset_links_saved = await persistRadarPoolMetricAssetLinks(db, item.discovery_key, marketResult);
     await persistRadarSecurityCheck(db, goPlusResult);
     await db.prepare(`INSERT INTO ci_radar_verifications (discovery_key, provider, outcome, simulation_success, risk, checked_at, next_check_at, evidence_json, error_message) VALUES (?, 'Honeypot.is', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(discovery_key) DO UPDATE SET provider = excluded.provider, outcome = excluded.outcome, simulation_success = excluded.simulation_success, risk = excluded.risk, checked_at = excluded.checked_at, next_check_at = excluded.next_check_at, evidence_json = excluded.evidence_json, error_message = excluded.error_message`).bind(result.discovery_key, result.outcome, result.simulation_success, result.risk, result.checked_at, result.next_check_at, JSON.stringify(result.evidence), result.error_message).run();
     summary.attempted++;
@@ -3290,6 +3309,15 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     const result = await db.prepare(`SELECT v.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol FROM ci_radar_verifications v JOIN ci_radar_discoveries d ON d.discovery_key = v.discovery_key ORDER BY v.checked_at DESC LIMIT ?`).bind(limit).all();
     return json({ success: true, count: result.results?.length || 0, verifications: result.results || [] });
   }
+  if (method === "GET" && path === "/api/radar/pool-metrics") {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const result = discoveryKey
+      ? await db.prepare("SELECT m.* FROM ci_radar_pool_metric_assets a JOIN ci_radar_pool_metrics m ON m.metric_key = a.metric_key WHERE a.discovery_key = ? ORDER BY m.observed_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_radar_pool_metrics ORDER BY observed_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, metrics: result.results || [], note: "Liquidités déclarées par DexScreener; profondeur exécutable et impact de prix non vérifiés." });
+  }
+
   if (method === "GET" && path === "/api/radar/pool-metrics") {
     const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
     const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
