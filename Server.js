@@ -9469,3 +9469,119 @@ handleProtectedRoutes=async function(request,env,ctx,route){
   }
   return await ciChapter19PreviousProtectedRoutes(request,env,ctx,route);
 };
+
+
+/* ============================================================
+   CHAPITRE 20 — PÉRIMÈTRE V1 ET CONTRAT DE VALIDATION FINALE
+   V1 est exclusivement consacré aux actifs crypto / tokens.
+   Les autres marchés sont hors périmètre et hors quotas IA V1.
+   ============================================================ */
+const CI_CHAPTER20_V1 = "crypto-intelligence-v1-scope-2026-11";
+
+const CI_V1_SCOPE_POLICY = Object.freeze({
+  policy_id: CI_CHAPTER20_V1,
+  product: "CRYPTO INTELLIGENCE",
+  version: "V1",
+  included_domains: ["crypto","token","cryptocurrency","defi","onchain"],
+  excluded_domains: ["stocks","equities","forex","commodities","bonds","real_estate","sports","other_markets"],
+  supported_asset_kinds: ["native_coin","fungible_token","lp_pair","crypto_wallet"],
+  principles: [
+    "La découverte, la surveillance, l'analyse et les prédictions automatisées V1 concernent uniquement les actifs crypto.",
+    "Un marché non crypto ne doit pas consommer les quotas des cinq IA de V1.",
+    "Les réseaux pris en charge sont ceux explicitement configurés dans les adaptateurs; aucune couverture mondiale totale n'est revendiquée.",
+    "L'ajout d'un nouveau réseau ou fournisseur nécessite un adaptateur isolé, une vérification des limites et conditions d'utilisation, puis une autorisation.",
+    "Les futures extensions multi-marchés doivent être isolées dans des domaines, files et budgets distincts."
+  ],
+  coverage_disclaimer: "La couverture réelle dépend des réseaux, endpoints, fournisseurs, quotas, clés et périodes de disponibilité configurés. Cette politique ne prouve pas une couverture exhaustive.",
+  runtime_validation: "policy_endpoint_added_runtime_validation_pending"
+});
+
+const CI_V1_CHAPTER_CHECKLIST = Object.freeze([
+  {chapter:1,name:"Radar mondial des nouveaux tokens",status:"implementation_added_pending_global_validation"},
+  {chapter:2,name:"Cycle de vie des actifs",status:"implementation_added_pending_global_validation"},
+  {chapter:3,name:"Cercle d'investissement potentiel",status:"implementation_added_pending_global_validation"},
+  {chapter:4,name:"Laboratoire d'investigation",status:"implementation_added_pending_global_validation"},
+  {chapter:5,name:"Conseil indépendant des cinq IA",status:"implementation_added_pending_global_validation"},
+  {chapter:6,name:"Intelligence collective et opportunités",status:"implementation_added_pending_global_validation"},
+  {chapter:7,name:"Baleines et petits portefeuilles",status:"implementation_added_pending_global_validation"},
+  {chapter:8,name:"Cycle Conan de prédiction sur 15 jours",status:"implementation_added_pending_global_validation"},
+  {chapter:9,name:"Score Conan sur 100",status:"implementation_added_pending_global_validation"},
+  {chapter:10,name:"Progression et croissance de Conan",status:"implementation_added_pending_global_validation"},
+  {chapter:11,name:"Observation adaptative",status:"implementation_added_pending_global_validation"},
+  {chapter:12,name:"Incubateur et évolution autonome isolée",status:"implementation_added_pending_global_validation"},
+  {chapter:13,name:"Mémoire intelligente et rappel",status:"implementation_added_pending_global_validation"},
+  {chapter:14,name:"Fournisseurs et adaptateurs",status:"implementation_added_pending_global_validation"},
+  {chapter:15,name:"Orchestration centrale des quotas API",status:"implementation_added_pending_global_validation"},
+  {chapter:16,name:"Telegram privé en lecture seule",status:"implementation_added_pending_global_validation"},
+  {chapter:17,name:"Historique, traçabilité et sauvegardes",status:"implementation_added_pending_global_validation"},
+  {chapter:18,name:"Interface mobile en 18 sections",status:"implementation_added_pending_global_validation"},
+  {chapter:19,name:"Fiabilité et transparence",status:"implementation_added_pending_global_validation"},
+  {chapter:20,name:"Périmètre V1 et validation finale",status:"policy_added_pending_global_validation"}
+]);
+
+function validateCIv1Scope(input={}){
+  const raw=safeString(input.domain||input.market_type||input.asset_type||"crypto",80).toLowerCase().replace(/[\s-]+/g,"_");
+  const aliases={cryptocurrency:"crypto",token:"crypto",defi:"crypto",on_chain:"onchain",equity:"equities",stock:"stocks",forex_pair:"forex",fx:"forex"};
+  const domain=aliases[raw]||raw;
+  const included=CI_V1_SCOPE_POLICY.included_domains.includes(domain);
+  const explicitNonCrypto=CI_V1_SCOPE_POLICY.excluded_domains.includes(domain);
+  const assetId=safeString(input.asset_id||input.symbol||input.contract_address,200)||null;
+  const chain=safeString(input.chain||input.chain_id,80)||null;
+  const valid=included&&!explicitNonCrypto;
+  return {
+    policy_id:CI_CHAPTER20_V1,
+    accepted:valid,
+    domain,
+    asset_id:assetId,
+    chain,
+    v1_scope:"crypto_only",
+    ai_quota_eligible:valid,
+    reason:valid?"Domaine inclus dans le périmètre crypto V1.":"Domaine hors périmètre V1 : aucune consommation de quota IA crypto n'est autorisée par cette validation.",
+    requires_network_support:valid,
+    warning:valid&&!chain?"L'actif doit encore être associé à un réseau pris en charge et à des preuves vérifiables.":null
+  };
+}
+
+function getCIv1ReadinessManifest(){
+  const counts=CI_V1_CHAPTER_CHECKLIST.reduce((acc,item)=>{
+    acc[item.status]=(acc[item.status]||0)+1;return acc;
+  },{});
+  return {
+    product:CI_V1_SCOPE_POLICY.product,
+    version:"V1",
+    scope:CI_V1_SCOPE_POLICY,
+    chapters:CI_V1_CHAPTER_CHECKLIST,
+    chapter_count:CI_V1_CHAPTER_CHECKLIST.length,
+    implementation_status_counts:counts,
+    global_validation:"not_started",
+    deployment:"not_authorized",
+    live_integrations:"not_verified",
+    automated_runtime:"not_certified",
+    known_limits:[
+      "Les chapitres ont reçu des ajouts de code, mais leur fonctionnement intégré n'est pas encore validé par une campagne globale.",
+      "Les quotas dépendent des limites effectivement configurées auprès de chaque fournisseur.",
+      "L'exécution autonome de code Conan reste limitée à l'espace isolé de stockage; aucun code arbitraire n'est exécuté par ce registre.",
+      "La couverture réseau et fournisseur ne peut pas être qualifiée de mondiale sans preuves de collecte correspondantes.",
+      "Aucun rendement, niveau de sécurité ou résultat prédictif n'est garanti."
+    ],
+    next_required_step:"Lancer une analyse globale du dépôt, des schémas D1, des routes, des adaptateurs, des quotas, des permissions, des sauvegardes et des tests d'intégration avant tout déploiement."
+  };
+}
+
+const ciChapter20PreviousProtectedRoutes=handleProtectedRoutes;
+handleProtectedRoutes=async function(request,env,ctx,route){
+  const {path,method}=route;
+  if(method==="GET"&&path==="/api/v1/scope"){
+    return json({success:true,scope:CI_V1_SCOPE_POLICY});
+  }
+  if(method==="POST"&&path==="/api/v1/scope/validate"){
+    try{
+      const result=validateCIv1Scope(await request.json());
+      return json({success:true,validation:result},result.accepted?200:422);
+    }catch(error){return errorResponse(safeString(error.message||"Validation du périmètre impossible.",800),400);}
+  }
+  if(method==="GET"&&path==="/api/v1/readiness"){
+    return json({success:true,readiness:getCIv1ReadinessManifest()});
+  }
+  return await ciChapter20PreviousProtectedRoutes(request,env,ctx,route);
+};
