@@ -4960,6 +4960,37 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({success:true,count:result.results?.length||0,results:result.results||[]});
   }
 
+
+  if (method === "GET" && path === "/api/conan/growth") {
+    await ensureConanPredictionTables(db);
+    const state=await db.prepare("SELECT * FROM ci_conan_growth_state WHERE state_id='primary'").first();
+    const history=await db.prepare("SELECT * FROM ci_conan_growth_history ORDER BY created_at DESC LIMIT 50").all();
+    return json({success:true,methodology:CONAN_GROWTH_METHODOLOGY,state,transitions:history.results||[],thresholds:{child_to_adolescent:"Au moins 7 directions correctes parmi les 10 premières prédictions évaluées et vérifiables.",adolescent_to_adult:"Au moins 70 directions correctes parmi les 100 premières prédictions évaluées et vérifiables."},unverifiable_policy:"Les prédictions non vérifiables sont exclues des deux seuils."});
+  }
+  if (method === "GET" && path === "/api/conan/surveillance-windows") {
+    await ensureConanPredictionTables(db);
+    const result=await db.prepare("SELECT * FROM ci_conan_surveillance_windows ORDER BY window_number ASC").all();
+    return json({success:true,count:result.results?.length||0,windows:result.results||[],note:"La fenêtre débloquée à l'adolescence est créée vide; elle n'est pas présentée comme surveillée avant attribution d'un actif."});
+  }
+  if (method === "POST" && path === "/api/conan/surveillance-windows/assign") {
+    await ensureConanPredictionTables(db);
+    const body=await readBody(request);
+    const windowId=safeString(body.window_id||"",120),discoveryKey=safeString(body.discovery_key||"",200);
+    if(!windowId||!discoveryKey)return errorResponse("window_id et discovery_key sont requis.");
+    const windowRow=await db.prepare("SELECT * FROM ci_conan_surveillance_windows WHERE window_id=?").bind(windowId).first();
+    if(!windowRow)return errorResponse("Fenêtre de surveillance inconnue.",404);
+    if(windowRow.status!=="unassigned")return errorResponse("Cette fenêtre est déjà attribuée; aucune substitution automatique n'est autorisée.",409);
+    const asset=await db.prepare("SELECT discovery_key,chain_id,contract_address,token_symbol FROM ci_radar_discoveries WHERE discovery_key=?").bind(discoveryKey).first();
+    if(!asset)return errorResponse("Actif absent de l'univers crypto.",404);
+    const market=await getConanLatestMarket(db,discoveryKey);
+    if(!market)return errorResponse("Aucun prix source récent exploitable pour cet actif.",409);
+    const timestamp=nowISO();
+    await db.prepare("UPDATE ci_conan_surveillance_windows SET status='assigned',discovery_key=?,chain_id=?,contract_address=?,token_symbol=?,assigned_at=?,assignment_evidence_json=? WHERE window_id=? AND status='unassigned'").bind(
+      asset.discovery_key,asset.chain_id,asset.contract_address,asset.token_symbol,timestamp,JSON.stringify({price_usd:market.price_usd,source:market.source,observed_at:market.observed_at}),windowId
+    ).run();
+    await audit(db,"conan_extra_surveillance_window_assigned","Fenêtre "+windowId+" attribuée à "+discoveryKey+".");
+    return json({success:true,window_id:windowId,status:"assigned",asset:{discovery_key:asset.discovery_key,chain_id:asset.chain_id,contract_address:asset.contract_address,token_symbol:asset.token_symbol},reference:{price_usd:market.price_usd,source:market.source,observed_at:market.observed_at}});
+  }
   if (method === "GET" && path === "/api/conan/scores") {
     const cycleId=safeString(url.searchParams.get("cycle_id")||"",120),limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
     const result=cycleId?await db.prepare("SELECT * FROM ci_conan_score_history WHERE cycle_id=? ORDER BY created_at DESC").bind(cycleId).all():await db.prepare("SELECT * FROM ci_conan_score_history ORDER BY created_at DESC LIMIT ?").bind(limit).all();
