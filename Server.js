@@ -6527,9 +6527,20 @@ async function recordConanPredictionObservation(db,cycle,asset,cycleDay){
     for(const target of targets){
       const reached=conanTargetReached(prediction.direction,Number(market.price_usd),Number(target.price_usd));
       if(reached&&!target.touched_at)target.touched_at=timestamp;
-      if(reached&&target.touched_at&&!target.held_1h_at&&Date.now()-Date.parse(target.touched_at)>=3600000){
-        target.held_1h_at=timestamp;
-        target.verification_method="two_sampled_observations_at_least_one_hour_apart";
+      if(reached&&!target.streak_started_at)target.streak_started_at=timestamp;
+      if(!reached)target.streak_started_at=null;
+      if(reached&&target.streak_started_at&&!target.held_1h_at&&Date.now()-Date.parse(target.streak_started_at)>=3600000){
+        const streakRows=await db.prepare("SELECT price_usd,observed_at FROM ci_conan_prediction_observations WHERE cycle_id=? AND discovery_key=? AND observed_at>=? AND observed_at<=? ORDER BY observed_at ASC").bind(
+          cycle.cycle_id,asset.discovery_key,target.streak_started_at,timestamp
+        ).all();
+        const samples=streakRows.results||[];
+        const gaps=samples.slice(1).map((item,index)=>Date.parse(item.observed_at)-Date.parse(samples[index].observed_at));
+        const allSamplesFavorable=samples.length>=3&&samples.every(item=>conanTargetReached(prediction.direction,Number(item.price_usd),Number(target.price_usd)));
+        const samplingContinuousEnough=gaps.length>0&&Math.max(...gaps)<=30*60*1000;
+        if(allSamplesFavorable&&samplingContinuousEnough){
+          target.held_1h_at=timestamp;
+          target.verification_method="all_recorded_samples_favorable_for_one_hour_maximum_gap_30m";
+        }
       }
     }
     await db.prepare("INSERT INTO ci_conan_prediction_progress (prediction_id,latest_price_usd,latest_observed_at,targets_progress_json,last_updated_at) VALUES (?,?,?,?,?) ON CONFLICT(prediction_id) DO UPDATE SET latest_price_usd=excluded.latest_price_usd,latest_observed_at=excluded.latest_observed_at,targets_progress_json=excluded.targets_progress_json,last_updated_at=excluded.last_updated_at").bind(
@@ -6559,7 +6570,7 @@ async function evaluateConanPredictionCycle(db,cycle){
     let targets=[];try{targets=JSON.parse(progress?.targets_progress_json||"[]");}catch{targets=[];}
     const touched=targets.filter(item=>item.touched_at).map(item=>({target_index:item.target_index,price_usd:item.price_usd,touched_at:item.touched_at}));
     const held=targets.filter(item=>item.held_1h_at).map(item=>({target_index:item.target_index,price_usd:item.price_usd,held_1h_at:item.held_1h_at,verification_method:item.verification_method}));
-    const notes={direction_rule:"Comparaison entre le prix de référence verrouillé et le dernier prix observé au jour 15.",sideways_rule:"Variation absolue de 3 % ou moins.",target_rule:"Contact et confirmation par deux observations favorables espacées d'au moins une heure sont distincts; aucune continuité permanente n'est affirmée.",observations_after_lock:samples.length,first_observation:samples[0]?.observed_at||null,final_observation:final.observed_at,final_source:final.source,direction_change_percent:change,direction_correct:directionCorrect===1};
+    const notes={direction_rule:"Comparaison entre le prix de référence verrouillé et le dernier prix observé au jour 15.",sideways_rule:"Variation absolue de 3 % ou moins.",target_rule:"Contact distinct de la confirmation : toutes les observations enregistrées doivent rester favorables pendant au moins une heure, avec un intervalle maximal de 30 minutes; les périodes non échantillonnées ne sont pas prouvées.",observations_after_lock:samples.length,first_observation:samples[0]?.observed_at||null,final_observation:final.observed_at,final_source:final.source,direction_change_percent:change,direction_correct:directionCorrect===1};
     await db.prepare("INSERT INTO ci_conan_prediction_results (result_id,prediction_id,cycle_id,discovery_key,outcome_status,direction_correct,reference_price_usd,final_price_usd,direction_change_percent,targets_touched_json,targets_held_1h_json,learning_notes_json,evaluated_at) VALUES (?,?,?,?, 'evaluated',?,?,?,?,?,?,?,?)").bind(
       cryptoRandomId(),prediction.prediction_id,cycle.cycle_id,prediction.discovery_key,directionCorrect,prediction.reference_price_usd,final.price_usd,change,JSON.stringify(touched),JSON.stringify(held),JSON.stringify(notes),nowISO()
     ).run();
