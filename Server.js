@@ -6423,6 +6423,7 @@ async function createConanPredictionCycle(db){
     await db.prepare("INSERT INTO ci_conan_prediction_assets (asset_row_id,cycle_id,asset_order,discovery_key,chain_id,contract_address,token_name,token_symbol,pair_address,selected_at,selection_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(
       cryptoRandomId(),id,i+1,asset.discovery_key,asset.chain_id,asset.contract_address,asset.token_name,asset.token_symbol,asset.pair_address,timestamp,selection.reason
     ).run();
+    await recordConanPredictionObservation(db,{cycle_id:id},asset,1);
   }
   await db.prepare("INSERT INTO ci_conan_learning_history (learning_id,cycle_id,learning_type,summary,evidence_json,created_at) VALUES (?,?,?,?,?,?)").bind(
     cryptoRandomId(),id,"cycle_started","Début du cycle de 15 jours : deux actifs distincts; observation initiale pendant les jours 1 à 7.",JSON.stringify({selection_mode:selection.mode,selection_reason:selection.reason,assets:selection.assets.map(item=>({discovery_key:item.discovery_key,chain_id:item.chain_id,contract_address:item.contract_address,pair_address:item.pair_address,price_usd:item.price_usd,source:item.source,observed_at:item.observed_at}))}),timestamp
