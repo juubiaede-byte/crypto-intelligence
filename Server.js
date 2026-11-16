@@ -1477,6 +1477,41 @@ async function restoreDatabaseArchive(
     const pendingTableNames = Array.from(pendingByTable.keys())
       .filter((tableName) => pendingByTable.get(tableName).length > 0);
     const pendingSet = new Set(pendingTableNames);
+
+    /*
+     * Refuse toute restauration si un trigger pourrait produire des effets
+     * secondaires non visibles dans la liste des INSERT de cette opération.
+     */
+    const guardedTableNames = Array.from(
+      new Set([...pendingTableNames, "ci_audit"])
+    );
+    const triggerPlaceholders = guardedTableNames.map(() => "?").join(", ");
+    const triggerCheck = await db.prepare(
+      "SELECT name, tbl_name FROM sqlite_master " +
+      "WHERE type = 'trigger' AND tbl_name IN (" + triggerPlaceholders + ")"
+    ).bind(...guardedTableNames).all();
+
+    if ((triggerCheck.results || []).length) {
+      throw new Error(
+        "Restauration bloquée : un trigger SQL pourrait produire des effets " +
+        "secondaires sur les tables concernées."
+      );
+    }
+
+    const foreignKeySetting = await db.prepare(
+      "PRAGMA foreign_keys"
+    ).first();
+    const foreignKeyValue = foreignKeySetting
+      ? Number(Object.values(foreignKeySetting)[0])
+      : 0;
+
+    if (foreignKeyValue !== 1) {
+      throw new Error(
+        "Restauration bloquée : l'application effective des clés étrangères " +
+        "n'a pas pu être confirmée dans D1."
+      );
+    }
+
     const dependencies = new Map();
 
     for (const tableName of pendingTableNames) {
