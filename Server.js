@@ -6113,6 +6113,19 @@ async function recordRadarWalletBehavior(db, chain, discoveryKey) {
       ).run();
       signals++;
     }
+    if (buys.length >= 2 && sells.length >= 2) {
+      const churnCutoff = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+      const priorChurn = await db.prepare("SELECT signal_id FROM ci_wallet_behavior_signals WHERE chain_id = ? AND discovery_key = ? AND wallet_address = ? AND signal_type = ? AND created_at >= ? LIMIT 1").bind(chain,discoveryKey,wallet,"rapid_buy_sell_churn_candidate",churnCutoff).first();
+      const blocks = activity.map(item => Number(item.block_number)).filter(Number.isFinite);
+      if (!priorChurn && blocks.length && Math.max(...blocks) - Math.min(...blocks) <= 500) {
+        await db.prepare("INSERT INTO ci_wallet_behavior_signals (signal_id,chain_id,discovery_key,wallet_address,signal_type,severity,confidence_percent,window_start,window_end,evidence_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(
+          crypto.randomUUID(),chain,discoveryKey,wallet,"rapid_buy_sell_churn_candidate","research",40,
+          activity[activity.length-1].observed_at,activity[0].observed_at,
+          JSON.stringify({buy_count:buys.length,sell_count:sells.length,block_span:Math.max(...blocks)-Math.min(...blocks),note:"Achats et ventes rapprochés pouvant justifier une analyse de churn ou de manipulation; aucune manipulation n'est établie par ce seul motif."}),nowISO()
+        ).run();
+        signals++;
+      }
+    }
   }
 
   // Plusieurs adresses actives dans une fenêtre de blocs rapprochée: piste de comportement similaire,
