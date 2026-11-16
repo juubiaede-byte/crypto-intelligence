@@ -376,6 +376,9 @@ async function initializeBackendTables(db) {
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_pool_metric_history (observation_id TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT, pair_address TEXT NOT NULL, dex_id TEXT, price_usd REAL, liquidity_usd REAL, base_reserve REAL, quote_reserve REAL, volume_24h_usd REAL, buys_24h INTEGER, sells_24h INTEGER, observed_at TEXT NOT NULL, source TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT "{}")`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_pool_metric_history_discovery ON ci_radar_pool_metric_history(discovery_key, observed_at DESC)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_pool_metric_history_pair ON ci_radar_pool_metric_history(chain_id, pair_address, observed_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_onchain_pool_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT, pair_address TEXT NOT NULL, dex_id TEXT, outcome TEXT NOT NULL, checked_at TEXT NOT NULL, token0_address TEXT, token1_address TEXT, reserve0_raw TEXT, reserve1_raw TEXT, reserve0_adjusted REAL, reserve1_adjusted REAL, token0_decimals INTEGER, token1_decimals INTEGER, block_timestamp INTEGER, evidence_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_checks_discovery ON ci_radar_onchain_pool_checks(discovery_key, checked_at DESC)`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_checks_pair ON ci_radar_onchain_pool_checks(chain_id, pair_address, checked_at DESC)`)
 
   ]);
 }
@@ -2381,6 +2384,105 @@ async function persistRadarPoolMetricHistory(db, discoveryKey, marketResult) {
   return { observations_saved: saved, per_token_batch_limit: 20, history_mode: "append_only", note: "Valeurs rapportées par DexScreener; aucune profondeur exécutable on-chain n'est déduite." };
 }
 
+
+function radarHexWord(hex, index) {
+  const value = safeString(hex || "", 10000).replace(/^0x/i, "");
+  const word = value.slice(index * 64, index * 64 + 64);
+  return word.length === 64 && /^[0-9a-fA-F]+$/.test(word) ? word : null;
+}
+function radarDecodeAddress(hex) {
+  const word = radarHexWord(hex, 0);
+  return word ? "0x" + word.slice(-40) : null;
+}
+async function radarRpcCall(rpcUrl, method, params) {
+  const response = await externalJSON(rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+  }, 10000);
+  const payload = response.data || {};
+  if (payload.error) throw new Error(safeString(payload.error.message || "Erreur RPC.", 300));
+  if (typeof payload.result !== "string") throw new Error("Réponse RPC sans résultat hexadécimal.");
+  return payload.result;
+}
+async function verifyRadarOnchainPool(db, item, pair) {
+  const checkedAt = nowISO();
+  const pairAddress = safeString(pair?.pairAddress || "", 160);
+  const chainId = safeString(pair?.chainId || item.chain_id || "", 80);
+  const dexId = safeString(pair?.dexId || "", 100);
+  const checkKey = (item.discovery_key + ":" + chainId + ":" + pairAddress).toLowerCase();
+  const rpc = radarPublicRpc(chainId);
+  const base = { check_key: checkKey, discovery_key: item.discovery_key, chain_id: chainId, pair_address: pairAddress, dex_id: dexId || null, checked_at: checkedAt };
+  if (!rpc) return { ...base, outcome: "unsupported_chain", evidence: { reason: "RPC configuré uniquement pour Ethereum, BSC et Base." }, error_message: null };
+  if (!/^0x[a-fA-F0-9]{40}$/.test(pairAddress)) return { ...base, outcome: "invalid_pair_address", evidence: {}, error_message: null };
+  try {
+    const results = await Promise.all([
+      radarRpcCall(rpc.url, "eth_call", [{ to: pairAddress, data: "0x0902f1ac" }, "latest"]),
+      radarRpcCall(rpc.url, "eth_call", [{ to: pairAddress, data: "0x0dfe1681" }, "latest"]),
+      radarRpcCall(rpc.url, "eth_call", [{ to: pairAddress, data: "0xd21220a7" }, "latest"])
+    ]);
+    const reserve0Word = radarHexWord(results[0], 0);
+    const reserve1Word = radarHexWord(results[0], 1);
+    const timestampWord = radarHexWord(results[0], 2);
+    const token0 = radarDecodeAddress(results[1]);
+    const token1 = radarDecodeAddress(results[2]);
+    if (!reserve0Word || !reserve1Word || !timestampWord || !token0 || !token1) {
+      return { ...base, outcome: "unsupported_pair_interface", evidence: { abi: "Uniswap-V2-compatible", note: "Réponse incompatible; réserves non interprétées." }, error_message: null };
+    }
+    const decimalsResults = await Promise.all([
+      radarRpcCall(rpc.url, "eth_call", [{ to: token0, data: "0x313ce567" }, "latest"]),
+      radarRpcCall(rpc.url, "eth_call", [{ to: token1, data: "0x313ce567" }, "latest"])
+    ]);
+    const decimalsWord0 = radarHexWord(decimalsResults[0], 0);
+    const decimalsWord1 = radarHexWord(decimalsResults[1], 0);
+    const decimals0 = decimalsWord0 ? Number(BigInt("0x" + decimalsWord0)) : NaN;
+    const decimals1 = decimalsWord1 ? Number(BigInt("0x" + decimalsWord1)) : NaN;
+    const reserve0 = BigInt("0x" + reserve0Word);
+    const reserve1 = BigInt("0x" + reserve1Word);
+    const common = {
+      ...base, token0_address: token0, token1_address: token1,
+      reserve0_raw: reserve0.toString(), reserve1_raw: reserve1.toString(),
+      token0_decimals: Number.isInteger(decimals0) && decimals0 >= 0 && decimals0 <= 255 ? decimals0 : null,
+      token1_decimals: Number.isInteger(decimals1) && decimals1 >= 0 && decimals1 <= 255 ? decimals1 : null,
+      block_timestamp: Number(BigInt("0x" + timestampWord))
+    };
+    if (common.token0_decimals === null || common.token1_decimals === null) {
+      return { ...common, outcome: "reserves_read_decimals_unknown", evidence: { method: "eth_call", raw_reserves_are_onchain: true, adjusted_units_unavailable: true }, error_message: null };
+    }
+    const adjusted0 = Number(reserve0) / Math.pow(10, decimals0);
+    const adjusted1 = Number(reserve1) / Math.pow(10, decimals1);
+    return {
+      ...common, outcome: "onchain_reserves_read",
+      reserve0_adjusted: Number.isFinite(adjusted0) ? adjusted0 : null,
+      reserve1_adjusted: Number.isFinite(adjusted1) ? adjusted1 : null,
+      evidence: { method: "eth_call", provider: "PublicNode", pair_abi: "Uniswap-V2-compatible", raw_reserves_are_onchain: true, usd_depth_not_calculated: true, price_impact_not_calculated: true },
+      error_message: null
+    };
+  } catch (error) {
+    await recordProviderUsage(db, "publicnode_rpc", false, error.status || 500);
+    return { ...base, outcome: "unknown", evidence: { rpc_chain_id: rpc.chain_id, method: "eth_call" }, error_message: safeString(error.message || "Lecture on-chain impossible.", 500) };
+  }
+}
+async function runRadarOnchainPoolChecks(db, item, marketResult) {
+  const pairs = Array.isArray(marketResult?.evidence?.returned_pairs) ? marketResult.evidence.returned_pairs.filter((pair) => pair?.pairAddress).slice(0, 2) : [];
+  const summary = { attempted: 0, onchain_reserves_read: 0, unsupported_pair_interface: 0, unsupported_chain: 0, unknown: 0, batch_limit_per_token: 2 };
+  for (const pair of pairs) {
+    const result = await verifyRadarOnchainPool(db, item, pair);
+    await db.prepare("INSERT INTO ci_radar_onchain_pool_checks (check_key, discovery_key, chain_id, pair_address, dex_id, outcome, checked_at, token0_address, token1_address, reserve0_raw, reserve1_raw, reserve0_adjusted, reserve1_adjusted, token0_decimals, token1_decimals, block_timestamp, evidence_json, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(check_key) DO UPDATE SET outcome = excluded.outcome, checked_at = excluded.checked_at, token0_address = excluded.token0_address, token1_address = excluded.token1_address, reserve0_raw = excluded.reserve0_raw, reserve1_raw = excluded.reserve1_raw, reserve0_adjusted = excluded.reserve0_adjusted, reserve1_adjusted = excluded.reserve1_adjusted, token0_decimals = excluded.token0_decimals, token1_decimals = excluded.token1_decimals, block_timestamp = excluded.block_timestamp, evidence_json = excluded.evidence_json, error_message = excluded.error_message").bind(
+      result.check_key, result.discovery_key, result.chain_id, result.pair_address, result.dex_id, result.outcome, result.checked_at,
+      result.token0_address || null, result.token1_address || null, result.reserve0_raw || null, result.reserve1_raw || null,
+      result.reserve0_adjusted ?? null, result.reserve1_adjusted ?? null, result.token0_decimals ?? null, result.token1_decimals ?? null,
+      result.block_timestamp ?? null, JSON.stringify(result.evidence || {}), result.error_message
+    ).run();
+    summary.attempted++;
+    if (result.outcome === "onchain_reserves_read") summary.onchain_reserves_read++;
+    if (result.outcome === "unsupported_pair_interface" || result.outcome === "reserves_read_decimals_unknown") summary.unsupported_pair_interface++;
+    if (result.outcome === "unsupported_chain") summary.unsupported_chain++;
+    if (result.outcome === "unknown") summary.unknown++;
+  }
+  return summary;
+}
+
 async function runRadarVerification(db) {
   const pending = await db.prepare(`SELECT d.discovery_key, d.chain_id, d.contract_address, d.pair_addresses_json FROM ci_radar_discoveries d LEFT JOIN ci_radar_verifications v ON v.discovery_key = d.discovery_key WHERE d.status = 'quarantine' AND (v.discovery_key IS NULL OR (v.next_check_at IS NOT NULL AND v.next_check_at <= ?)) ORDER BY d.first_seen_at ASC LIMIT 5`).bind(nowISO()).all();
   const summary = { attempted: 0, honeypot_detected: 0, simulation_passed: 0, unknown: 0, unsupported: 0, errors: 0, batch_limit: 5 };
@@ -2392,12 +2494,14 @@ async function runRadarVerification(db) {
       goPlusResult.outcome = goPlusSignals.length ? 'risk_signals' : 'no_flags_returned';
       goPlusResult.evidence = { ...(goPlusResult.evidence || {}), interpreted_risk_signals: goPlusSignals, risk_assessment_version: 2 };
       goPlusResult.evidence.liquidity_assessment = goPlusLiquidityAssessment(goPlusResult.evidence.token_security);
+      goPlusResult.evidence.liquidity_assessment = goPlusLiquidityAssessmentV2(goPlusResult.evidence.token_security);
     }
     const marketResult = await verifyRadarMarketData(db, item);
     await persistRadarMarketCheck(db, marketResult);
     marketResult.pool_metrics = await persistRadarPoolMetrics(db, item.discovery_key, marketResult);
     marketResult.pool_metrics.asset_links_saved = await persistRadarPoolMetricAssetLinks(db, item.discovery_key, marketResult);
     marketResult.pool_metric_history = await persistRadarPoolMetricHistory(db, item.discovery_key, marketResult);
+    marketResult.onchain_pool_checks = await runRadarOnchainPoolChecks(db, item, marketResult);
     marketResult.onchain_pool_checks = await runRadarOnchainPoolChecks(db, item, marketResult);
     await persistRadarSecurityCheck(db, goPlusResult);
     await db.prepare(`INSERT INTO ci_radar_verifications (discovery_key, provider, outcome, simulation_success, risk, checked_at, next_check_at, evidence_json, error_message) VALUES (?, 'Honeypot.is', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(discovery_key) DO UPDATE SET provider = excluded.provider, outcome = excluded.outcome, simulation_success = excluded.simulation_success, risk = excluded.risk, checked_at = excluded.checked_at, next_check_at = excluded.next_check_at, evidence_json = excluded.evidence_json, error_message = excluded.error_message`).bind(result.discovery_key, result.outcome, result.simulation_success, result.risk, result.checked_at, result.next_check_at, JSON.stringify(result.evidence), result.error_message).run();
@@ -3801,16 +3905,14 @@ function goPlusLiquidityAssessment(token) {
   const holders = token.lp_holders.filter((holder) => holder && typeof holder === "object");
   const parsed = holders.map((holder) => ({
     percent: radarFiniteMetric(holder.percent),
-    locked: holder.is_locked === undefined || holder.is_locked === null || holder.is_locked === "" ? null : goPlusValueIsEnabled(holder.is_locked),
+    locked: goPlusValueIsEnabled(holder.is_locked),
     address: safeString(holder.address || "", 160) || null,
     tag: safeString(holder.tag || "", 120) || null,
     locked_detail: Array.isArray(holder.locked_detail) ? holder.locked_detail : []
   }));
   const known = parsed.filter((holder) => holder.percent !== null);
-  const lockKnown = known.filter((holder) => holder.locked !== null);
-  const lockedShare = lockKnown.filter((holder) => holder.locked === true).reduce((sum, holder) => sum + holder.percent, 0);
-  const unlockedShare = lockKnown.filter((holder) => holder.locked === false).reduce((sum, holder) => sum + holder.percent, 0);
-  const unclassifiedLockShare = known.filter((holder) => holder.locked === null).reduce((sum, holder) => sum + holder.percent, 0);
+  const lockedShare = known.filter((holder) => holder.locked).reduce((sum, holder) => sum + holder.percent, 0);
+  const unlockedShare = known.filter((holder) => !holder.locked).reduce((sum, holder) => sum + holder.percent, 0);
   const topHolderShare = known.length ? Math.max(...known.map((holder) => holder.percent)) : null;
   const topThreeShare = known.slice(0, 3).reduce((sum, holder) => sum + holder.percent, 0);
   const unlockEvents = parsed.flatMap((holder) => holder.locked_detail.map((detail) => ({
@@ -3826,13 +3928,34 @@ function goPlusLiquidityAssessment(token) {
     lp_total_supply_reported: token.lp_total_supply ?? null,
     top_lp_holders_returned: holders.length,
     top_holders_with_percentage: known.length,
-    top10_locked_share_percent: lockKnown.length ? lockedShare * 100 : null,
-    top10_unlocked_share_percent: lockKnown.length ? unlockedShare * 100 : null,
-    top10_lock_status_unknown_share_percent: known.length ? unclassifiedLockShare * 100 : null,
+    top10_locked_share_percent: known.length ? lockedShare * 100 : null,
+    top10_unlocked_share_percent: known.length ? unlockedShare * 100 : null,
     largest_reported_lp_holder_percent: topHolderShare === null ? null : topHolderShare * 100,
     first_three_reported_lp_holders_percent: known.length ? topThreeShare * 100 : null,
     unlock_events: unlockEvents,
     coverage: "Analyse limitée aux détenteurs LP renvoyés par GoPlus (jusqu'aux dix premiers) et aux lockers reconnus par ce fournisseur. Les absences de données ne prouvent pas l'absence de verrouillage."
+  };
+}
+
+
+function goPlusLiquidityAssessmentV2(token) {
+  const assessment = goPlusLiquidityAssessment(token);
+  if (!token || !Array.isArray(token.lp_holders)) return assessment;
+  const holders = token.lp_holders.filter((holder) => holder && typeof holder === "object");
+  const known = holders.map((holder) => ({
+    percent: radarFiniteMetric(holder.percent),
+    locked: holder.is_locked === undefined || holder.is_locked === null || holder.is_locked === "" ? null : goPlusValueIsEnabled(holder.is_locked)
+  })).filter((holder) => holder.percent !== null);
+  const lockKnown = known.filter((holder) => holder.locked !== null);
+  const locked = lockKnown.filter((holder) => holder.locked === true).reduce((sum, holder) => sum + holder.percent, 0);
+  const unlocked = lockKnown.filter((holder) => holder.locked === false).reduce((sum, holder) => sum + holder.percent, 0);
+  const unknown = known.filter((holder) => holder.locked === null).reduce((sum, holder) => sum + holder.percent, 0);
+  return {
+    ...assessment,
+    top10_locked_share_percent: lockKnown.length ? locked * 100 : null,
+    top10_unlocked_share_percent: lockKnown.length ? unlocked * 100 : null,
+    top10_lock_status_unknown_share_percent: known.length ? unknown * 100 : null,
+    lock_status_interpretation: "Les détenteurs sans indicateur is_locked explicite restent non classés; ils ne sont pas considérés comme déverrouillés."
   };
 }
 
