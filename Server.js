@@ -105,6 +105,8 @@ const ARCHIVE_TABLES = [
   "ci_audit"
   ,"ci_investment_evaluations"
   ,"ci_investment_decisions"
+  ,"ci_ai_council_sessions"
+  ,"ci_ai_council_opinions"
 ];
 
 const ARCHIVE_PREFIX = "conan/backups/";
@@ -4729,6 +4731,38 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, count: result.results?.length || 0, evidence: result.results || [] });
   }
 
+
+  /* ---------------- CHAPITRE 5 — CONSEIL DES CINQ IA ----------------------- */
+
+  if (method === "POST" && path === "/api/ai/council/analyze") {
+    const body = await readBody(request);
+    const discoveryKey = safeString(body.discovery_key || "", 200);
+    if (!discoveryKey) return errorResponse("discovery_key requis.");
+    const result = await runRadarAICouncil(env, db, discoveryKey);
+    if (result.error) return errorResponse(result.error, result.status || 409);
+    return json({ success: true, council: result }, 201);
+  }
+
+  if (method === "GET" && path === "/api/ai/council/sessions") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit")) || 50));
+    const result = discoveryKey
+      ? await db.prepare("SELECT * FROM ci_ai_council_sessions WHERE discovery_key = ? ORDER BY created_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_ai_council_sessions ORDER BY created_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, sessions: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/api/ai/council/opinions") {
+    const sessionId = safeString(url.searchParams.get("session_id") || "", 120);
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    if (!sessionId && !discoveryKey) return errorResponse("session_id ou discovery_key requis.");
+    const result = sessionId
+      ? await db.prepare("SELECT * FROM ci_ai_council_opinions WHERE session_id = ? ORDER BY created_at ASC LIMIT ?").bind(sessionId, limit).all()
+      : await db.prepare("SELECT * FROM ci_ai_council_opinions WHERE discovery_key = ? ORDER BY created_at DESC LIMIT ?").bind(discoveryKey, limit).all();
+    return json({ success: true, count: result.results?.length || 0, opinions: result.results || [] });
+  }
+
   return errorResponse("Route API introuvable.", 404);
 }
 
@@ -5366,6 +5400,239 @@ async function prepareRadarInvestigationDossier(db, discoveryKey) {
     note: "Pré-dossier assemblé à partir des dernières observations déjà enregistrées. Les domaines absents restent inconnus et nécessitent des sources vérifiables; aucune équipe, adoption, association ou donnée financière n'est inventée."
   };
 }
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 5 — CONSEIL IA : ORCHESTRATION, PREUVES ET ARBITRAGE              */
+/* -------------------------------------------------------------------------- */
+
+const RADAR_AI_COUNCIL_ROLES = [
+  { id: "fundamentals", name: "IA Fondamentale", instruction: "Évalue origine, équipe uniquement si vérifiable, technologie, utilité, tokenomics, distribution, dilution et crédibilité du projet." },
+  { id: "financial", name: "IA Financière", instruction: "Évalue prix, volumes, valorisation, liquidité réelle, profondeur, volatilité, concentration, flux et risques financiers. Distingue données observées et interprétations." },
+  { id: "security", name: "IA Sécurité", instruction: "Examine contrat, honeypot, possibilité de vente, taxes, privilèges administrateur, liquidité, concentration, LP et manipulation. Ne déclare jamais un contrat sûr sans preuves." },
+  { id: "growth", name: "IA Croissance", instruction: "Évalue adoption, activité de développement, utilisateurs, transactions, intégrations, communauté, actualités et partenariats vérifiables." },
+  { id: "arbiter", name: "IA Arbitre", instruction: "Compare les quatre avis indépendants, leurs preuves, leurs désaccords et leurs données manquantes. Ne fait pas une moyenne mécanique et n'efface jamais un signal critique." }
+];
+
+const RADAR_AI_COUNCIL_PROMPT_VERSION = "council-v1";
+
+async function initializeAICouncilTables(db) {
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_ai_council_sessions (
+      session_id TEXT PRIMARY KEY,
+      discovery_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      decision_gate TEXT NOT NULL,
+      critical_risk_signal INTEGER NOT NULL DEFAULT 0,
+      summary TEXT,
+      disagreements_json TEXT NOT NULL DEFAULT '[]',
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      provider_errors_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_ai_council_sessions_asset ON ci_ai_council_sessions(discovery_key, created_at DESC)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_ai_council_opinions (
+      opinion_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      discovery_key TEXT NOT NULL,
+      role TEXT NOT NULL,
+      provider TEXT,
+      status TEXT NOT NULL,
+      opinion_json TEXT NOT NULL DEFAULT '{}',
+      prompt_version TEXT NOT NULL,
+      error_message TEXT,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_ai_council_opinions_session ON ci_ai_council_opinions(session_id, created_at ASC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_ai_council_opinions_provider ON ci_ai_council_opinions(provider, status, created_at)")
+  ]);
+}
+
+function normalizeRadarAICouncilOpinion(raw, roleId) {
+  const parsed = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const list = value => Array.isArray(value) ? value.slice(0, 40).map(item => {
+    if (item && typeof item === "object") return {
+      statement: safeString(item.statement || item.claim || item.description || "", 1200),
+      source: safeString(item.source || "", 500) || null,
+      evidence_status: ["verified", "observed", "estimated", "unverified", "disputed"].includes(item.evidence_status) ? item.evidence_status : "unverified",
+      observed_at: safeString(item.observed_at || "", 80) || null
+    };
+    return { statement: safeString(item, 1200), source: null, evidence_status: "unverified", observed_at: null };
+  }).filter(item => item.statement) : [];
+  const confidence = Number(parsed.confidence);
+  const stance = ["support", "neutral", "oppose", "insufficient_data"].includes(parsed.stance) ? parsed.stance : "insufficient_data";
+  return {
+    role: roleId,
+    summary: safeString(parsed.summary || parsed.conclusion || "", 3000),
+    stance,
+    facts: list(parsed.facts),
+    hypotheses: list(parsed.hypotheses),
+    risks: list(parsed.risks),
+    missing_data: Array.isArray(parsed.missing_data) ? parsed.missing_data.slice(0, 80).map(item => safeString(item, 500)).filter(Boolean) : [],
+    confidence_percent: Number.isFinite(confidence) ? Math.max(0, Math.min(100, confidence)) : null,
+    critical_risk_signal: parsed.critical_risk === true || list(parsed.risks).some(item => /critical|critique/i.test(item.statement)),
+    conclusion: safeString(parsed.conclusion || "", 2000),
+    raw_unstructured_response: parsed.unstructured_response ? safeString(parsed.unstructured_response, 12000) : null,
+    parsing_warning: safeString(parsed.parsing_warning || "", 500) || null
+  };
+}
+
+async function runRadarAICouncil(env, db, discoveryKey) {
+  await initializeAICouncilTables(db);
+  const discovery = await db.prepare("SELECT * FROM ci_radar_discoveries WHERE discovery_key = ?").bind(discoveryKey).first();
+  if (!discovery) return { error: "Actif radar introuvable.", status: 404 };
+
+  const providers = availableAIProviders(env);
+  if (!providers.length) return { error: "Aucun fournisseur IA configuré. Aucun avis simulé n'a été créé.", status: 503 };
+
+  const dossier = await prepareRadarInvestigationDossier(db, discoveryKey);
+  const latestReport = await getLatestRadarInvestigationReport(db, discoveryKey);
+  const evidence = {
+    asset: { discovery_key: discovery.discovery_key, chain_id: discovery.chain_id, contract_address: discovery.contract_address, name: discovery.token_name, symbol: discovery.token_symbol },
+    dossier,
+    latest_investigation_report: latestReport ? {
+      report_id: latestReport.report_id,
+      report_version: latestReport.report_version,
+      coverage_percent: latestReport.coverage_percent,
+      confidence_percent: latestReport.confidence_percent,
+      sections: (() => { try { return JSON.parse(latestReport.sections_json || "{}"); } catch { return {}; } })(),
+      missing_data: (() => { try { return JSON.parse(latestReport.missing_data_json || "[]"); } catch { return []; } })(),
+      risk_register: (() => { try { return JSON.parse(latestReport.risk_register_json || "[]"); } catch { return []; } })()
+    } : null,
+    collected_at: nowISO(),
+    data_policy: "Aucune donnée absente ne doit être inventée. Les sources citées par un modèle ne sont pas considérées vérifiées sans preuve indépendante."
+  };
+
+  const limitValue = Number(env.AI_COUNCIL_DAILY_PROVIDER_CALL_LIMIT);
+  const dailyLimit = Number.isFinite(limitValue) ? Math.max(1, Math.min(50, Math.floor(limitValue))) : 5;
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const usageResult = await db.prepare("SELECT provider, COUNT(*) AS calls FROM ci_ai_council_opinions WHERE status = 'completed' AND created_at >= ? GROUP BY provider").bind(since).all();
+  const usage = new Map((usageResult.results || []).map(row => [row.provider, Number(row.calls) || 0]));
+  const available = () => providers.filter(provider => (usage.get(provider) || 0) < dailyLimit);
+  const chooseProvider = () => {
+    const candidates = available().sort((a, b) => (usage.get(a) || 0) - (usage.get(b) || 0));
+    return candidates[0] || null;
+  };
+
+  const sessionId = cryptoRandomId();
+  const opinions = [];
+  const providerErrors = [];
+  const expertRoles = RADAR_AI_COUNCIL_ROLES.filter(role => role.id !== "arbiter");
+
+  const executeRole = async (role, context) => {
+    const provider = chooseProvider();
+    if (!provider) {
+      const message = "Plafond journalier local du conseil atteint pour les fournisseurs disponibles; appel non effectué.";
+      providerErrors.push({ role: role.id, provider: null, error: message });
+      await db.prepare(`INSERT INTO ci_ai_council_opinions
+        (opinion_id, session_id, discovery_key, role, provider, status, opinion_json, prompt_version, error_message, created_at)
+        VALUES (?, ?, ?, ?, NULL, 'skipped_quota', '{}', ?, ?, ?)`).bind(
+          cryptoRandomId(), sessionId, discoveryKey, role.id, RADAR_AI_COUNCIL_PROMPT_VERSION, message, nowISO()
+        ).run();
+      return null;
+    }
+    const prompt = [
+      "CRYPTO INTELLIGENCE — CONSEIL IA INDÉPENDANT",
+      "RÔLE : " + role.name + " (" + role.id + ")",
+      "MISSION : " + role.instruction,
+      "RÈGLES OBLIGATOIRES :",
+      "- Sépare les faits observés, les hypothèses, les risques et les inconnues.",
+      "- Pour chaque fait, indique une source et un statut de preuve; si absent, indique inconnu.",
+      "- Ne fabrique aucun prix, volume, partenariat, identité, audit ou résultat.",
+      "- Une source simplement citée par un modèle n'est pas une preuve vérifiée.",
+      "- Un risque critique signalé doit être conservé et ne peut pas être annulé par des avis positifs.",
+      "- Ne promets aucun rendement et ne donne aucune garantie de sécurité.",
+      "CONTEXTE FOURNI :",
+      JSON.stringify(context),
+      "Réponds en JSON : { role, summary, stance: support|neutral|oppose|insufficient_data, facts:[], hypotheses:[], risks:[], missing_data:[], confidence:0-100, critical_risk:false, conclusion }."
+    ].join("\n");
+
+    try {
+      const raw = await callAIProvider(provider, env, prompt);
+      const normalized = normalizeRadarAICouncilOpinion(parseAIResponse(raw), role.id);
+      const createdAt = nowISO();
+      await db.prepare(`INSERT INTO ci_ai_council_opinions
+        (opinion_id, session_id, discovery_key, role, provider, status, opinion_json, prompt_version, error_message, created_at)
+        VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, NULL, ?)`).bind(
+          cryptoRandomId(), sessionId, discoveryKey, role.id, provider,
+          JSON.stringify(normalized), RADAR_AI_COUNCIL_PROMPT_VERSION, createdAt
+        ).run();
+      usage.set(provider, (usage.get(provider) || 0) + 1);
+      await recordProviderUsage(db, provider, true, 200);
+      opinions.push({ ...normalized, provider, created_at: createdAt });
+      return opinions[opinions.length - 1];
+    } catch (error) {
+      const message = safeString(error.message || "Erreur fournisseur IA.", 700);
+      providerErrors.push({ role: role.id, provider, error: message });
+      await db.prepare(`INSERT INTO ci_ai_council_opinions
+        (opinion_id, session_id, discovery_key, role, provider, status, opinion_json, prompt_version, error_message, created_at)
+        VALUES (?, ?, ?, ?, ?, 'failed', '{}', ?, ?, ?)`).bind(
+          cryptoRandomId(), sessionId, discoveryKey, role.id, provider,
+          RADAR_AI_COUNCIL_PROMPT_VERSION, message, nowISO()
+        ).run();
+      await recordProviderUsage(db, provider, false, error.status || 500);
+      return null;
+    }
+  };
+
+  for (const role of expertRoles) await executeRole(role, evidence);
+
+  const securityOpinion = opinions.find(item => item.role === "security");
+  const criticalRiskSignal = opinions.some(item => item.critical_risk_signal === true);
+  let arbiter = null;
+  if (opinions.length) {
+    const arbiterRole = RADAR_AI_COUNCIL_ROLES.find(role => role.id === "arbiter");
+    arbiter = await executeRole(arbiterRole, {
+      evidence,
+      independent_opinions: opinions.map(item => ({ role: item.role, stance: item.stance, summary: item.summary, facts: item.facts, hypotheses: item.hypotheses, risks: item.risks, missing_data: item.missing_data, confidence_percent: item.confidence_percent })),
+      mandatory_rule: "Ne supprime et ne compense jamais un signal de risque critique. Si un tel signal existe, la conclusion ne peut pas autoriser une entrée; indique une vérification humaine et indépendante requise."
+    });
+  }
+
+  const stances = [...new Set(opinions.filter(item => item.role !== "arbiter").map(item => item.stance).filter(value => value !== "insufficient_data"))];
+  const disagreements = stances.length > 1 ? [{
+    type: "stance_divergence",
+    stances,
+    roles: opinions.filter(item => item.role !== "arbiter").map(item => ({ role: item.role, stance: item.stance })),
+    note: "Divergence conservée; aucune moyenne ne l'efface."
+  }] : [];
+  const decisionGate = criticalRiskSignal ? "blocked_pending_independent_verification" :
+    (opinions.length < 4 || !arbiter ? "incomplete_no_decision" : "advisory_only");
+  const status = opinions.length === 5 ? "completed" : opinions.length ? "partial" : "failed";
+  const summary = criticalRiskSignal
+    ? "Signal de risque critique rapporté par au moins une IA : toute conclusion positive est bloquée en attente d'une vérification indépendante."
+    : safeString(arbiter?.summary || arbiter?.conclusion || "Conseil incomplet; aucune conclusion consolidée fiable.", 2000);
+  const session = {
+    session_id: sessionId,
+    discovery_key: discoveryKey,
+    status,
+    decision_gate: decisionGate,
+    critical_risk_signal: criticalRiskSignal,
+    summary,
+    opinions,
+    arbiter,
+    disagreements,
+    provider_errors: providerErrors,
+    evidence,
+    created_at: nowISO(),
+    safeguards: {
+      independent_expert_calls_before_arbiter: true,
+      critical_risk_cannot_be_overridden: true,
+      model_claims_are_not_independent_verification: true,
+      daily_local_provider_call_limit: dailyLimit,
+      no_automatic_investment_decision: true
+    }
+  };
+  await db.prepare(`INSERT INTO ci_ai_council_sessions
+    (session_id, discovery_key, status, decision_gate, critical_risk_signal, summary, disagreements_json, evidence_json, provider_errors_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      sessionId, discoveryKey, status, decisionGate, criticalRiskSignal ? 1 : 0, summary,
+      JSON.stringify(disagreements), JSON.stringify(evidence), JSON.stringify(providerErrors), session.created_at
+    ).run();
+  await audit(db, "ai_council_session_" + status, discoveryKey + " — " + decisionGate);
+  return session;
+}
+
 
 export default {
   async fetch(request, env, ctx) {
