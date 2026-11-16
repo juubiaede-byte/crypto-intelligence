@@ -8744,3 +8744,36 @@ processCIProviderQueue=async function(db,env,limit=5){
   }
   return {processed:results.length,results,priority_order:"critical_security_to_historical_analysis",paid_overage:false};
 };
+
+
+/* Chapitre 15 — éviter le double comptage des inférences IA et des lectures en file. */
+fetchCIProviderReferenceData=async function(db,env,body){
+  const id=safeString(body.provider_id||"",60).toLowerCase();
+  const operation=safeString(body.operation||"",60).toLowerCase();
+  const gate=await ciProviderRuntimeGate(db,id);
+  if(!gate.allowed){
+    const error=new Error("Requête fournisseur différée : "+gate.reason);error.status=429;error.retry_at=gate.retry_at;throw error;
+  }
+  const started=Date.now();
+  try{
+    const result=await ciChapter15OriginalFetchProviderData(db,env,body);
+    await db.prepare("UPDATE ci_provider_runtime_state SET consecutive_errors=0,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE provider_id=?").bind(nowISO(),id).run();
+    return result;
+  }catch(error){
+    if(!(error.status===429&&String(error.message||"").includes("différée"))){
+      await ciRecordManagedProviderResult(db,id,operation,false,error.status||500,Date.now()-started,error.message);
+    }
+    throw error;
+  }
+};
+
+callAIProvider=async function(provider,env,prompt){
+  const db=env?.DB;
+  if(!db)return await ciChapter15OriginalCallAIProvider(provider,env,prompt);
+  const gate=await ciProviderRuntimeGate(db,provider);
+  if(!gate.allowed){
+    const error=new Error("Fournisseur IA différé par le gestionnaire central : "+gate.reason);
+    error.status=429;error.retry_at=gate.retry_at;throw error;
+  }
+  return await ciChapter15OriginalCallAIProvider(provider,env,prompt);
+};
