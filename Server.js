@@ -124,6 +124,7 @@ const ARCHIVE_TABLES = [
   ,"ci_conan_prediction_progress"
   ,"ci_conan_prediction_results"
   ,"ci_conan_learning_history"
+  ,"ci_conan_score_history"
 ];
 
 const ARCHIVE_PREFIX = "conan/backups/";
@@ -587,6 +588,9 @@ async function initializeBackendTables(db) {
     ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_results_asset ON ci_conan_prediction_results(discovery_key,evaluated_at DESC)")
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_learning_history (learning_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,learning_type TEXT NOT NULL,summary TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)`)
     ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_learning_cycle ON ci_conan_learning_history(cycle_id,created_at DESC)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_score_history (score_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL UNIQUE,score_total REAL,direction_score REAL,targets_technical_score REAL,probability_calibration_score REAL,project_quality_score REAL,market_activity_score REAL,risk_management_score REAL,evaluated_predictions INTEGER NOT NULL DEFAULT 0,unverifiable_predictions INTEGER NOT NULL DEFAULT 0,methodology_version TEXT NOT NULL,components_json TEXT NOT NULL DEFAULT "{}",created_at TEXT NOT NULL)`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_score_history_created ON ci_conan_score_history(created_at DESC)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_score_history_score ON ci_conan_score_history(score_total DESC,created_at DESC)")
 
 
 
@@ -4951,6 +4955,19 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     if(!cycleId&&!discoveryKey)return errorResponse("cycle_id ou discovery_key requis.");
     const result=cycleId?await db.prepare("SELECT * FROM ci_conan_prediction_results WHERE cycle_id=? ORDER BY evaluated_at ASC LIMIT ?").bind(cycleId,limit).all():await db.prepare("SELECT * FROM ci_conan_prediction_results WHERE discovery_key=? ORDER BY evaluated_at DESC LIMIT ?").bind(discoveryKey,limit).all();
     return json({success:true,count:result.results?.length||0,results:result.results||[]});
+  }
+
+  if (method === "GET" && path === "/api/conan/scores") {
+    const cycleId=safeString(url.searchParams.get("cycle_id")||"",120),limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
+    const result=cycleId?await db.prepare("SELECT * FROM ci_conan_score_history WHERE cycle_id=? ORDER BY created_at DESC").bind(cycleId).all():await db.prepare("SELECT * FROM ci_conan_score_history ORDER BY created_at DESC LIMIT ?").bind(limit).all();
+    return json({success:true,count:result.results?.length||0,scores:result.results||[]});
+  }
+  if (method === "GET" && path === "/api/conan/score") {
+    const cycleId=safeString(url.searchParams.get("cycle_id")||"",120);
+    if(!cycleId)return errorResponse("cycle_id requis.");
+    const result=await db.prepare("SELECT * FROM ci_conan_score_history WHERE cycle_id=? LIMIT 1").bind(cycleId).first();
+    if(!result)return errorResponse("Aucun score calculé pour ce cycle.",404);
+    return json({success:true,score:result});
   }
   if (method === "GET" && path === "/api/conan/learning-history") {
     const cycleId=safeString(url.searchParams.get("cycle_id")||"",120),limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
