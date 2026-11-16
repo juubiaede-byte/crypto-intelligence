@@ -2171,6 +2171,36 @@ async function syncRadarAssetLifecycle(db, limit = 1000) {
   return { scanned: rows.results?.length || 0, initialized };
 }
 
+function validateRadarLifecycleEvidence(evidence) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+    return "Les preuves doivent être un objet structuré.";
+  }
+  const entries = Object.entries(evidence).filter(([key, value]) =>
+    key && value !== null && value !== undefined &&
+    !(typeof value === "string" && !value.trim()) &&
+    !(Array.isArray(value) && value.length === 0)
+  );
+  if (entries.length < 2) {
+    return "Chaque transition exige au moins deux éléments de preuve distincts.";
+  }
+  const sourceKeys = ["source", "sources", "provider", "providers", "source_url", "urls"];
+  const observationKeys = ["observation", "observations", "finding", "findings", "checks", "metrics", "identity", "contract", "liquidity", "security", "onchain", "holders", "volume", "market_data"];
+  const normalizedKeys = entries.map(([key]) => key.toLowerCase());
+  if (!normalizedKeys.some(key => sourceKeys.includes(key))) {
+    return "Les preuves doivent identifier au moins une source vérifiable.";
+  }
+  if (!normalizedKeys.some(key => observationKeys.includes(key))) {
+    return "Les preuves doivent contenir au moins une observation ou vérification concrète.";
+  }
+  const substantive = normalizedKeys.filter(key =>
+    !["price", "price_change", "price_change_24h", "price_increase", "variation", "pump"].includes(key)
+  );
+  if (substantive.length < 2) {
+    return "Une hausse de prix seule ne peut jamais justifier une transition.";
+  }
+  return null;
+}
+
 async function transitionRadarAssetLifecycle(db, body) {
   const discoveryKey = safeString(body.discovery_key || "", 200);
   const targetStage = safeString(body.to_stage || "", 80);
@@ -2203,6 +2233,8 @@ async function transitionRadarAssetLifecycle(db, body) {
     return { error: "Transition refusée : les étapes doivent être parcourues dans l'ordre, sans saut." };
   }
   const evidence = body.evidence && typeof body.evidence === "object" && !Array.isArray(body.evidence) ? body.evidence : {};
+  const evidenceError = validateRadarLifecycleEvidence(evidence);
+  if (evidenceError) return { error: evidenceError };
   const evidenceJson = JSON.stringify(evidence);
   const timestamp = nowISO();
   const eventId = cryptoRandomId();
