@@ -8816,7 +8816,7 @@ handleProtectedRoutes=async function(request,env,ctx,route){
       const prompt=safeString(body.prompt||"",20000);
       if(!prompt)throw new Error("Le prompt est obligatoire.");
       const result=await callCIProviderWithFallback(env,db,prompt,body.preferred_provider);
-      return json({success:result.success,...result,provider_fallback_is_not_data_equivalence:false});
+      return json({success:result.success,...result,fallback_may_change_model:true});
     }catch(error){return errorResponse(safeString(error.message||"Repli IA impossible.",1000),400);}
   }
   return await ciChapter15RoutesBeforeFallback(request,env,ctx,route);
