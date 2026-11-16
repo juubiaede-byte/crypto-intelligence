@@ -107,6 +107,9 @@ const ARCHIVE_TABLES = [
   ,"ci_investment_decisions"
   ,"ci_ai_council_sessions"
   ,"ci_ai_council_opinions"
+  ,"ci_collective_opportunity_runs"
+  ,"ci_collective_opportunity_signals"
+  ,"ci_collective_opportunity_history"
 ];
 
 const ARCHIVE_PREFIX = "conan/backups/";
@@ -467,7 +470,15 @@ async function initializeBackendTables(db) {
       evidence_status TEXT NOT NULL DEFAULT 'observed',
       recorded_at TEXT NOT NULL
     )`)
-    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_investigation_evidence_report ON ci_investigation_evidence(report_id, section_key, field_key, recorded_at DESC)`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_collective_opportunity_runs (run_id TEXT PRIMARY KEY, status TEXT NOT NULL, assets_examined INTEGER NOT NULL DEFAULT 0, signals_created INTEGER NOT NULL DEFAULT 0, candidates_count INTEGER NOT NULL DEFAULT 0, correlations_count INTEGER NOT NULL DEFAULT 0, methodology_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_collective_opportunity_signals (signal_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, discovery_key TEXT NOT NULL, signal_type TEXT NOT NULL, severity TEXT NOT NULL, confidence_percent REAL, metrics_json TEXT NOT NULL DEFAULT '{}', evidence_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_signals_asset ON ci_collective_opportunity_signals(discovery_key, created_at DESC)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_signals_run ON ci_collective_opportunity_signals(run_id, created_at DESC)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_collective_opportunity_history (history_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, discovery_key TEXT NOT NULL, classification TEXT NOT NULL, opportunity_score REAL NOT NULL DEFAULT 0, confidence_percent REAL NOT NULL DEFAULT 0, price_change_24h REAL, activity_ratio REAL, buy_pressure REAL, liquidity_usd REAL, pool_depth_usd REAL, market_cap_usd REAL, fdv_usd REAL, circulating_supply REAL, total_supply REAL, sellability_status TEXT NOT NULL DEFAULT 'unknown', critical_risk INTEGER NOT NULL DEFAULT 0, evidence_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_history_asset ON ci_collective_opportunity_history(discovery_key, created_at DESC)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_history_run ON ci_collective_opportunity_history(run_id, created_at DESC)")
+_investigation_evidence_report ON ci_investigation_evidence(report_id, section_key, field_key, recorded_at DESC)`)
 
 
   ]);
