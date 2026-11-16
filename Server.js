@@ -7469,3 +7469,199 @@ handleProtectedRoutes = async function(request,env,ctx,route){
   }
   return await conanChapter12OriginalProtectedRoutes(request,env,ctx,route);
 };
+
+
+// CHAPTER 12 ADDENDUM — AUTONOMOUS, VERSIONED CONAN-OWNED CODE WORKSPACE.
+// This workspace is separate from the application's source tree. Revisions are
+// stored as data in D1; they are never eval'd, imported, or executed by this Worker.
+const CONAN_OWN_CODE_WORKSPACE_VERSION = "conan-owned-code-workspace-v1";
+
+async function ensureConanOwnedCodeWorkspace(db){
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_code_modules (
+      module_id TEXT PRIMARY KEY,
+      module_name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      active_revision_id TEXT,
+      status TEXT NOT NULL DEFAULT 'draft',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_code_revisions (
+      revision_id TEXT PRIMARY KEY,
+      module_id TEXT NOT NULL,
+      version_number INTEGER NOT NULL,
+      source_code TEXT NOT NULL,
+      source_format TEXT NOT NULL DEFAULT 'javascript',
+      checksum TEXT NOT NULL,
+      validation_json TEXT NOT NULL,
+      parent_revision_id TEXT,
+      created_by TEXT NOT NULL DEFAULT 'conan',
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_code_revisions_module ON ci_conan_code_revisions(module_id,version_number DESC)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_code_events (
+      event_id TEXT PRIMARY KEY,
+      module_id TEXT,
+      revision_id TEXT,
+      event_type TEXT NOT NULL,
+      details_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_code_backups (
+      backup_id TEXT PRIMARY KEY,
+      snapshot_json TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      verified INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    )`)
+  ]);
+  for(const table of ["ci_conan_code_modules","ci_conan_code_revisions","ci_conan_code_events","ci_conan_code_backups"]){
+    if(!ARCHIVE_TABLES.includes(table))ARCHIVE_TABLES.push(table);
+  }
+}
+
+function validateConanOwnedCodeSource(source){
+  const code=String(source??"");
+  const issues=[];
+  if(!code.trim())issues.push("Le code ne peut pas être vide.");
+  if(code.length>30000)issues.push("La taille maximale d'une révision est de 30 000 caractères.");
+  const forbidden=[
+    {pattern:/\\beval\\s*\\(/i,label:"eval"},
+    {pattern:/\\bnew\\s+Function\\s*\\(/i,label:"Function constructor"},
+    {pattern:/\\bimport\\s*\\(/i,label:"dynamic import"},
+    {pattern:/\\bfetch\\s*\\(/i,label:"network fetch"},
+    {pattern:/\\bglobalThis\\b/i,label:"globalThis"},
+    {pattern:/\\bprocess\\b/i,label:"process"},
+    {pattern:/\\brequire\\s*\\(/i,label:"require"},
+    {pattern:/\\bDeno\\b/i,label:"Deno"},
+    {pattern:/\\bWebAssembly\\b/i,label:"WebAssembly"}
+  ];
+  for(const item of forbidden)if(item.pattern.test(code))issues.push("API non autorisée dans l'espace de code isolé : "+item.label+".");
+  return {valid:issues.length===0,issues,source_characters:code.length,execution_status:"not_executable_by_application_worker",note:"Validation statique uniquement; aucune exécution de code arbitraire n'est autorisée."};
+}
+
+async function recordConanOwnedCodeEvent(db,eventType,moduleId,revisionId,details){
+  await db.prepare("INSERT INTO ci_conan_code_events (event_id,module_id,revision_id,event_type,details_json,created_at) VALUES (?,?,?,?,?,?)").bind(
+    cryptoRandomId(),moduleId||null,revisionId||null,eventType,JSON.stringify(details||{}),nowISO()
+  ).run();
+}
+
+async function createConanOwnedCodeBackup(db){
+  await ensureConanOwnedCodeWorkspace(db);
+  const names=["ci_conan_code_modules","ci_conan_code_revisions","ci_conan_code_events"];
+  const snapshot={schema:CONAN_OWN_CODE_WORKSPACE_VERSION,tables:{}};
+  for(const name of names){
+    const rows=await db.prepare("SELECT * FROM "+name).all();
+    snapshot.tables[name]=rows.results||[];
+  }
+  const serialized=JSON.stringify(snapshot);
+  const checksum=conanIncubatorFingerprint(snapshot);
+  const id=cryptoRandomId(),timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_conan_code_backups (backup_id,snapshot_json,checksum,verified,created_at) VALUES (?,?,?,0,?)").bind(id,serialized,checksum,timestamp).run();
+  const stored=await db.prepare("SELECT snapshot_json,checksum FROM ci_conan_code_backups WHERE backup_id=?").bind(id).first();
+  const verified=Boolean(stored&&stored.snapshot_json===serialized&&stored.checksum===checksum);
+  if(!verified)throw new Error("Sauvegarde du code personnel Conan non vérifiée; opération bloquée.");
+  await db.prepare("UPDATE ci_conan_code_backups SET verified=1 WHERE backup_id=?").bind(id).run();
+  await recordConanOwnedCodeEvent(db,"code_workspace_backup_verified",null,null,{backup_id:id,checksum});
+  return {backup_id:id,verified:true,checksum};
+}
+
+async function createOrReviseConanOwnedModule(db,body){
+  await ensureConanOwnedCodeWorkspace(db);
+  const name=safeString(body.module_name||"",120);
+  const description=safeString(body.description||"",1000);
+  const source=typeof body.source_code==="string"?body.source_code:"";
+  if(!name||!description)return {error:"module_name et description sont obligatoires."};
+  const validation=validateConanOwnedCodeSource(source);
+  if(!validation.valid)return {error:"Révision refusée par les garde-fous statiques.",validation};
+  let moduleId=safeString(body.module_id||"",160);
+  let moduleRow=null;
+  if(moduleId)moduleRow=await db.prepare("SELECT * FROM ci_conan_code_modules WHERE module_id=?").bind(moduleId).first();
+  if(moduleId&&!moduleRow)return {error:"Module Conan introuvable."};
+  if(!moduleId){
+    moduleId=cryptoRandomId();
+    const timestamp=nowISO();
+    await db.prepare("INSERT INTO ci_conan_code_modules (module_id,module_name,description,status,created_at,updated_at) VALUES (?,?,?,'draft',?,?)").bind(moduleId,name,description,timestamp,timestamp).run();
+  }
+  const latest=await db.prepare("SELECT revision_id,version_number FROM ci_conan_code_revisions WHERE module_id=? ORDER BY version_number DESC LIMIT 1").bind(moduleId).first();
+  const version=(Number(latest?.version_number)||0)+1;
+  const revisionId=cryptoRandomId(),timestamp=nowISO(),checksum=conanIncubatorFingerprint(source);
+  await db.prepare("INSERT INTO ci_conan_code_revisions (revision_id,module_id,version_number,source_code,source_format,checksum,validation_json,parent_revision_id,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(
+    revisionId,moduleId,version,source,"javascript",checksum,JSON.stringify(validation),latest?.revision_id||null,"conan",timestamp
+  ).run();
+  await db.prepare("UPDATE ci_conan_code_modules SET module_name=?,description=?,updated_at=? WHERE module_id=?").bind(name,description,timestamp,moduleId).run();
+  await recordConanOwnedCodeEvent(db,"conan_owned_code_revision_created",moduleId,revisionId,{version,checksum,validation});
+  return {module_id:moduleId,revision_id:revisionId,version,checksum,validation,execution_status:"stored_not_executed",human_approval_required:false,application_source_modified:false};
+}
+
+const conanChapter12BeforeOwnedCodeWorkspace = handleProtectedRoutes;
+handleProtectedRoutes = async function(request,env,ctx,route){
+  const {path,method,url}=route;
+  const codeRoutes=[
+    "/api/conan/incubator/code",
+    "/api/conan/incubator/code/modules",
+    "/api/conan/incubator/code/revisions",
+    "/api/conan/incubator/code/activate",
+    "/api/conan/incubator/code/backups",
+    "/api/conan/incubator/code/events"
+  ];
+  if(codeRoutes.includes(path)){
+    const db=getDB(env);
+    await initializeBackendTables(db);
+    await ensureConanIncubatorTables(db);
+    await ensureConanOwnedCodeWorkspace(db);
+    if(method==="GET"&&path==="/api/conan/incubator/code"){
+      const state=await getConanIncubatorState(db);
+      return json({success:true,workspace:CONAN_OWN_CODE_WORKSPACE_VERSION,autonomous_authoring:true,human_approval_required:false,application_source_access:"read_only",application_source_modification:false,arbitrary_code_execution:false,execution_status:"not_available_in_worker",permissions:state.permissions});
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/code/modules"){
+      const rows=await db.prepare("SELECT * FROM ci_conan_code_modules ORDER BY updated_at DESC LIMIT 200").all();
+      return json({success:true,count:rows.results?.length||0,modules:rows.results||[]});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/code/modules"){
+      try{
+        const result=await createOrReviseConanOwnedModule(db,await readBody(request));
+        if(result.error)return errorResponse(result.error,400,{validation:result.validation});
+        return json({success:true,...result},201);
+      }catch(error){return errorResponse(safeString(error.message||"Création de module refusée.",1000),400);}
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/code/revisions"){
+      const moduleId=safeString(url.searchParams.get("module_id")||"",160);
+      if(!moduleId)return errorResponse("module_id est obligatoire.");
+      const rows=await db.prepare("SELECT revision_id,module_id,version_number,source_format,checksum,validation_json,parent_revision_id,created_by,created_at FROM ci_conan_code_revisions WHERE module_id=? ORDER BY version_number DESC LIMIT 100").bind(moduleId).all();
+      return json({success:true,count:rows.results?.length||0,revisions:rows.results||[]});
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/code/activate"){
+      const moduleId=safeString(url.searchParams.get("module_id")||"",160);
+      const row=await db.prepare("SELECT module_id,module_name,active_revision_id,status FROM ci_conan_code_modules WHERE module_id=?").bind(moduleId).first();
+      if(!row)return errorResponse("Module introuvable.",404);
+      return json({success:true,module:row,activation_means:"selected_version_only",runtime_execution:false});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/code/activate"){
+      const body=await readBody(request),moduleId=safeString(body.module_id||"",160),revisionId=safeString(body.revision_id||"",160);
+      const revision=await db.prepare("SELECT * FROM ci_conan_code_revisions WHERE revision_id=? AND module_id=?").bind(revisionId,moduleId).first();
+      if(!revision)return errorResponse("Révision de ce module introuvable.",404);
+      const validation=JSON.parse(revision.validation_json||"{}");
+      if(!validation.valid)return errorResponse("Révision non validée.",400);
+      const timestamp=nowISO();
+      await db.prepare("UPDATE ci_conan_code_modules SET active_revision_id=?,status='selected_not_executed',updated_at=? WHERE module_id=?").bind(revisionId,timestamp,moduleId).run();
+      await recordConanOwnedCodeEvent(db,"conan_owned_revision_selected",moduleId,revisionId,{runtime_execution:false});
+      return json({success:true,module_id:moduleId,active_revision_id:revisionId,status:"selected_not_executed",runtime_execution:false,application_source_modified:false});
+    }
+    if(method==="POST"&&path==="/api/conan/incubator/code/backups"){
+      try{return json({success:true,...await createConanOwnedCodeBackup(db)},201);}
+      catch(error){return errorResponse(safeString(error.message||"Sauvegarde échouée.",1000),500);}
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/code/backups"){
+      const rows=await db.prepare("SELECT backup_id,checksum,verified,created_at FROM ci_conan_code_backups ORDER BY created_at DESC LIMIT 100").all();
+      return json({success:true,count:rows.results?.length||0,backups:rows.results||[]});
+    }
+    if(method==="GET"&&path==="/api/conan/incubator/code/events"){
+      const limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
+      const rows=await db.prepare("SELECT * FROM ci_conan_code_events ORDER BY created_at DESC LIMIT ?").bind(limit).all();
+      return json({success:true,count:rows.results?.length||0,events:rows.results||[]});
+    }
+  }
+  return await conanChapter12BeforeOwnedCodeWorkspace(request,env,ctx,route);
+};
