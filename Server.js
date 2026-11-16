@@ -1,6 +1,6 @@
 
 /*
- * CRYPTO INTELLIGENCE — server.js
+ * CRYPTO INTELLIGENCE — Server.js
  * Backend central pour Cloudflare Workers.
  *
  * Variables / bindings à configurer :
@@ -20,8 +20,8 @@
  *
  * ARCHIVES R2 :
  * - Sauvegarde des tables D1 autorisées.
- * - Liste des archives.
- * - Vérification SHA-256.
+ * - Liste paginée des archives.
+ * - Vérification SHA-256 et du manifeste.
  * - Aucune suppression automatique.
  * - Aucune restauration automatique.
  */
@@ -108,7 +108,13 @@ const ARCHIVE_PREFIX = "conan/backups/";
 const ARCHIVE_FORMAT = "crypto-intelligence-d1-backup-v1";
 const ARCHIVE_MAX_ROWS_PER_TABLE = 5000;
 const ARCHIVE_MAX_BYTES = 8 * 1024 * 1024;
-const ARCHIVE_LIST_LIMIT = 100;
+
+/*
+ * R2 accepte au maximum 1 000 objets par page.
+ * Chaque sauvegarde contient normalement deux objets :
+ * snapshot.json et manifest.json.
+ */
+const ARCHIVE_LIST_LIMIT = 1000;
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -486,14 +492,6 @@ async function createDatabaseArchive(db, env) {
   };
 
   const coreJSON = JSON.stringify(core);
-  const sizeBytes = new TextEncoder().encode(coreJSON).byteLength;
-
-  if (sizeBytes > ARCHIVE_MAX_BYTES) {
-    throw new Error(
-      `Sauvegarde interrompue : l'archive ferait ${sizeBytes} octets, au-delà de la limite de ${ARCHIVE_MAX_BYTES} octets. Aucune archive complète n'a été créée.`
-    );
-  }
-
   const checksum = await sha256(coreJSON);
 
   const archiveDocument = {
@@ -505,6 +503,18 @@ async function createDatabaseArchive(db, env) {
   };
 
   const archiveJSON = JSON.stringify(archiveDocument);
+  const archiveBytes = new TextEncoder().encode(archiveJSON).byteLength;
+
+  /*
+   * La taille est calculée sur le document complet réellement écrit,
+   * et non uniquement sur la partie core.
+   */
+  if (archiveBytes > ARCHIVE_MAX_BYTES) {
+    throw new Error(
+      `Sauvegarde interrompue : l'archive ferait ${archiveBytes} octets, au-delà de la limite de ${ARCHIVE_MAX_BYTES} octets. Aucune archive complète n'a été créée.`
+    );
+  }
+
   const timestampPart = createdAt.replace(/[:.]/g, "-");
   const baseKey = `${ARCHIVE_PREFIX}${timestampPart}-${snapshotId}`;
 
@@ -535,7 +545,7 @@ async function createDatabaseArchive(db, env) {
     manifest_key: manifestKey,
     checksum,
     checksum_algorithm: "SHA-256",
-    size_bytes: new TextEncoder().encode(archiveJSON).byteLength,
+    size_bytes: archiveBytes,
     table_count: Object.keys(collected.tables).length,
     total_rows: collected.totalRows,
     tables: collected.tableSummary,
@@ -570,7 +580,7 @@ async function createDatabaseArchive(db, env) {
     created_at: createdAt,
     checksum,
     checksum_algorithm: "SHA-256",
-    size_bytes: manifest.size_bytes,
+    size_bytes: archiveBytes,
     table_count: manifest.table_count,
     total_rows: manifest.total_rows,
     tables: manifest.tables,
@@ -579,8 +589,14 @@ async function createDatabaseArchive(db, env) {
 }
 
 /*
- * Liste les archives R2.
- * La pagination R2 est conservée : aucune archive n'est supprimée.
+ * Liste les archives R2 avec pagination.
+ *
+ * R2 pagine les objets, pas les manifestes.
+ * Une page peut donc contenir des snapshots et des manifestes.
+ * Le curseur retourné permet de continuer sans sauter les objets
+ * présents sur les pages suivantes.
+ *
+ * Aucune archive n'est supprimée ou modifiée.
  */
 async function listDatabaseArchives(env, cursor = null) {
   const bucket = getArchiveBucket(env);
@@ -591,7 +607,7 @@ async function listDatabaseArchives(env, cursor = null) {
   };
 
   if (cursor) {
-    options.cursor = cursor;
+    options.cursor = safeString(cursor, 2000);
   }
 
   const listing = await bucket.list(options);
@@ -618,6 +634,14 @@ async function listDatabaseArchives(env, cursor = null) {
       const manifestText = await object.text();
       const manifest = JSON.parse(manifestText);
 
+      const manifestValid =
+        manifest.application === APP_NAME &&
+        manifest.format === ARCHIVE_FORMAT &&
+        typeof manifest.snapshot_key === "string" &&
+        manifest.snapshot_key.startsWith(ARCHIVE_PREFIX) &&
+        manifest.snapshot_key.endsWith("/snapshot.json") &&
+        manifest.manifest_key === item.key;
+
       archives.push({
         snapshot_id: manifest.snapshot_id || null,
         created_at: manifest.created_at || null,
@@ -629,12 +653,14 @@ async function listDatabaseArchives(env, cursor = null) {
         table_count: manifest.table_count ?? null,
         total_rows: manifest.total_rows ?? null,
         tables: manifest.tables || {},
+        manifest_valid: manifestValid,
         restoration_available: false
       });
     } catch (error) {
       archives.push({
         manifest_key: item.key,
-        manifest_error: safeString(error.message, 300)
+        manifest_error: safeString(error.message, 300),
+        manifest_valid: false
       });
     }
   }
@@ -646,7 +672,10 @@ async function listDatabaseArchives(env, cursor = null) {
   return {
     archives,
     count: archives.length,
+    objects_scanned: objects.length,
+    page_limit: ARCHIVE_LIST_LIMIT,
     truncated: Boolean(listing.truncated),
+    has_more: Boolean(listing.truncated),
     next_cursor: listing.truncated ? listing.cursor || null : null
   };
 }
@@ -697,10 +726,13 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
   if (
     archive.format !== ARCHIVE_FORMAT ||
     archive.application !== APP_NAME ||
+    !archive.database ||
+    !archive.summary ||
     !archive.tables ||
     !archive.integrity ||
     archive.integrity.algorithm !== "SHA-256" ||
-    typeof archive.integrity.checksum !== "string"
+    typeof archive.integrity.checksum !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(archive.integrity.checksum)
   ) {
     throw new Error(
       "Format d'archive non reconnu ou informations d'intégrité manquantes."
@@ -724,10 +756,24 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
   const calculatedChecksum = await sha256(JSON.stringify(core));
   const expectedChecksum = archive.integrity.checksum;
 
-  const valid = constantTimeEqual(
+  const contentChecksumValid = constantTimeEqual(
     calculatedChecksum,
     expectedChecksum
   );
+
+  /*
+   * Contrôle des métadonnées R2 du snapshot.
+   * Ces métadonnées ne remplacent pas le calcul SHA-256 :
+   * elles servent de contrôle supplémentaire.
+   */
+  const snapshotMetadata = object.customMetadata || {};
+
+  const snapshotMetadataStatus =
+    snapshotMetadata.application === APP_NAME &&
+    snapshotMetadata.format === ARCHIVE_FORMAT &&
+    snapshotMetadata.checksum === expectedChecksum
+      ? "consistent"
+      : "inconsistent";
 
   const baseKey = snapshotKey.slice(
     0,
@@ -743,11 +789,30 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
     try {
       const manifest = JSON.parse(await manifestObject.text());
 
-      manifestStatus =
+      const manifestValid =
+        manifest.application === APP_NAME &&
+        manifest.format === ARCHIVE_FORMAT &&
+        manifest.snapshot_key === snapshotKey &&
+        manifest.manifest_key === manifestKey &&
         manifest.checksum === expectedChecksum &&
-        manifest.snapshot_key === snapshotKey
-          ? "consistent"
-          : "inconsistent";
+        manifest.checksum_algorithm === "SHA-256" &&
+        manifest.snapshot_id === snapshotMetadata.snapshot_id;
+
+      manifestStatus = manifestValid
+        ? "consistent"
+        : "inconsistent";
+
+      const manifestMetadata = manifestObject.customMetadata || {};
+
+      const manifestMetadataValid =
+        manifestMetadata.application === APP_NAME &&
+        manifestMetadata.format === ARCHIVE_FORMAT &&
+        manifestMetadata.checksum === expectedChecksum &&
+        manifestMetadata.snapshot_id === manifest.snapshot_id;
+
+      if (!manifestMetadataValid) {
+        manifestStatus = "inconsistent";
+      }
     } catch {
       manifestStatus = "invalid";
     }
@@ -755,26 +820,39 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
     manifestStatus = "missing";
   }
 
+  /*
+   * Une archive est entièrement valide uniquement si :
+   * 1. Le SHA-256 du contenu correspond.
+   * 2. Les métadonnées du snapshot sont cohérentes.
+   * 3. Le manifeste existe et correspond au snapshot.
+   */
+  const valid =
+    contentChecksumValid &&
+    snapshotMetadataStatus === "consistent" &&
+    manifestStatus === "consistent";
+
   await audit(
     db,
     valid ? "archive_verified" : "archive_integrity_failed",
-    `Vérification SHA-256 de ${snapshotKey} : ${valid ? "valide" : "échec"}`
+    `Vérification de ${snapshotKey} : ${valid ? "valide" : "échec"} — SHA-256 ${contentChecksumValid ? "valide" : "invalide"} — manifeste ${manifestStatus}`
   );
 
   return {
     snapshot_key: snapshotKey,
     manifest_key: manifestKey,
     valid,
+    content_checksum_valid: contentChecksumValid,
+    snapshot_metadata_status: snapshotMetadataStatus,
+    manifest_status: manifestStatus,
     algorithm: "SHA-256",
     expected_checksum: expectedChecksum,
     calculated_checksum: calculatedChecksum,
-    manifest_status: manifestStatus,
     created_at: archive.created_at || null,
     table_count: archive.summary?.table_count ?? null,
     total_rows: archive.summary?.total_rows ?? null,
     note: valid
-      ? "Le contenu de l'archive correspond à son empreinte SHA-256."
-      : "L'empreinte ne correspond pas : cette archive ne doit pas être utilisée pour une restauration."
+      ? "Le contenu, les métadonnées R2 et le manifeste sont cohérents."
+      : "La vérification complète a échoué ou un élément est manquant. Cette archive ne doit pas être utilisée pour une restauration."
   };
 }
 
@@ -1614,7 +1692,8 @@ async function handleProtectedRoutes(request, env, ctx, route) {
         automatic_deletion: false,
         prefix: ARCHIVE_PREFIX,
         maximum_rows_per_table: ARCHIVE_MAX_ROWS_PER_TABLE,
-        maximum_archive_bytes: ARCHIVE_MAX_BYTES
+        maximum_archive_bytes: ARCHIVE_MAX_BYTES,
+        listing_page_limit: ARCHIVE_LIST_LIMIT
       },
       note:
         "La présence du binding confirme sa disponibilité pour le Worker, mais les opérations doivent encore être testées en conditions réelles."
@@ -1869,13 +1948,14 @@ async function handleProtectedRoutes(request, env, ctx, route) {
             database_backup: Boolean(env.ARCHIVES),
             archive_listing: Boolean(env.ARCHIVES),
             sha256_verification: Boolean(env.ARCHIVES),
+            manifest_verification: Boolean(env.ARCHIVES),
             controlled_restoration: false,
             automatic_deletion: false
           }
         }
       },
       note:
-        "Les fonctions de sauvegarde D1, de liste des archives et de vérification SHA-256 sont intégrées au backend. Elles restent à tester en conditions réelles. La mémoire personnelle de Conan et la restauration contrôlée ne sont pas encore intégrées."
+        "Les fonctions de sauvegarde D1, de liste paginée des archives et de vérification SHA-256 avec contrôle du manifeste sont intégrées au backend. Elles restent à tester en conditions réelles. La mémoire personnelle de Conan et la restauration contrôlée ne sont pas encore intégrées."
     });
   }
 
