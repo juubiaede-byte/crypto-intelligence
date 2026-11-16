@@ -3,7 +3,7 @@
  * CRYPTO INTELLIGENCE — Server.js
  * Backend central pour Cloudflare Workers.
  *
- * Variables / bindings à configurer :
+ * Variables / bindings :
  * DB                 : Cloudflare D1
  * ARCHIVES           : Cloudflare R2
  * AI                 : Cloudflare Workers AI
@@ -22,8 +22,9 @@
  * - Sauvegarde des tables D1 autorisées.
  * - Liste paginée des archives.
  * - Vérification SHA-256 et du manifeste.
- * - Aucune suppression automatique.
+ * - Prévisualisation sécurisée avant restauration.
  * - Aucune restauration automatique.
+ * - Aucune suppression automatique.
  */
 
 const APP_NAME = "CRYPTO INTELLIGENCE";
@@ -75,14 +76,6 @@ const JSON_HEADERS = {
   "X-Content-Type-Options": "nosniff"
 };
 
-/*
- * Tables D1 autorisées dans les sauvegardes.
- * Les noms sont fixes : aucune table fournie par une requête utilisateur
- * ne peut être injectée dans une instruction SQL.
- *
- * Les tables absentes sont simplement ignorées.
- * Les tables système Cloudflare ne sont pas archivées.
- */
 const ARCHIVE_TABLES = [
   "ai_opinions",
   "alerts",
@@ -108,13 +101,15 @@ const ARCHIVE_PREFIX = "conan/backups/";
 const ARCHIVE_FORMAT = "crypto-intelligence-d1-backup-v1";
 const ARCHIVE_MAX_ROWS_PER_TABLE = 5000;
 const ARCHIVE_MAX_BYTES = 8 * 1024 * 1024;
+const ARCHIVE_LIST_LIMIT = 1000;
 
 /*
- * R2 accepte au maximum 1 000 objets par page.
- * Chaque sauvegarde contient normalement deux objets :
- * snapshot.json et manifest.json.
+ * Limite de sécurité supplémentaire pour la prévisualisation.
+ * Une archive dépassant cette limite ne sera pas déclarée
+ * prévisualisable intégralement.
  */
-const ARCHIVE_LIST_LIMIT = 1000;
+const ARCHIVE_PREVIEW_MAX_TOTAL_ROWS = 10000;
+const ARCHIVE_PREVIEW_SAMPLE_LIMIT = 10;
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -178,6 +173,7 @@ function corsHeaders(request, env) {
 
 function withHeaders(response, headers) {
   const merged = new Headers(response.headers);
+
   for (const [key, value] of Object.entries(headers)) {
     merged.set(key, value);
   }
@@ -194,9 +190,11 @@ function constantTimeEqual(a, b) {
   if (a.length !== b.length) return false;
 
   let result = 0;
+
   for (let i = 0; i < a.length; i++) {
     result |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
+
   return result === 0;
 }
 
@@ -204,6 +202,7 @@ function isAuthorized(request, env) {
   if (!env.APP_SECRET) return false;
 
   const header = request.headers.get("Authorization") || "";
+
   const token = header.startsWith("Bearer ")
     ? header.slice(7).trim()
     : "";
@@ -242,8 +241,11 @@ async function sha256(value) {
 
 function getDB(env) {
   if (!env.DB) {
-    throw new Error("Binding D1 DB absent. Configure le binding DB dans Cloudflare.");
+    throw new Error(
+      "Binding D1 DB absent. Configure le binding DB dans Cloudflare."
+    );
   }
+
   return env.DB;
 }
 
@@ -303,7 +305,11 @@ async function audit(db, type, description) {
     await db.prepare(`
       INSERT INTO ci_audit (event_type, description, created_at)
       VALUES (?, ?, ?)
-    `).bind(type, safeString(description, 2000), nowISO()).run();
+    `).bind(
+      type,
+      safeString(description, 2000),
+      nowISO()
+    ).run();
   } catch (error) {
     console.error("Audit error:", error);
   }
@@ -319,8 +325,10 @@ async function cacheGet(db, key) {
   if (!row) return null;
 
   if (Number(row.expires_at) < Date.now()) {
-    await db.prepare("DELETE FROM ci_cache WHERE cache_key = ?")
-      .bind(key).run();
+    await db.prepare(
+      "DELETE FROM ci_cache WHERE cache_key = ?"
+    ).bind(key).run();
+
     return null;
   }
 
@@ -380,10 +388,6 @@ function getArchiveBucket(env) {
   return env.ARCHIVES;
 }
 
-/*
- * Vérifie l'existence d'une table à partir de la liste autorisée.
- * Les noms utilisés ici proviennent exclusivement de ARCHIVE_TABLES.
- */
 async function getArchiveTableInfo(db, tableName) {
   if (!ARCHIVE_TABLES.includes(tableName)) {
     throw new Error("Table non autorisée pour les archives.");
@@ -396,15 +400,6 @@ async function getArchiveTableInfo(db, tableName) {
   return result.results || [];
 }
 
-/*
- * Construit une copie logique des tables D1.
- * Cette opération ne modifie et ne supprime aucune donnée.
- *
- * Limites de sécurité :
- * - 5 000 lignes maximum par table.
- * - 8 Mo maximum pour l'archive complète.
- * - En cas de dépassement, aucune archive complète n'est déclarée.
- */
 async function collectDatabaseSnapshot(db) {
   const tables = {};
   const tableSummary = {};
@@ -413,9 +408,7 @@ async function collectDatabaseSnapshot(db) {
   for (const tableName of ARCHIVE_TABLES) {
     const columnsInfo = await getArchiveTableInfo(db, tableName);
 
-    if (!columnsInfo.length) {
-      continue;
-    }
+    if (!columnsInfo.length) continue;
 
     const columns = columnsInfo.map((column) => column.name);
 
@@ -457,16 +450,6 @@ async function collectDatabaseSnapshot(db) {
   };
 }
 
-/*
- * Création d'une archive D1 dans R2.
- *
- * Le contenu de l'archive est haché en SHA-256.
- * Le snapshot est écrit avant son manifeste.
- *
- * Si l'écriture du manifeste échoue après celle du snapshot,
- * le snapshot n'est pas supprimé : aucune suppression automatique
- * n'est autorisée dans le système d'archives.
- */
 async function createDatabaseArchive(db, env) {
   const bucket = getArchiveBucket(env);
   const createdAt = nowISO();
@@ -505,10 +488,6 @@ async function createDatabaseArchive(db, env) {
   const archiveJSON = JSON.stringify(archiveDocument);
   const archiveBytes = new TextEncoder().encode(archiveJSON).byteLength;
 
-  /*
-   * La taille est calculée sur le document complet réellement écrit,
-   * et non uniquement sur la partie core.
-   */
   if (archiveBytes > ARCHIVE_MAX_BYTES) {
     throw new Error(
       `Sauvegarde interrompue : l'archive ferait ${archiveBytes} octets, au-delà de la limite de ${ARCHIVE_MAX_BYTES} octets. Aucune archive complète n'a été créée.`
@@ -551,7 +530,8 @@ async function createDatabaseArchive(db, env) {
     tables: collected.tableSummary,
     restoration: {
       available: false,
-      note: "La restauration contrôlée sera ajoutée dans une étape séparée."
+      preview_available: true,
+      note: "La restauration contrôlée nécessite une prévisualisation et une validation préalables."
     }
   };
 
@@ -584,20 +564,11 @@ async function createDatabaseArchive(db, env) {
     table_count: manifest.table_count,
     total_rows: manifest.total_rows,
     tables: manifest.tables,
+    preview_available: true,
     restoration_available: false
   };
 }
 
-/*
- * Liste les archives R2 avec pagination.
- *
- * R2 pagine les objets, pas les manifestes.
- * Une page peut donc contenir des snapshots et des manifestes.
- * Le curseur retourné permet de continuer sans sauter les objets
- * présents sur les pages suivantes.
- *
- * Aucune archive n'est supprimée ou modifiée.
- */
 async function listDatabaseArchives(env, cursor = null) {
   const bucket = getArchiveBucket(env);
 
@@ -654,6 +625,7 @@ async function listDatabaseArchives(env, cursor = null) {
         total_rows: manifest.total_rows ?? null,
         tables: manifest.tables || {},
         manifest_valid: manifestValid,
+        preview_available: true,
         restoration_available: false
       });
     } catch (error) {
@@ -680,11 +652,6 @@ async function listDatabaseArchives(env, cursor = null) {
   };
 }
 
-/*
- * Vérifie une archive existante.
- * Le client ne peut demander que des objets snapshot.json
- * situés sous le préfixe réservé aux sauvegardes de Conan.
- */
 function validateArchiveSnapshotKey(key) {
   const value = safeString(key, 1000);
 
@@ -701,7 +668,18 @@ function validateArchiveSnapshotKey(key) {
   return value;
 }
 
-async function verifyDatabaseArchive(db, env, requestedKey) {
+/*
+ * Vérification complète d'une archive existante.
+ * recordAudit=false est utilisé par la prévisualisation :
+ * cette dernière ne doit effectuer aucune écriture dans D1.
+ */
+async function verifyDatabaseArchive(
+  db,
+  env,
+  requestedKey,
+  options = {}
+) {
+  const recordAudit = options.recordAudit !== false;
   const bucket = getArchiveBucket(env);
   const snapshotKey = validateArchiveSnapshotKey(requestedKey);
 
@@ -714,6 +692,10 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
   }
 
   const archiveText = await object.text();
+
+  if (new TextEncoder().encode(archiveText).byteLength > ARCHIVE_MAX_BYTES) {
+    throw new Error("L'archive dépasse la taille maximale autorisée.");
+  }
 
   let archive;
 
@@ -739,10 +721,6 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
     );
   }
 
-  /*
-   * On reconstruit le même objet principal dans le même ordre
-   * que lors de la création de l'archive.
-   */
   const core = {
     format: archive.format,
     application: archive.application,
@@ -761,11 +739,6 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
     expectedChecksum
   );
 
-  /*
-   * Contrôle des métadonnées R2 du snapshot.
-   * Ces métadonnées ne remplacent pas le calcul SHA-256 :
-   * elles servent de contrôle supplémentaire.
-   */
   const snapshotMetadata = object.customMetadata || {};
 
   const snapshotMetadataStatus =
@@ -820,22 +793,18 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
     manifestStatus = "missing";
   }
 
-  /*
-   * Une archive est entièrement valide uniquement si :
-   * 1. Le SHA-256 du contenu correspond.
-   * 2. Les métadonnées du snapshot sont cohérentes.
-   * 3. Le manifeste existe et correspond au snapshot.
-   */
   const valid =
     contentChecksumValid &&
     snapshotMetadataStatus === "consistent" &&
     manifestStatus === "consistent";
 
-  await audit(
-    db,
-    valid ? "archive_verified" : "archive_integrity_failed",
-    `Vérification de ${snapshotKey} : ${valid ? "valide" : "échec"} — SHA-256 ${contentChecksumValid ? "valide" : "invalide"} — manifeste ${manifestStatus}`
-  );
+  if (recordAudit) {
+    await audit(
+      db,
+      valid ? "archive_verified" : "archive_integrity_failed",
+      `Vérification de ${snapshotKey} : ${valid ? "valide" : "échec"} — SHA-256 ${contentChecksumValid ? "valide" : "invalide"} — manifeste ${manifestStatus}`
+    );
+  }
 
   return {
     snapshot_key: snapshotKey,
@@ -853,6 +822,491 @@ async function verifyDatabaseArchive(db, env, requestedKey) {
     note: valid
       ? "Le contenu, les métadonnées R2 et le manifeste sont cohérents."
       : "La vérification complète a échoué ou un élément est manquant. Cette archive ne doit pas être utilisée pour une restauration."
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* PRÉVISUALISATION SÉCURISÉE AVANT RESTAURATION                              */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Protège les identifiants SQL.
+ * Les noms de tables et colonnes sont en plus contrôlés
+ * contre les listes et schémas D1 connus.
+ */
+function quoteSQLIdentifier(identifier) {
+  const value = String(identifier);
+
+  if (!value || value.includes("\0")) {
+    throw new Error("Identifiant SQL invalide.");
+  }
+
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function archiveValuesEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function getPrimaryKeyColumns(columnsInfo) {
+  return columnsInfo
+    .filter((column) => Number(column.pk) > 0)
+    .sort((a, b) => Number(a.pk) - Number(b.pk))
+    .map((column) => column.name);
+}
+
+/*
+ * Charge et vérifie l'archive avant toute comparaison.
+ * Cette fonction ne modifie ni R2 ni D1.
+ */
+async function loadArchiveForPreview(env, snapshotKey) {
+  const bucket = getArchiveBucket(env);
+  const safeKey = validateArchiveSnapshotKey(snapshotKey);
+
+  const object = await bucket.get(safeKey);
+
+  if (!object) {
+    const error = new Error("Archive introuvable dans R2.");
+    error.status = 404;
+    throw error;
+  }
+
+  const archiveText = await object.text();
+  const archiveBytes = new TextEncoder().encode(archiveText).byteLength;
+
+  if (archiveBytes > ARCHIVE_MAX_BYTES) {
+    throw new Error(
+      "Prévisualisation refusée : l'archive dépasse la taille maximale autorisée."
+    );
+  }
+
+  let archive;
+
+  try {
+    archive = JSON.parse(archiveText);
+  } catch {
+    throw new Error("Le contenu de l'archive n'est pas un JSON valide.");
+  }
+
+  const verification = await verifyDatabaseArchive(
+    null,
+    env,
+    safeKey,
+    { recordAudit: false }
+  );
+
+  if (!verification.valid) {
+    const error = new Error(
+      "Prévisualisation refusée : l'intégrité SHA-256, les métadonnées ou le manifeste ne sont pas valides."
+    );
+
+    error.verification = verification;
+    throw error;
+  }
+
+  if (
+    !archive.tables ||
+    typeof archive.tables !== "object" ||
+    Array.isArray(archive.tables)
+  ) {
+    throw new Error("Structure des tables de l'archive invalide.");
+  }
+
+  return {
+    archive,
+    verification,
+    snapshotKey: safeKey
+  };
+}
+
+/*
+ * Prévisualise les données de l'archive face à D1.
+ *
+ * Catégories :
+ * - insertable : ligne absente de D1 et pouvant être insérée.
+ * - already_present : ligne déjà présente et identique.
+ * - conflict : même clé primaire mais contenu différent.
+ * - unidentifiable : table sans clé primaire exploitable.
+ * - invalid : structure de ligne ou de table incompatible.
+ *
+ * Aucune instruction INSERT, UPDATE ou DELETE n'est exécutée.
+ */
+async function previewDatabaseArchive(db, env, requestedKey) {
+  const loaded = await loadArchiveForPreview(env, requestedKey);
+  const archive = loaded.archive;
+
+  const archiveTableNames = Object.keys(archive.tables);
+
+  if (!archiveTableNames.length) {
+    throw new Error("L'archive ne contient aucune table.");
+  }
+
+  for (const tableName of archiveTableNames) {
+    if (!ARCHIVE_TABLES.includes(tableName)) {
+      throw new Error(
+        `Prévisualisation refusée : table non autorisée dans l'archive (${safeString(tableName, 100)}).`
+      );
+    }
+  }
+
+  let archivedTotalRows = 0;
+
+  for (const tableName of archiveTableNames) {
+    const table = archive.tables[tableName];
+
+    if (
+      !table ||
+      !Array.isArray(table.columns) ||
+      !Array.isArray(table.rows)
+    ) {
+      throw new Error(
+        `Structure invalide dans l'archive pour la table ${tableName}.`
+      );
+    }
+
+    if (table.rows.length > ARCHIVE_MAX_ROWS_PER_TABLE) {
+      throw new Error(
+        `La table ${tableName} dépasse la limite de lignes autorisée.`
+      );
+    }
+
+    archivedTotalRows += table.rows.length;
+  }
+
+  if (archivedTotalRows > ARCHIVE_PREVIEW_MAX_TOTAL_ROWS) {
+    throw new Error(
+      `Prévisualisation interrompue : ${archivedTotalRows} lignes dépassent la limite de sécurité de ${ARCHIVE_PREVIEW_MAX_TOTAL_ROWS} lignes par opération de prévisualisation.`
+    );
+  }
+
+  if (
+    Number(archive.summary?.total_rows) !== archivedTotalRows ||
+    Number(archive.summary?.table_count) !== archiveTableNames.length
+  ) {
+    throw new Error(
+      "Les totaux déclarés dans l'archive ne correspondent pas à son contenu."
+    );
+  }
+
+  const tableReports = [];
+
+  const totals = {
+    archived_rows: archivedTotalRows,
+    insertable_rows: 0,
+    already_present_rows: 0,
+    conflict_rows: 0,
+    unidentifiable_rows: 0,
+    invalid_rows: 0,
+    missing_tables: 0,
+    incompatible_tables: 0
+  };
+
+  for (const tableName of archiveTableNames) {
+    const archivedTable = archive.tables[tableName];
+    const archivedColumns = archivedTable.columns;
+    const archivedRows = archivedTable.rows;
+
+    const uniqueArchivedColumns = new Set(archivedColumns);
+
+    if (
+      uniqueArchivedColumns.size !== archivedColumns.length ||
+      archivedColumns.some((column) => typeof column !== "string" || !column)
+    ) {
+      tableReports.push({
+        table: tableName,
+        status: "invalid_archive_schema",
+        archived_rows: archivedRows.length,
+        insertable_rows: 0,
+        already_present_rows: 0,
+        conflict_rows: 0,
+        unidentifiable_rows: 0,
+        invalid_rows: archivedRows.length,
+        issues: ["Colonnes invalides ou dupliquées dans l'archive."]
+      });
+
+      totals.invalid_rows += archivedRows.length;
+      totals.incompatible_tables++;
+      continue;
+    }
+
+    const liveColumnsInfo = await getArchiveTableInfo(db, tableName);
+
+    if (!liveColumnsInfo.length) {
+      tableReports.push({
+        table: tableName,
+        status: "missing_in_database",
+        archived_rows: archivedRows.length,
+        insertable_rows: 0,
+        already_present_rows: 0,
+        conflict_rows: 0,
+        unidentifiable_rows: archivedRows.length,
+        invalid_rows: 0,
+        issues: [
+          "La table n'existe pas dans D1. La prévisualisation ne créera aucune table."
+        ]
+      });
+
+      totals.missing_tables++;
+      totals.unidentifiable_rows += archivedRows.length;
+      continue;
+    }
+
+    const liveColumnNames = new Set(
+      liveColumnsInfo.map((column) => column.name)
+    );
+
+    const archivedColumnNames = new Set(archivedColumns);
+
+    const missingLiveColumns = archivedColumns.filter(
+      (column) => !liveColumnNames.has(column)
+    );
+
+    const extraLiveColumns = liveColumnsInfo
+      .map((column) => column.name)
+      .filter((column) => !archivedColumnNames.has(column));
+
+    const primaryKeys = getPrimaryKeyColumns(liveColumnsInfo);
+
+    const missingPrimaryKeys = primaryKeys.filter(
+      (column) => !archivedColumnNames.has(column)
+    );
+
+    const missingRequiredColumns = liveColumnsInfo
+      .filter((column) => {
+        return (
+          Number(column.notnull) === 1 &&
+          column.dflt_value === null &&
+          Number(column.pk) === 0 &&
+          !archivedColumnNames.has(column.name)
+        );
+      })
+      .map((column) => column.name);
+
+    const issues = [];
+
+    if (missingLiveColumns.length) {
+      issues.push(
+        `Colonnes de l'archive absentes de D1 : ${missingLiveColumns.join(", ")}`
+      );
+    }
+
+    if (missingPrimaryKeys.length) {
+      issues.push(
+        `Clés primaires absentes de l'archive : ${missingPrimaryKeys.join(", ")}`
+      );
+    }
+
+    if (missingRequiredColumns.length) {
+      issues.push(
+        `Colonnes obligatoires absentes de l'archive : ${missingRequiredColumns.join(", ")}`
+      );
+    }
+
+    if (!primaryKeys.length) {
+      issues.push(
+        "Aucune clé primaire trouvée dans D1 : identification fiable des doublons impossible."
+      );
+    }
+
+    const schemaCompatible =
+      missingLiveColumns.length === 0 &&
+      missingPrimaryKeys.length === 0 &&
+      missingRequiredColumns.length === 0 &&
+      primaryKeys.length > 0;
+
+    if (!schemaCompatible) {
+      tableReports.push({
+        table: tableName,
+        status: "incompatible_schema",
+        archived_rows: archivedRows.length,
+        insertable_rows: 0,
+        already_present_rows: 0,
+        conflict_rows: 0,
+        unidentifiable_rows: primaryKeys.length
+          ? 0
+          : archivedRows.length,
+        invalid_rows: primaryKeys.length
+          ? archivedRows.length
+          : 0,
+        primary_key: primaryKeys,
+        archived_columns: archivedColumns,
+        live_columns: Array.from(liveColumnNames),
+        extra_live_columns: extraLiveColumns,
+        missing_live_columns: missingLiveColumns,
+        issues
+      });
+
+      totals.incompatible_tables++;
+
+      if (primaryKeys.length) {
+        totals.invalid_rows += archivedRows.length;
+      } else {
+        totals.unidentifiable_rows += archivedRows.length;
+      }
+
+      continue;
+    }
+
+    let insertableRows = 0;
+    let alreadyPresentRows = 0;
+    let conflictRows = 0;
+    let invalidRows = 0;
+
+    const seenArchiveKeys = new Set();
+    const conflictSamples = [];
+
+    const tableSQL = quoteSQLIdentifier(tableName);
+    const whereSQL = primaryKeys
+      .map((column) => `${quoteSQLIdentifier(column)} = ?`)
+      .join(" AND ");
+
+    const selectSQL =
+      `SELECT * FROM ${tableSQL} WHERE ${whereSQL} LIMIT 1`;
+
+    for (const row of archivedRows) {
+      if (
+        !row ||
+        typeof row !== "object" ||
+        Array.isArray(row)
+      ) {
+        invalidRows++;
+        continue;
+      }
+
+      const rowColumns = Object.keys(row);
+
+      const hasUnknownRowColumns = rowColumns.some(
+        (column) => !archivedColumnNames.has(column)
+      );
+
+      if (hasUnknownRowColumns) {
+        invalidRows++;
+        continue;
+      }
+
+      const keyValues = primaryKeys.map((column) => row[column]);
+
+      if (keyValues.some((value) => value === undefined || value === null)) {
+        invalidRows++;
+        continue;
+      }
+
+      const archiveKey = JSON.stringify(keyValues);
+
+      if (seenArchiveKeys.has(archiveKey)) {
+        conflictRows++;
+
+        if (conflictSamples.length < ARCHIVE_PREVIEW_SAMPLE_LIMIT) {
+          conflictSamples.push({
+            reason: "duplicate_inside_archive",
+            primary_key: keyValues
+          });
+        }
+
+        continue;
+      }
+
+      seenArchiveKeys.add(archiveKey);
+
+      const existing = await db.prepare(selectSQL)
+        .bind(...keyValues)
+        .first();
+
+      if (!existing) {
+        insertableRows++;
+        continue;
+      }
+
+      const identical = archivedColumns.every((column) =>
+        archiveValuesEqual(row[column], existing[column])
+      );
+
+      if (identical) {
+        alreadyPresentRows++;
+      } else {
+        conflictRows++;
+
+        if (conflictSamples.length < ARCHIVE_PREVIEW_SAMPLE_LIMIT) {
+          conflictSamples.push({
+            reason: "existing_row_differs",
+            primary_key: keyValues
+          });
+        }
+      }
+    }
+
+    const status =
+      conflictRows > 0
+        ? "conflicts_detected"
+        : "compatible";
+
+    tableReports.push({
+      table: tableName,
+      status,
+      archived_rows: archivedRows.length,
+      insertable_rows: insertableRows,
+      already_present_rows: alreadyPresentRows,
+      conflict_rows: conflictRows,
+      unidentifiable_rows: 0,
+      invalid_rows: invalidRows,
+      primary_key: primaryKeys,
+      archived_columns: archivedColumns,
+      live_columns: Array.from(liveColumnNames),
+      extra_live_columns: extraLiveColumns,
+      missing_live_columns: [],
+      conflict_samples: conflictSamples,
+      issues
+    });
+
+    totals.insertable_rows += insertableRows;
+    totals.already_present_rows += alreadyPresentRows;
+    totals.conflict_rows += conflictRows;
+    totals.invalid_rows += invalidRows;
+  }
+
+  const allTablesCompatible =
+    totals.missing_tables === 0 &&
+    totals.incompatible_tables === 0 &&
+    totals.invalid_rows === 0 &&
+    totals.unidentifiable_rows === 0;
+
+  return {
+    success: true,
+    application: APP_NAME,
+    operation: "archive_restore_preview",
+    preview_only: true,
+    restoration_executed: false,
+    database_modified: false,
+    archive: {
+      snapshot_key: loaded.snapshotKey,
+      manifest_key: loaded.verification.manifest_key,
+      created_at: loaded.verification.created_at,
+      checksum_algorithm: loaded.verification.algorithm,
+      checksum: loaded.verification.expected_checksum,
+      calculated_checksum: loaded.verification.calculated_checksum,
+      integrity_valid: loaded.verification.valid
+    },
+    compatibility: {
+      compatible: allTablesCompatible,
+      missing_tables: totals.missing_tables,
+      incompatible_tables: totals.incompatible_tables
+    },
+    totals,
+    tables: tableReports,
+    safety: {
+      insertions_executed: false,
+      updates_executed: false,
+      deletions_executed: false,
+      tables_created: false,
+      existing_rows_overwritten: false,
+      archive_modified: false,
+      original_archive_preserved: true
+    },
+    next_step:
+      allTablesCompatible && totals.conflict_rows === 0
+        ? "La prévisualisation est compatible. Une étape distincte devra encore autoriser et exécuter la restauration."
+        : "Des incompatibilités, conflits ou lignes non identifiables doivent être examinés avant toute restauration.",
+    generated_at: nowISO()
   };
 }
 
@@ -887,6 +1341,7 @@ async function externalJSON(url, options = {}, timeoutMs = 15000) {
       const error = new Error(
         `Fournisseur HTTP ${response.status}: ${safeString(data.error || data.message || text, 300)}`
       );
+
       error.status = response.status;
       throw error;
     }
@@ -903,6 +1358,7 @@ async function getDexScreenerToken(tokenAddress, db) {
 
   const cacheKey = `dexscreener:${address.toLowerCase()}`;
   const cached = await cacheGet(db, cacheKey);
+
   if (cached) return { ...cached, cached: true };
 
   const { data } = await externalJSON(
@@ -943,6 +1399,7 @@ async function searchDexScreener(query, db) {
 
   const cacheKey = `dexsearch:${q.toLowerCase()}`;
   const cached = await cacheGet(db, cacheKey);
+
   if (cached) return { ...cached, cached: true };
 
   const { data } = await externalJSON(
@@ -980,6 +1437,7 @@ async function searchDexScreener(query, db) {
 async function getGeckoTerminalNetworks(db) {
   const key = "geckoterminal:networks";
   const cached = await cacheGet(db, key);
+
   if (cached) return { ...cached, cached: true };
 
   const { data } = await externalJSON(
@@ -1011,9 +1469,11 @@ async function getCoinGeckoMarkets(env, db, options = {}) {
 
   const cacheKey = `coingecko:markets:${currency}:${page}:${perPage}`;
   const cached = await cacheGet(db, cacheKey);
+
   if (cached) return { ...cached, cached: true };
 
   const url = new URL("https://api.coingecko.com/api/v3/coins/markets");
+
   url.searchParams.set("vs_currency", currency);
   url.searchParams.set("order", "market_cap_desc");
   url.searchParams.set("per_page", String(perPage));
@@ -1095,6 +1555,7 @@ async function callGemini(env, prompt) {
   if (!env.GEMINI_API_KEY) throw new Error("Gemini non configuré.");
 
   const model = env.GEMINI_MODEL || DEFAULT_MODELS.gemini;
+
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
 
@@ -1191,6 +1652,7 @@ async function callCloudflareAI(env, prompt) {
   }
 
   const model = env.CF_AI_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+
   const result = await env.AI.run(model, {
     messages: [
       {
@@ -1212,6 +1674,7 @@ function parseAIResponse(raw) {
     return JSON.parse(text);
   } catch {
     const match = text.match(/\{[\s\S]*\}/);
+
     if (match) {
       try {
         return JSON.parse(match[0]);
@@ -1342,7 +1805,9 @@ Retourne un objet JSON avec :
     (opinion) => opinion.result?.critical_risk === true
   );
 
-  const arbiterOpinion = opinions.find((item) => item.role === "arbiter");
+  const arbiterOpinion = opinions.find(
+    (item) => item.role === "arbiter"
+  );
 
   const report = {
     application: APP_NAME,
@@ -1367,7 +1832,9 @@ Retourne un objet JSON avec :
 async function saveAnalysisRecord(db, report) {
   try {
     const info = await db.prepare("PRAGMA table_info(analyses)").all();
-    const available = new Set((info.results || []).map((col) => col.name));
+    const available = new Set(
+      (info.results || []).map((col) => col.name)
+    );
 
     if (!available.size) return;
 
@@ -1407,6 +1874,7 @@ async function saveAnalysisRecord(db, report) {
 
 async function getAssets(db, limit = 100) {
   const info = await db.prepare("PRAGMA table_info(assets)").all();
+
   if (!info.results?.length) {
     return {
       assets: [],
@@ -1415,6 +1883,7 @@ async function getAssets(db, limit = 100) {
   }
 
   const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+
   const result = await db.prepare(
     `SELECT * FROM assets LIMIT ${safeLimit}`
   ).all();
@@ -1427,19 +1896,26 @@ async function getAssets(db, limit = 100) {
 
 async function getAssetById(db, id) {
   const info = await db.prepare("PRAGMA table_info(assets)").all();
-  const columns = new Set((info.results || []).map((item) => item.name));
+
+  const columns = new Set(
+    (info.results || []).map((item) => item.name)
+  );
 
   if (!columns.has("id")) {
     throw new Error("La table assets ne contient pas de colonne id.");
   }
 
-  return db.prepare("SELECT * FROM assets WHERE id = ? LIMIT 1")
-    .bind(id).first();
+  return db.prepare(
+    "SELECT * FROM assets WHERE id = ? LIMIT 1"
+  ).bind(id).first();
 }
 
 async function insertAssetIfSupported(db, asset) {
   const info = await db.prepare("PRAGMA table_info(assets)").all();
-  const available = new Set((info.results || []).map((item) => item.name));
+
+  const available = new Set(
+    (info.results || []).map((item) => item.name)
+  );
 
   const values = {
     id: asset.id || crypto.randomUUID(),
@@ -1483,7 +1959,9 @@ async function getProviderStatus(env, db) {
     FROM ci_provider_usage
     WHERE created_at >= ?
     GROUP BY provider
-  `).bind(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()).all();
+  `).bind(
+    new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  ).all();
 
   const used = new Map(
     (usage.results || []).map((row) => [row.provider, row])
@@ -1540,7 +2018,11 @@ async function createTask(db, taskType, payload = {}, priority = 5) {
     nowISO()
   ).run();
 
-  return { id, status: "pending", task_type: taskType };
+  return {
+    id,
+    status: "pending",
+    task_type: taskType
+  };
 }
 
 async function listTasks(db, limit = 100) {
@@ -1595,7 +2077,10 @@ function buildAssetAlert(asset, category, details, appUrl) {
   const name = safeString(asset.name || "Token inconnu", 100);
   const symbol = safeString(asset.symbol || "N/A", 30);
   const chain = safeString(asset.chain || "Chaîne inconnue", 60);
-  const contract = safeString(asset.contract_address || "Non disponible", 150);
+  const contract = safeString(
+    asset.contract_address || "Non disponible",
+    150
+  );
 
   return [
     `CRYPTO INTELLIGENCE — ${category}`,
@@ -1606,7 +2091,9 @@ function buildAssetAlert(asset, category, details, appUrl) {
     "",
     safeString(details, 2000),
     "",
-    appUrl ? `Analyse complète : ${appUrl}` : "Consulte l'application pour l'analyse complète.",
+    appUrl
+      ? `Analyse complète : ${appUrl}`
+      : "Consulte l'application pour l'analyse complète.",
     "",
     `Date : ${nowISO()}`
   ].join("\n");
@@ -1688,15 +2175,17 @@ async function handleProtectedRoutes(request, env, ctx, route) {
         backup: Boolean(env.ARCHIVES),
         listing: Boolean(env.ARCHIVES),
         sha256_verification: Boolean(env.ARCHIVES),
+        restoration_preview: Boolean(env.ARCHIVES),
         restoration: false,
         automatic_deletion: false,
         prefix: ARCHIVE_PREFIX,
         maximum_rows_per_table: ARCHIVE_MAX_ROWS_PER_TABLE,
         maximum_archive_bytes: ARCHIVE_MAX_BYTES,
+        maximum_preview_rows: ARCHIVE_PREVIEW_MAX_TOTAL_ROWS,
         listing_page_limit: ARCHIVE_LIST_LIMIT
       },
       note:
-        "La présence du binding confirme sa disponibilité pour le Worker, mais les opérations doivent encore être testées en conditions réelles."
+        "La prévisualisation compare une archive vérifiée avec D1 sans exécuter d'insertion, de modification ou de suppression. La restauration réelle reste désactivée."
     });
   }
 
@@ -1737,10 +2226,35 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     });
   }
 
+  /*
+   * PRÉVISUALISATION :
+   * GET /api/archives/preview?key=...
+   *
+   * Cette route est protégée par APP_SECRET.
+   * Elle ne réalise aucune écriture dans D1 ou R2.
+   */
+  if (method === "GET" && path === "/api/archives/preview") {
+    const key = url.searchParams.get("key");
+
+    if (!key) {
+      return errorResponse(
+        "Paramètre key requis. Il doit contenir la clé snapshot.json de l'archive."
+      );
+    }
+
+    const result = await previewDatabaseArchive(db, env, key);
+
+    return json({
+      success: true,
+      preview: result
+    });
+  }
+
   /* ------------------------------ ACTIFS --------------------------------- */
 
   if (method === "GET" && path === "/api/assets") {
     const limit = url.searchParams.get("limit") || 100;
+
     return json({
       success: true,
       ...(await getAssets(db, limit))
@@ -1748,7 +2262,10 @@ async function handleProtectedRoutes(request, env, ctx, route) {
   }
 
   if (method === "GET" && path.startsWith("/api/assets/")) {
-    const id = decodeURIComponent(path.slice("/api/assets/".length));
+    const id = decodeURIComponent(
+      path.slice("/api/assets/".length)
+    );
+
     const asset = await getAssetById(db, id);
 
     if (!asset) return errorResponse("Actif introuvable.", 404);
@@ -1764,7 +2281,12 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     }
 
     const asset = await insertAssetIfSupported(db, body);
-    await audit(db, "asset_added", `Actif ajouté : ${asset.symbol || asset.name}`);
+
+    await audit(
+      db,
+      "asset_added",
+      `Actif ajouté : ${asset.symbol || asset.name}`
+    );
 
     return json({ success: true, asset }, 201);
   }
@@ -1773,17 +2295,21 @@ async function handleProtectedRoutes(request, env, ctx, route) {
 
   if (method === "GET" && path === "/api/market/search") {
     const query = url.searchParams.get("q");
+
     if (!query) return errorResponse("Paramètre q requis.");
 
     const result = await searchDexScreener(query, db);
+
     return json({ success: true, ...result });
   }
 
   if (method === "GET" && path === "/api/market/token") {
     const address = url.searchParams.get("address");
+
     if (!address) return errorResponse("Paramètre address requis.");
 
     const result = await getDexScreenerToken(address, db);
+
     return json({ success: true, ...result });
   }
 
@@ -1870,7 +2396,11 @@ async function handleProtectedRoutes(request, env, ctx, route) {
   }
 
   if (method === "GET" && path === "/api/tasks") {
-    const tasks = await listTasks(db, url.searchParams.get("limit") || 100);
+    const tasks = await listTasks(
+      db,
+      url.searchParams.get("limit") || 100
+    );
+
     return json({ success: true, tasks });
   }
 
@@ -1889,7 +2419,9 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     const body = await readBody(request);
 
     if (!body.asset || !body.category || !body.details) {
-      return errorResponse("asset, category et details sont requis.");
+      return errorResponse(
+        "asset, category et details sont requis."
+      );
     }
 
     const message = buildAssetAlert(
@@ -1949,13 +2481,14 @@ async function handleProtectedRoutes(request, env, ctx, route) {
             archive_listing: Boolean(env.ARCHIVES),
             sha256_verification: Boolean(env.ARCHIVES),
             manifest_verification: Boolean(env.ARCHIVES),
+            restoration_preview: Boolean(env.ARCHIVES),
             controlled_restoration: false,
             automatic_deletion: false
           }
         }
       },
       note:
-        "Les fonctions de sauvegarde D1, de liste paginée des archives et de vérification SHA-256 avec contrôle du manifeste sont intégrées au backend. Elles restent à tester en conditions réelles. La mémoire personnelle de Conan et la restauration contrôlée ne sont pas encore intégrées."
+        "Les fonctions de sauvegarde D1, de liste paginée, de vérification SHA-256 et de prévisualisation sans modification de D1 sont intégrées au backend. La restauration contrôlée et la mémoire personnelle de Conan ne sont pas encore intégrées."
     });
   }
 
@@ -1964,7 +2497,9 @@ async function handleProtectedRoutes(request, env, ctx, route) {
   if (method === "POST" && path === "/api/conan/command") {
     const body = await readBody(request);
 
-    if (!body.command) return errorResponse("Commande Conan requise.");
+    if (!body.command) {
+      return errorResponse("Commande Conan requise.");
+    }
 
     const task = await createTask(
       db,
@@ -2004,6 +2539,7 @@ async function handleProtectedRoutes(request, env, ctx, route) {
           backup_route: Boolean(env.ARCHIVES),
           listing_route: Boolean(env.ARCHIVES),
           verification_route: Boolean(env.ARCHIVES),
+          preview_route: Boolean(env.ARCHIVES),
           restoration: false
         }
       }
@@ -2022,7 +2558,10 @@ async function handleRequest(request, env, ctx) {
   const headers = corsHeaders(request, env);
 
   if (route.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers });
+    return new Response(null, {
+      status: 204,
+      headers
+    });
   }
 
   const publicResponse = await handlePublicRoutes(
@@ -2074,7 +2613,10 @@ async function handleRequest(request, env, ctx) {
             : "Une erreur interne est survenue.",
         status,
         env.DEBUG === "true"
-          ? safeString(error.message, 1000)
+          ? {
+              message: safeString(error.message, 1000),
+              verification: error.verification || undefined
+            }
           : undefined
       ),
       headers
@@ -2087,9 +2629,13 @@ export default {
     const response = await handleRequest(request, env, ctx);
 
     const headers = new Headers(response.headers);
+
     headers.set("X-Frame-Options", "DENY");
     headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
-    headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    headers.set(
+      "Permissions-Policy",
+      "camera=(), microphone=(), geolocation=()"
+    );
     headers.set("X-Content-Type-Options", "nosniff");
 
     return new Response(response.body, {
