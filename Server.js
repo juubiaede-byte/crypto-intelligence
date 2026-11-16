@@ -8591,3 +8591,114 @@ handleProtectedRoutes = async function(request,env,ctx,route){
   }
   return await ciChapter15PreviousRoutes(request,env,ctx,route);
 };
+
+
+/* Chapitre 15 — alignement des quotas sur les périodes calendaires et comptage unique. */
+ciProviderPeriodKeys = function(timestamp=new Date()){
+  return {day:timestamp.toISOString().slice(0,10),month:timestamp.toISOString().slice(0,7)};
+};
+ciProviderRuntimeGate = async function(db,providerId){
+  await ensureCIProviderOrchestratorTables(db);
+  const state=await db.prepare("SELECT * FROM ci_provider_runtime_state WHERE provider_id=?").bind(providerId).first();
+  if(state?.paused)return {allowed:false,reason:"provider_paused",retry_at:null};
+  if(state?.cooldown_until&&Date.parse(state.cooldown_until)>Date.now())return {allowed:false,reason:"provider_backoff",retry_at:state.cooldown_until};
+  const registry=await db.prepare("SELECT daily_limit,monthly_limit FROM ci_provider_registry WHERE provider_id=?").bind(providerId).first();
+  const now=new Date(),keys=ciProviderPeriodKeys(now);
+  const dayStart=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate())).toISOString();
+  const monthStart=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1)).toISOString();
+  const counts=await db.prepare("SELECT SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS daily_count,SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS monthly_count FROM ci_provider_usage_metrics WHERE provider_id=?").bind(dayStart,monthStart,providerId).first();
+  const daily=Number(counts?.daily_count)||0,monthly=Number(counts?.monthly_count)||0;
+  if(registry?.daily_limit!==null&&registry?.daily_limit!==undefined&&daily>=Number(registry.daily_limit)){
+    await ciProviderQuotaEvent(db,providerId,"daily_limit_reached",keys.day,daily,Number(registry.daily_limit),{});
+    return {allowed:false,reason:"daily_limit_reached",retry_at:new Date(dayStart).getTime()+86400000?new Date(Date.parse(dayStart)+86400000).toISOString():null,daily_count:daily,monthly_count:monthly};
+  }
+  if(registry?.monthly_limit!==null&&registry?.monthly_limit!==undefined&&monthly>=Number(registry.monthly_limit)){
+    await ciProviderQuotaEvent(db,providerId,"monthly_limit_reached",keys.month,monthly,Number(registry.monthly_limit),{});
+    return {allowed:false,reason:"monthly_limit_reached",retry_at:new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()+1,1)).toISOString(),daily_count:daily,monthly_count:monthly};
+  }
+  return {allowed:true,daily_count:daily,monthly_count:monthly,daily_limit:registry?.daily_limit??null,monthly_limit:registry?.monthly_limit??null};
+};
+
+async function processCIProviderQueue(db,env,limit=5){
+  await ensureCIProviderOrchestratorTables(db);
+  const max=Math.max(1,Math.min(10,Number(limit)||5));
+  const ready=await db.prepare("SELECT * FROM ci_provider_request_queue WHERE status='pending' AND next_attempt_at<=? ORDER BY priority ASC,created_at ASC LIMIT ?").bind(nowISO(),max).all();
+  const results=[];
+  for(const job of ready.results||[]){
+    const gate=await ciProviderRuntimeGate(db,job.provider_id);
+    if(!gate.allowed){
+      results.push({request_id:job.request_id,status:"deferred",reason:gate.reason,retry_at:gate.retry_at});
+      if(gate.retry_at)await db.prepare("UPDATE ci_provider_request_queue SET next_attempt_at=?,updated_at=? WHERE request_id=? AND status='pending'").bind(gate.retry_at,nowISO(),job.request_id).run();
+      continue;
+    }
+    const claim=await db.prepare("UPDATE ci_provider_request_queue SET status='running',attempts=attempts+1,updated_at=? WHERE request_id=? AND status='pending'").bind(nowISO(),job.request_id).run();
+    if(!claim.meta?.changes)continue;
+    const started=Date.now();
+    try{
+      const payload=JSON.parse(job.payload_json||"{}");
+      const data=await ciChapter15OriginalFetchProviderData(db,env,{provider_id:job.provider_id,operation:job.operation,...payload});
+      await ciRecordManagedProviderResult(db,job.provider_id,job.operation,true,200,Date.now()-started,null);
+      await db.prepare("UPDATE ci_provider_request_queue SET status='completed',result_json=?,last_error=NULL,updated_at=? WHERE request_id=?").bind(JSON.stringify(data),nowISO(),job.request_id).run();
+      results.push({request_id:job.request_id,status:"completed",provider_id:job.provider_id,operation:job.operation});
+    }catch(error){
+      const message=safeString(error.message||"Erreur fournisseur.",700),statusCode=Number(error.status)||null;
+      const state=await ciRecordManagedProviderResult(db,job.provider_id,job.operation,false,statusCode,Date.now()-started,message);
+      const attempts=Number(job.attempts)+1,canRetry=attempts<Number(job.max_attempts);
+      const next=state.cooldown_until||new Date(Date.now()+60000).toISOString();
+      await db.prepare("UPDATE ci_provider_request_queue SET status=?,next_attempt_at=?,last_error=?,updated_at=? WHERE request_id=?").bind(canRetry?"pending":"failed",next,message,nowISO(),job.request_id).run();
+      results.push({request_id:job.request_id,status:canRetry?"retry_scheduled":"failed",error:message,retry_at:canRetry?next:null});
+    }
+  }
+  return {processed:results.length,results,priority_order:"critical_security_to_historical_analysis",paid_overage:false};
+}
+
+function ciProviderIdFromLegacyName(name){
+  const value=safeString(name||"",100).toLowerCase();
+  if(value.includes("coingecko"))return "coingecko";
+  if(value.includes("coinmarketcap")||value==="cmc")return "coinmarketcap";
+  if(value.includes("dexscreener"))return "dexscreener";
+  if(value.includes("geckoterminal"))return "geckoterminal";
+  if(value.includes("defillama"))return "defillama";
+  if(value.includes("etherscan"))return "etherscan";
+  if(value.includes("blockscout"))return "blockscout";
+  if(value.includes("goplus"))return "goplus";
+  if(value.includes("honeypot"))return "honeypot";
+  if(["gemini","groq","cloudflare","sambanova","cohere"].includes(value))return value;
+  return null;
+}
+
+const ciChapter15OriginalRecordProviderUsage=recordProviderUsage;
+recordProviderUsage=async function(db,provider,success,statusCode){
+  await ciChapter15OriginalRecordProviderUsage(db,provider,success,statusCode);
+  const id=ciProviderIdFromLegacyName(provider);
+  if(!id)return;
+  try{
+    const existing=await db.prepare("SELECT metric_id FROM ci_provider_usage_metrics WHERE provider_id=? AND operation=? AND created_at>=? ORDER BY created_at DESC LIMIT 1").bind(id,"legacy_provider_call",new Date(Date.now()-5000).toISOString()).first();
+    if(existing)return;
+    await ciRecordManagedProviderResult(db,id,"legacy_provider_call",Boolean(success),statusCode||null,0,success?null:"Échec signalé par l'adaptateur existant.");
+  }catch(error){console.error("Central provider metrics error:",error);}
+};
+
+const ciChapter15OriginalFetchRadarSource=fetchRadarSource;
+fetchRadarSource=async function(db,provider,url){
+  const id=ciProviderIdFromLegacyName(provider);
+  if(id){
+    const gate=await ciProviderRuntimeGate(db,id);
+    if(!gate.allowed)return {ok:false,error:"Requête suspendue par le gestionnaire central: "+gate.reason,retry_at:gate.retry_at||null};
+  }
+  return await ciChapter15OriginalFetchRadarSource(db,provider,url);
+};
+
+const ciChapter15OriginalHoneypot=verifyRadarTokenWithHoneypot;
+verifyRadarTokenWithHoneypot=async function(db,item){
+  const gate=await ciProviderRuntimeGate(db,"honeypot");
+  if(!gate.allowed)return {discovery_key:item.discovery_key,outcome:"unknown",simulation_success:null,risk:"unknown",checked_at:nowISO(),next_check_at:gate.retry_at,evidence:{provider:"Honeypot.is",deferred_by_provider_manager:true,reason:gate.reason},error_message:null};
+  return await ciChapter15OriginalHoneypot(db,item);
+};
+
+const ciChapter15OriginalGoPlus=verifyRadarTokenWithGoPlus;
+verifyRadarTokenWithGoPlus=async function(db,item){
+  const gate=await ciProviderRuntimeGate(db,"goplus");
+  if(!gate.allowed)return {check_key:item.discovery_key+":goplus",discovery_key:item.discovery_key,provider:"GoPlus",outcome:"unknown",checked_at:nowISO(),evidence:{deferred_by_provider_manager:true,reason:gate.reason},error_message:null};
+  return await ciChapter15OriginalGoPlus(db,item);
+};
