@@ -2817,6 +2817,8 @@ async function runRadarVerification(db) {
   const summary = { attempted: 0, honeypot_detected: 0, simulation_passed: 0, unknown: 0, unsupported: 0, errors: 0, batch_limit: 5 };
   for (const item of pending.results || []) {
     const result = await verifyRadarTokenWithHoneypot(db, item);
+    const identityResult = await verifyRadarTokenIdentityWithGeckoTerminal(db, item);
+    await persistRadarIdentityCheck(db, identityResult);
     const goPlusResult = await verifyRadarTokenWithGoPlus(db, item);
     const goPlusSignals = goPlusRiskSignals(goPlusResult.evidence?.token_security);
     if (goPlusResult.outcome !== 'unsupported' && goPlusResult.outcome !== 'unknown') {
