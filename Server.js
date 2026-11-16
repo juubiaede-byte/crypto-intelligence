@@ -4180,6 +4180,62 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     });
   }
 
+  if (method === "GET" && path === "/api/radar/lifecycle-duration") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    if (!discoveryKey) return errorResponse("Le paramètre discovery_key est obligatoire.");
+    const lifecycle = await db.prepare(
+      "SELECT * FROM ci_radar_asset_lifecycle WHERE discovery_key = ?"
+    ).bind(discoveryKey).first();
+    if (!lifecycle) return errorResponse("Cycle de vie introuvable pour cet actif.", 404);
+    const historyResult = await db.prepare(
+      "SELECT from_stage, to_stage, transitioned_at, reason FROM ci_radar_asset_lifecycle_history WHERE discovery_key = ? ORDER BY transitioned_at ASC, event_id ASC LIMIT 1000"
+    ).bind(discoveryKey).all();
+    const history = historyResult.results || [];
+    const timeline = [];
+    let activeStage = null;
+    let enteredAt = null;
+    let chronologyValid = true;
+    for (const event of history) {
+      const eventTime = Date.parse(event.transitioned_at || "");
+      if (!Number.isFinite(eventTime)) { chronologyValid = false; continue; }
+      if (activeStage === null) {
+        activeStage = event.from_stage;
+        enteredAt = eventTime;
+      }
+      if (eventTime < enteredAt) chronologyValid = false;
+      timeline.push({
+        stage: activeStage,
+        entered_at: new Date(enteredAt).toISOString(),
+        exited_at: new Date(eventTime).toISOString(),
+        duration_seconds: Math.max(0, Math.floor((eventTime - enteredAt) / 1000)),
+        transition_reason: event.reason || null
+      });
+      activeStage = event.to_stage;
+      enteredAt = eventTime;
+    }
+    const now = Date.now();
+    const currentEntry = Date.parse(lifecycle.entered_stage_at || "");
+    const currentEnteredAt = Number.isFinite(currentEntry) ? currentEntry : enteredAt;
+    if (activeStage !== null && currentEnteredAt !== null && Number.isFinite(currentEnteredAt)) {
+      if (now < currentEnteredAt) chronologyValid = false;
+      timeline.push({
+        stage: lifecycle.current_stage,
+        entered_at: new Date(currentEnteredAt).toISOString(),
+        exited_at: null,
+        duration_seconds: Math.max(0, Math.floor((now - currentEnteredAt) / 1000)),
+        is_current: true
+      });
+    }
+    return json({
+      success: true,
+      discovery_key: discoveryKey,
+      current_stage: lifecycle.current_stage,
+      timeline,
+      chronology_valid: chronologyValid,
+      note: "Durées calculées à partir des horodatages enregistrés; elles ne constituent pas une preuve de qualité de l'actif."
+    });
+  }
+
   if (method === "GET" && path === "/api/radar/lifecycle-history") {
     const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
     const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 200));
