@@ -6058,8 +6058,8 @@ async function radarWalletRpcRequest(rpcUrl, method, params) {
 
 function radarWalletTradeCategory(usdValue) {
   if (usdValue === null || usdValue === undefined) return "unknown";
-  if (usdValue >= RADAR_WALLET_THRESHOLDS_USD.whale_trade_min) return "whale_trade";
-  if (usdValue <= RADAR_WALLET_THRESHOLDS_USD.small_trade_max) return "small_wallet_trade";
+  if (usdValue >= RADAR_WALLET_THRESHOLDS_USD.whale_trade_min) return "large_trade_size";
+  if (usdValue <= RADAR_WALLET_THRESHOLDS_USD.small_trade_max) return "small_trade_size";
   return "mid_size_trade";
 }
 
@@ -6126,7 +6126,7 @@ async function recordRadarWalletBehavior(db, chain, discoveryKey) {
     wallets.get(event.wallet_address).push(event);
   }
   for (const [bucket, wallets] of buckets) {
-    const small = [...wallets.entries()].filter(([,items])=>items.some(item=>item.wallet_category==="small_wallet_trade"));
+    const small = [...wallets.entries()].filter(([,items])=>items.some(item=>item.wallet_category==="small_trade_size"));
     if (small.length < 5) continue;
     const members = small.map(([wallet])=>wallet).sort();
     const first = small.flatMap(([,items])=>items.map(item=>item.observed_at)).sort()[0];
@@ -6233,7 +6233,7 @@ async function runRadarWalletScan(db, options = {}) {
         };
         const inserted=await db.prepare("INSERT OR IGNORE INTO ci_wallet_events (event_id,chain_id,discovery_key,pair_address,wallet_address,recipient_address,transaction_hash,log_index,block_number,observed_at,trade_side,target_token_amount,estimated_usd_value,value_source,wallet_category,watchlist_status,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(
           crypto.randomUUID(),pair.chain_id,pair.discovery_key,pair.pair_address,wallet,recipient,log.transactionHash,Number(BigInt(log.logIndex)),blockNumber,observedAt,side,tokenAmount,usdValue,
-          tokenPrice!==null?"provider_price_estimate":"unknown",category,watch?.profile_status||"unknown",JSON.stringify(evidence)
+          tokenPrice!==null?"provider_price_estimate":"unknown",category,watch?(watch.profile_status+":"+watch.wallet_type):"unknown",JSON.stringify(evidence)
         ).run();
         if (Number(inserted.meta?.changes||0)>0) { eventsSaved++;pairEvents++; }
       }
