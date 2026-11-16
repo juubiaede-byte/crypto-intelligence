@@ -1,11 +1,12 @@
+
 /*
  * CRYPTO INTELLIGENCE — server.js
  * Backend central pour Cloudflare Workers.
  *
- * Variables / bindings à configurer plus tard :
+ * Variables / bindings à configurer :
  * DB                 : Cloudflare D1
- * ARCHIVES           : Cloudflare R2 (facultatif)
- * AI                 : Cloudflare Workers AI (facultatif)
+ * ARCHIVES           : Cloudflare R2
+ * AI                 : Cloudflare Workers AI
  * APP_SECRET         : secret d'accès à l'API
  * GEMINI_API_KEY     : clé Gemini
  * GROQ_API_KEY       : clé Groq
@@ -16,6 +17,13 @@
  * APP_ORIGIN         : origine autorisée pour le navigateur
  *
  * Aucun secret ne doit être placé dans GitHub ou dans le navigateur.
+ *
+ * ARCHIVES R2 :
+ * - Sauvegarde des tables D1 autorisées.
+ * - Liste des archives.
+ * - Vérification SHA-256.
+ * - Aucune suppression automatique.
+ * - Aucune restauration automatique.
  */
 
 const APP_NAME = "CRYPTO INTELLIGENCE";
@@ -66,6 +74,41 @@ const JSON_HEADERS = {
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff"
 };
+
+/*
+ * Tables D1 autorisées dans les sauvegardes.
+ * Les noms sont fixes : aucune table fournie par une requête utilisateur
+ * ne peut être injectée dans une instruction SQL.
+ *
+ * Les tables absentes sont simplement ignorées.
+ * Les tables système Cloudflare ne sont pas archivées.
+ */
+const ARCHIVE_TABLES = [
+  "ai_opinions",
+  "alerts",
+  "analyses",
+  "asset_status_history",
+  "assets",
+  "discoveries",
+  "evidence",
+  "market_snapshots",
+  "prediction_targets",
+  "predictions",
+  "sources",
+  "system_events",
+  "tasks",
+  "watchlists",
+  "ci_cache",
+  "ci_provider_usage",
+  "ci_tasks",
+  "ci_audit"
+];
+
+const ARCHIVE_PREFIX = "conan/backups/";
+const ARCHIVE_FORMAT = "crypto-intelligence-d1-backup-v1";
+const ARCHIVE_MAX_ROWS_PER_TABLE = 5000;
+const ARCHIVE_MAX_BYTES = 8 * 1024 * 1024;
+const ARCHIVE_LIST_LIMIT = 100;
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -152,7 +195,6 @@ function constantTimeEqual(a, b) {
 }
 
 function isAuthorized(request, env) {
-  // Les routes publiques explicitement autorisées sont contrôlées séparément.
   if (!env.APP_SECRET) return false;
 
   const header = request.headers.get("Authorization") || "";
@@ -316,6 +358,424 @@ async function recordProviderUsage(db, provider, success, statusCode) {
   } catch (error) {
     console.error("Provider usage error:", error);
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* ARCHIVES CONAN — CLOUDFLARE R2                                             */
+/* -------------------------------------------------------------------------- */
+
+function getArchiveBucket(env) {
+  if (!env.ARCHIVES) {
+    throw new Error(
+      "Binding R2 ARCHIVES absent. Configure le compartiment R2 dans Cloudflare."
+    );
+  }
+
+  return env.ARCHIVES;
+}
+
+/*
+ * Vérifie l'existence d'une table à partir de la liste autorisée.
+ * Les noms utilisés ici proviennent exclusivement de ARCHIVE_TABLES.
+ */
+async function getArchiveTableInfo(db, tableName) {
+  if (!ARCHIVE_TABLES.includes(tableName)) {
+    throw new Error("Table non autorisée pour les archives.");
+  }
+
+  const result = await db.prepare(
+    `PRAGMA table_info("${tableName}")`
+  ).all();
+
+  return result.results || [];
+}
+
+/*
+ * Construit une copie logique des tables D1.
+ * Cette opération ne modifie et ne supprime aucune donnée.
+ *
+ * Limites de sécurité :
+ * - 5 000 lignes maximum par table.
+ * - 8 Mo maximum pour l'archive complète.
+ * - En cas de dépassement, aucune archive complète n'est déclarée.
+ */
+async function collectDatabaseSnapshot(db) {
+  const tables = {};
+  const tableSummary = {};
+  let totalRows = 0;
+
+  for (const tableName of ARCHIVE_TABLES) {
+    const columnsInfo = await getArchiveTableInfo(db, tableName);
+
+    if (!columnsInfo.length) {
+      continue;
+    }
+
+    const columns = columnsInfo.map((column) => column.name);
+
+    const result = await db.prepare(
+      `SELECT * FROM "${tableName}" LIMIT ${ARCHIVE_MAX_ROWS_PER_TABLE + 1}`
+    ).all();
+
+    const rows = result.results || [];
+
+    if (rows.length > ARCHIVE_MAX_ROWS_PER_TABLE) {
+      throw new Error(
+        `Sauvegarde interrompue : la table ${tableName} dépasse la limite de ${ARCHIVE_MAX_ROWS_PER_TABLE} lignes. Aucune archive complète n'a été créée.`
+      );
+    }
+
+    tables[tableName] = {
+      columns,
+      rows
+    };
+
+    tableSummary[tableName] = {
+      row_count: rows.length,
+      column_count: columns.length
+    };
+
+    totalRows += rows.length;
+  }
+
+  if (!Object.keys(tables).length) {
+    throw new Error(
+      "Aucune table D1 autorisée n'a été trouvée pour la sauvegarde."
+    );
+  }
+
+  return {
+    tables,
+    tableSummary,
+    totalRows
+  };
+}
+
+/*
+ * Création d'une archive D1 dans R2.
+ *
+ * Le contenu de l'archive est haché en SHA-256.
+ * Le snapshot est écrit avant son manifeste.
+ *
+ * Si l'écriture du manifeste échoue après celle du snapshot,
+ * le snapshot n'est pas supprimé : aucune suppression automatique
+ * n'est autorisée dans le système d'archives.
+ */
+async function createDatabaseArchive(db, env) {
+  const bucket = getArchiveBucket(env);
+  const createdAt = nowISO();
+  const snapshotId = crypto.randomUUID();
+
+  const collected = await collectDatabaseSnapshot(db);
+
+  const core = {
+    format: ARCHIVE_FORMAT,
+    application: APP_NAME,
+    version: VERSION,
+    created_at: createdAt,
+    database: {
+      provider: "Cloudflare D1",
+      binding: "DB"
+    },
+    summary: {
+      table_count: Object.keys(collected.tables).length,
+      total_rows: collected.totalRows,
+      tables: collected.tableSummary
+    },
+    tables: collected.tables
+  };
+
+  const coreJSON = JSON.stringify(core);
+  const sizeBytes = new TextEncoder().encode(coreJSON).byteLength;
+
+  if (sizeBytes > ARCHIVE_MAX_BYTES) {
+    throw new Error(
+      `Sauvegarde interrompue : l'archive ferait ${sizeBytes} octets, au-delà de la limite de ${ARCHIVE_MAX_BYTES} octets. Aucune archive complète n'a été créée.`
+    );
+  }
+
+  const checksum = await sha256(coreJSON);
+
+  const archiveDocument = {
+    ...core,
+    integrity: {
+      algorithm: "SHA-256",
+      checksum
+    }
+  };
+
+  const archiveJSON = JSON.stringify(archiveDocument);
+  const timestampPart = createdAt.replace(/[:.]/g, "-");
+  const baseKey = `${ARCHIVE_PREFIX}${timestampPart}-${snapshotId}`;
+
+  const snapshotKey = `${baseKey}/snapshot.json`;
+  const manifestKey = `${baseKey}/manifest.json`;
+
+  const snapshotMetadata = {
+    application: APP_NAME,
+    format: ARCHIVE_FORMAT,
+    checksum,
+    created_at: createdAt,
+    snapshot_id: snapshotId
+  };
+
+  await bucket.put(snapshotKey, archiveJSON, {
+    httpMetadata: {
+      contentType: "application/json; charset=utf-8"
+    },
+    customMetadata: snapshotMetadata
+  });
+
+  const manifest = {
+    application: APP_NAME,
+    format: ARCHIVE_FORMAT,
+    snapshot_id: snapshotId,
+    created_at: createdAt,
+    snapshot_key: snapshotKey,
+    manifest_key: manifestKey,
+    checksum,
+    checksum_algorithm: "SHA-256",
+    size_bytes: new TextEncoder().encode(archiveJSON).byteLength,
+    table_count: Object.keys(collected.tables).length,
+    total_rows: collected.totalRows,
+    tables: collected.tableSummary,
+    restoration: {
+      available: false,
+      note: "La restauration contrôlée sera ajoutée dans une étape séparée."
+    }
+  };
+
+  await bucket.put(manifestKey, JSON.stringify(manifest), {
+    httpMetadata: {
+      contentType: "application/json; charset=utf-8"
+    },
+    customMetadata: {
+      application: APP_NAME,
+      format: ARCHIVE_FORMAT,
+      snapshot_id: snapshotId,
+      checksum
+    }
+  });
+
+  await audit(
+    db,
+    "archive_created",
+    `Archive R2 créée : ${snapshotKey} — ${collected.totalRows} lignes — SHA-256 ${checksum}`
+  );
+
+  return {
+    snapshot_id: snapshotId,
+    snapshot_key: snapshotKey,
+    manifest_key: manifestKey,
+    created_at: createdAt,
+    checksum,
+    checksum_algorithm: "SHA-256",
+    size_bytes: manifest.size_bytes,
+    table_count: manifest.table_count,
+    total_rows: manifest.total_rows,
+    tables: manifest.tables,
+    restoration_available: false
+  };
+}
+
+/*
+ * Liste les archives R2.
+ * La pagination R2 est conservée : aucune archive n'est supprimée.
+ */
+async function listDatabaseArchives(env, cursor = null) {
+  const bucket = getArchiveBucket(env);
+
+  const options = {
+    prefix: ARCHIVE_PREFIX,
+    limit: ARCHIVE_LIST_LIMIT
+  };
+
+  if (cursor) {
+    options.cursor = cursor;
+  }
+
+  const listing = await bucket.list(options);
+  const objects = listing.objects || [];
+
+  const manifests = objects.filter((object) =>
+    object.key.endsWith("/manifest.json")
+  );
+
+  const archives = [];
+
+  for (const item of manifests) {
+    try {
+      const object = await bucket.get(item.key);
+
+      if (!object) {
+        archives.push({
+          manifest_key: item.key,
+          manifest_missing: true
+        });
+        continue;
+      }
+
+      const manifestText = await object.text();
+      const manifest = JSON.parse(manifestText);
+
+      archives.push({
+        snapshot_id: manifest.snapshot_id || null,
+        created_at: manifest.created_at || null,
+        snapshot_key: manifest.snapshot_key || null,
+        manifest_key: item.key,
+        checksum: manifest.checksum || null,
+        checksum_algorithm: manifest.checksum_algorithm || null,
+        size_bytes: manifest.size_bytes ?? null,
+        table_count: manifest.table_count ?? null,
+        total_rows: manifest.total_rows ?? null,
+        tables: manifest.tables || {},
+        restoration_available: false
+      });
+    } catch (error) {
+      archives.push({
+        manifest_key: item.key,
+        manifest_error: safeString(error.message, 300)
+      });
+    }
+  }
+
+  archives.sort((a, b) =>
+    String(b.created_at || "").localeCompare(String(a.created_at || ""))
+  );
+
+  return {
+    archives,
+    count: archives.length,
+    truncated: Boolean(listing.truncated),
+    next_cursor: listing.truncated ? listing.cursor || null : null
+  };
+}
+
+/*
+ * Vérifie une archive existante.
+ * Le client ne peut demander que des objets snapshot.json
+ * situés sous le préfixe réservé aux sauvegardes de Conan.
+ */
+function validateArchiveSnapshotKey(key) {
+  const value = safeString(key, 1000);
+
+  if (
+    !value.startsWith(ARCHIVE_PREFIX) ||
+    !value.endsWith("/snapshot.json") ||
+    value.includes("..") ||
+    value.includes("\\") ||
+    value.startsWith("/")
+  ) {
+    throw new Error("Clé d'archive invalide.");
+  }
+
+  return value;
+}
+
+async function verifyDatabaseArchive(db, env, requestedKey) {
+  const bucket = getArchiveBucket(env);
+  const snapshotKey = validateArchiveSnapshotKey(requestedKey);
+
+  const object = await bucket.get(snapshotKey);
+
+  if (!object) {
+    const error = new Error("Archive introuvable dans R2.");
+    error.status = 404;
+    throw error;
+  }
+
+  const archiveText = await object.text();
+
+  let archive;
+
+  try {
+    archive = JSON.parse(archiveText);
+  } catch {
+    throw new Error("Le contenu de l'archive n'est pas un JSON valide.");
+  }
+
+  if (
+    archive.format !== ARCHIVE_FORMAT ||
+    archive.application !== APP_NAME ||
+    !archive.tables ||
+    !archive.integrity ||
+    archive.integrity.algorithm !== "SHA-256" ||
+    typeof archive.integrity.checksum !== "string"
+  ) {
+    throw new Error(
+      "Format d'archive non reconnu ou informations d'intégrité manquantes."
+    );
+  }
+
+  /*
+   * On reconstruit le même objet principal dans le même ordre
+   * que lors de la création de l'archive.
+   */
+  const core = {
+    format: archive.format,
+    application: archive.application,
+    version: archive.version,
+    created_at: archive.created_at,
+    database: archive.database,
+    summary: archive.summary,
+    tables: archive.tables
+  };
+
+  const calculatedChecksum = await sha256(JSON.stringify(core));
+  const expectedChecksum = archive.integrity.checksum;
+
+  const valid = constantTimeEqual(
+    calculatedChecksum,
+    expectedChecksum
+  );
+
+  const baseKey = snapshotKey.slice(
+    0,
+    -"/snapshot.json".length
+  );
+
+  const manifestKey = `${baseKey}/manifest.json`;
+  let manifestStatus = "not_checked";
+
+  const manifestObject = await bucket.get(manifestKey);
+
+  if (manifestObject) {
+    try {
+      const manifest = JSON.parse(await manifestObject.text());
+
+      manifestStatus =
+        manifest.checksum === expectedChecksum &&
+        manifest.snapshot_key === snapshotKey
+          ? "consistent"
+          : "inconsistent";
+    } catch {
+      manifestStatus = "invalid";
+    }
+  } else {
+    manifestStatus = "missing";
+  }
+
+  await audit(
+    db,
+    valid ? "archive_verified" : "archive_integrity_failed",
+    `Vérification SHA-256 de ${snapshotKey} : ${valid ? "valide" : "échec"}`
+  );
+
+  return {
+    snapshot_key: snapshotKey,
+    manifest_key: manifestKey,
+    valid,
+    algorithm: "SHA-256",
+    expected_checksum: expectedChecksum,
+    calculated_checksum: calculatedChecksum,
+    manifest_status: manifestStatus,
+    created_at: archive.created_at || null,
+    table_count: archive.summary?.table_count ?? null,
+    total_rows: archive.summary?.total_rows ?? null,
+    note: valid
+      ? "Le contenu de l'archive correspond à son empreinte SHA-256."
+      : "L'empreinte ne correspond pas : cette archive ne doit pas être utilisée pour une restauration."
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -736,8 +1196,6 @@ async function runExpertAnalysis(env, db, asset, marketData = {}) {
   const opinions = [];
   const providerErrors = [];
 
-  // Les rôles sont distincts. Les fournisseurs disponibles sont répartis
-  // entre les rôles ; cela ne garantit pas cinq modèles indépendants.
   for (let i = 0; i < AI_ROLES.length; i++) {
     const role = AI_ROLES[i];
     const provider = providers[i % providers.length];
@@ -829,8 +1287,6 @@ Retourne un objet JSON avec :
 /* -------------------------------------------------------------------------- */
 
 async function saveAnalysisRecord(db, report) {
-  // Insertion compatible avec les colonnes disponibles de la table analyses.
-  // Les colonnes inconnues ne sont jamais supposées.
   try {
     const info = await db.prepare("PRAGMA table_info(analyses)").all();
     const available = new Set((info.results || []).map((col) => col.name));
@@ -1023,7 +1479,7 @@ async function listTasks(db, limit = 100) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* TELEGRAM                                                                  */
+/* TELEGRAM                                                                   */
 /* -------------------------------------------------------------------------- */
 
 async function sendTelegram(env, message) {
@@ -1083,7 +1539,7 @@ function buildAssetAlert(asset, category, details, appUrl) {
 /* -------------------------------------------------------------------------- */
 
 async function handlePublicRoutes(request, env, ctx, route) {
-  const { path, method, url } = route;
+  const { path, method } = route;
 
   if (method === "GET" && path === "/") {
     return json({
@@ -1143,6 +1599,67 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     });
   }
 
+  /* -------------------------- ROUTES ARCHIVES R2 ------------------------- */
+
+  if (method === "GET" && path === "/api/archives/status") {
+    return json({
+      success: true,
+      archive_service: {
+        provider: "Cloudflare R2",
+        configured: Boolean(env.ARCHIVES),
+        backup: Boolean(env.ARCHIVES),
+        listing: Boolean(env.ARCHIVES),
+        sha256_verification: Boolean(env.ARCHIVES),
+        restoration: false,
+        automatic_deletion: false,
+        prefix: ARCHIVE_PREFIX,
+        maximum_rows_per_table: ARCHIVE_MAX_ROWS_PER_TABLE,
+        maximum_archive_bytes: ARCHIVE_MAX_BYTES
+      },
+      note:
+        "La présence du binding confirme sa disponibilité pour le Worker, mais les opérations doivent encore être testées en conditions réelles."
+    });
+  }
+
+  if (method === "POST" && path === "/api/archives/backup") {
+    const result = await createDatabaseArchive(db, env);
+
+    return json({
+      success: true,
+      message: "Sauvegarde D1 enregistrée dans R2.",
+      archive: result
+    }, 201);
+  }
+
+  if (method === "GET" && path === "/api/archives") {
+    const cursor = url.searchParams.get("cursor") || null;
+    const result = await listDatabaseArchives(env, cursor);
+
+    return json({
+      success: true,
+      ...result
+    });
+  }
+
+  if (method === "GET" && path === "/api/archives/verify") {
+    const key = url.searchParams.get("key");
+
+    if (!key) {
+      return errorResponse(
+        "Paramètre key requis. Il doit contenir la clé snapshot.json de l'archive."
+      );
+    }
+
+    const result = await verifyDatabaseArchive(db, env, key);
+
+    return json({
+      success: true,
+      verification: result
+    });
+  }
+
+  /* ------------------------------ ACTIFS --------------------------------- */
+
   if (method === "GET" && path === "/api/assets") {
     const limit = url.searchParams.get("limit") || 100;
     return json({
@@ -1172,6 +1689,8 @@ async function handleProtectedRoutes(request, env, ctx, route) {
 
     return json({ success: true, asset }, 201);
   }
+
+  /* -------------------------- DONNÉES DE MARCHÉ -------------------------- */
 
   if (method === "GET" && path === "/api/market/search") {
     const query = url.searchParams.get("q");
@@ -1206,6 +1725,8 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     });
   }
 
+  /* ------------------------------ SÉCURITÉ ------------------------------- */
+
   if (method === "GET" && path === "/api/security/chains") {
     return json({
       success: true,
@@ -1226,6 +1747,8 @@ async function handleProtectedRoutes(request, env, ctx, route) {
       ...(await getGoPlusTokenSecurity(chain, address))
     });
   }
+
+  /* ------------------------------- ANALYSES ------------------------------ */
 
   if (method === "POST" && path === "/api/analysis") {
     const body = await readBody(request);
@@ -1250,6 +1773,8 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, report }, 201);
   }
 
+  /* -------------------------------- TÂCHES ------------------------------- */
+
   if (method === "POST" && path === "/api/tasks") {
     const body = await readBody(request);
 
@@ -1269,6 +1794,8 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     const tasks = await listTasks(db, url.searchParams.get("limit") || 100);
     return json({ success: true, tasks });
   }
+
+  /* ------------------------------ TELEGRAM ------------------------------- */
 
   if (method === "POST" && path === "/api/telegram/test") {
     const result = await sendTelegram(
@@ -1304,6 +1831,8 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, telegram: result });
   }
 
+  /* -------------------------------- AUDIT -------------------------------- */
+
   if (method === "GET" && path === "/api/audit") {
     const result = await db.prepare(`
       SELECT * FROM ci_audit
@@ -1316,6 +1845,8 @@ async function handleProtectedRoutes(request, env, ctx, route) {
       events: result.results || []
     });
   }
+
+  /* ------------------------------- MÉMOIRE ------------------------------- */
 
   if (method === "GET" && path === "/api/memory/status") {
     return json({
@@ -1333,13 +1864,22 @@ async function handleProtectedRoutes(request, env, ctx, route) {
         long_term_archives: {
           provider: "Cloudflare R2",
           configured: Boolean(env.ARCHIVES),
-          implemented: false
+          implemented: Boolean(env.ARCHIVES),
+          capabilities: {
+            database_backup: Boolean(env.ARCHIVES),
+            archive_listing: Boolean(env.ARCHIVES),
+            sha256_verification: Boolean(env.ARCHIVES),
+            controlled_restoration: false,
+            automatic_deletion: false
+          }
         }
       },
       note:
-        "Cette route indique les connexions disponibles. La mémoire sémantique de Conan et les procédures d'archivage doivent encore être intégrées."
+        "Les fonctions de sauvegarde D1, de liste des archives et de vérification SHA-256 sont intégrées au backend. Elles restent à tester en conditions réelles. La mémoire personnelle de Conan et la restauration contrôlée ne sont pas encore intégrées."
     });
   }
+
+  /* -------------------------------- CONAN -------------------------------- */
 
   if (method === "POST" && path === "/api/conan/command") {
     const body = await readBody(request);
@@ -1378,7 +1918,14 @@ async function handleProtectedRoutes(request, env, ctx, route) {
         independent_code: false,
         self_learning_engine: false,
         prediction_cycles: false,
-        sandbox: false
+        sandbox: false,
+        archive_system: {
+          configured: Boolean(env.ARCHIVES),
+          backup_route: Boolean(env.ARCHIVES),
+          listing_route: Boolean(env.ARCHIVES),
+          verification_route: Boolean(env.ARCHIVES),
+          restoration: false
+        }
       }
     });
   }
@@ -1431,13 +1978,20 @@ async function handleRequest(request, env, ctx) {
   } catch (error) {
     console.error("CRYPTO INTELLIGENCE ERROR:", error);
 
-    const status = error.status === 429 ? 429 : 500;
+    const status =
+      error.status === 429
+        ? 429
+        : error.status === 404
+          ? 404
+          : 500;
 
     return withHeaders(
       errorResponse(
         status === 429
           ? "Limite du fournisseur atteinte. Réessaie plus tard."
-          : "Une erreur interne est survenue.",
+          : status === 404
+            ? safeString(error.message, 500)
+            : "Une erreur interne est survenue.",
         status,
         env.DEBUG === "true"
           ? safeString(error.message, 1000)
