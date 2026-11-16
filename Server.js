@@ -4677,6 +4677,15 @@ async function handleProtectedRoutes(request, env, ctx, route) {
 
   /* ---------------- CHAPITRE 4 — LABORATOIRE D'INVESTIGATION -------------- */
 
+
+  if (method === "GET" && path === "/api/radar/investigation/prepare") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    if (!discoveryKey) return errorResponse("discovery_key requis.");
+    const dossier = await prepareRadarInvestigationDossier(db, discoveryKey);
+    if (!dossier) return errorResponse("Actif radar introuvable.", 404);
+    return json({ success: true, dossier });
+  }
+
   if (method === "POST" && path === "/api/radar/investigation/report") {
     const body = await readBody(request);
     const discoveryKey = safeString(body.discovery_key || "", 200);
@@ -5325,6 +5334,37 @@ async function persistRadarInvestigationReport(db, discoveryKey, report, analyst
 async function getLatestRadarInvestigationReport(db, discoveryKey) {
   return db.prepare("SELECT * FROM ci_investigation_reports WHERE discovery_key = ? ORDER BY report_version DESC LIMIT 1")
     .bind(discoveryKey).first();
+}
+
+
+async function prepareRadarInvestigationDossier(db, discoveryKey) {
+  const discovery = await db.prepare("SELECT * FROM ci_radar_discoveries WHERE discovery_key = ?").bind(discoveryKey).first();
+  if (!discovery) return null;
+  const [identity, market, liquidity, lp, contract, lifecycle] = await Promise.all([
+    db.prepare("SELECT * FROM ci_radar_identity_checks WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT 1").bind(discoveryKey).first(),
+    db.prepare("SELECT * FROM ci_radar_market_checks WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT 1").bind(discoveryKey).first(),
+    db.prepare("SELECT * FROM ci_radar_onchain_liquidity_assessments WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT 1").bind(discoveryKey).first(),
+    db.prepare("SELECT * FROM ci_radar_lp_history WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT 1").bind(discoveryKey).first(),
+    db.prepare("SELECT * FROM ci_radar_contract_checks WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT 1").bind(discoveryKey).first(),
+    db.prepare("SELECT * FROM ci_radar_asset_lifecycle WHERE discovery_key = ?").bind(discoveryKey).first()
+  ]);
+  const parse = value => { try { return JSON.parse(value || "{}"); } catch { return {}; } };
+  const known = {
+    origin_history: { chain: discovery.chain_id, contract: discovery.contract_address, launch_date: discovery.pair_created_at, first_seen_at: discovery.first_seen_at, discovery_sources: parse(discovery.sources_json) },
+    identity: identity ? { provider: identity.provider, outcome: identity.outcome, checked_at: identity.checked_at, metadata: parse(identity.metadata_json) } : null,
+    market: market ? { provider: market.provider, outcome: market.outcome, liquidity_usd: market.liquidity_usd, volume_24h_usd: market.volume_24h_usd, pair_count: market.pair_count, checked_at: market.checked_at } : null,
+    onchain_liquidity: liquidity ? { outcome: liquidity.outcome, estimated_pool_depth_usd: liquidity.estimated_pool_depth_usd, buy_impact: parse(liquidity.estimated_buy_impact_json), sell_impact: parse(liquidity.estimated_sell_impact_json), checked_at: liquidity.checked_at, caveat: "Estimation non exécutable; frais, taxes, MEV et routage peuvent modifier le résultat." } : null,
+    lp_distribution: lp ? { assessment_status: lp.assessment_status, top10_locked_share_percent: lp.top10_locked_share_percent, top10_unlocked_share_percent: lp.top10_unlocked_share_percent, largest_lp_holder_percent: lp.largest_lp_holder_percent, unlock_events: parse(lp.unlock_events_json), checked_at: lp.checked_at } : null,
+    contract: contract ? { provider: contract.provider, outcome: contract.outcome, contract_code_present: contract.contract_code_present, evidence: parse(contract.evidence_json), checked_at: contract.checked_at } : null
+  };
+  const unavailable = ["team_verification", "technology_and_utility", "tokenomics_and_vesting", "circulating_supply_and_dilution", "market_cap_and_fdv", "community_reputation", "partnership_verification", "development_activity", "adoption_metrics", "complete_security_audit"];
+  return {
+    discovery: { discovery_key: discovery.discovery_key, chain_id: discovery.chain_id, contract_address: discovery.contract_address, token_name: discovery.token_name, token_symbol: discovery.token_symbol, first_seen_at: discovery.first_seen_at, pair_created_at: discovery.pair_created_at, sources: parse(discovery.sources_json) },
+    lifecycle: lifecycle || null,
+    available_evidence: known,
+    missing_investigation_areas: unavailable,
+    note: "Pré-dossier assemblé à partir des dernières observations déjà enregistrées. Les domaines absents restent inconnus et nécessitent des sources vérifiables; aucune équipe, adoption, association ou donnée financière n'est inventée."
+  };
 }
 
 export default {
