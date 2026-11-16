@@ -40,6 +40,7 @@
       font-weight: bold;
     }
     button.secondary { background: #34435d; }
+    button.preview { background: #247b70; }
     button.danger { background: #754044; }
     button:disabled { opacity: .5; }
     pre {
@@ -88,6 +89,11 @@
   <button id="backup">Créer une sauvegarde D1 vers R2</button>
   <button id="list" class="secondary">Afficher les archives</button>
   <button id="verify" class="secondary">Vérifier la dernière archive SHA-256</button>
+
+  <button id="preview" class="preview">
+    Prévisualiser la restauration (sans modifier D1)
+  </button>
+
   <button id="clear" class="danger">Effacer la clé de cette page</button>
 
   <h2>Résultat</h2>
@@ -95,6 +101,8 @@
   <p class="small">
     Les opérations de sauvegarde ajoutent une archive dans R2.
     Elles ne suppriment pas les données D1 ni les archives existantes.
+    La prévisualisation compare l'archive avec D1 sans exécuter
+    d'insertion, de mise à jour ou de suppression.
   </p>
 </main>
 
@@ -117,9 +125,11 @@
 
   function getSecret() {
     const value = secretInput.value.trim();
+
     if (!value) {
       throw new Error("Saisis d'abord APP_SECRET.");
     }
+
     secret = value;
     return secret;
   }
@@ -144,7 +154,9 @@
     try {
       data = text ? JSON.parse(text) : {};
     } catch {
-      throw new Error("Réponse non JSON reçue. HTTP " + response.status);
+      throw new Error(
+        "Réponse non JSON reçue. HTTP " + response.status
+      );
     }
 
     if (!response.ok || data.success === false) {
@@ -165,15 +177,48 @@
       const result = await operation();
       display(result);
     } catch (error) {
-      display("ERREUR : " + (error.message || "Erreur inconnue."));
+      display(
+        "ERREUR : " +
+        (error.message || "Erreur inconnue.")
+      );
     } finally {
       buttons.forEach(item => item.disabled = false);
     }
   }
 
+  async function getLatestArchive() {
+    const listing = await api("/api/archives");
+    const archives = Array.isArray(listing.archives)
+      ? listing.archives
+      : [];
+
+    const validArchives = archives.filter(item =>
+      item.snapshot_key &&
+      item.manifest_valid === true
+    );
+
+    if (!validArchives.length) {
+      throw new Error(
+        "Aucune archive avec manifeste valide trouvée. " +
+        "Crée d'abord une sauvegarde."
+      );
+    }
+
+    validArchives.sort((a, b) => {
+      const dateA = Date.parse(a.created_at || "") || 0;
+      const dateB = Date.parse(b.created_at || "") || 0;
+      return dateB - dateA;
+    });
+
+    lastSnapshotKey = validArchives[0].snapshot_key;
+
+    return validArchives[0];
+  }
+
   document.getElementById("connect").addEventListener("click", () => {
     run(null, async () => {
       const data = await api("/api/status");
+
       return {
         message: "Accès sécurisé et interrogation D1 réussis.",
         result: data
@@ -203,32 +248,61 @@
 
   document.getElementById("list").addEventListener("click", () => {
     run(null, async () => {
-      return await api("/api/archives");
+      const data = await api("/api/archives");
+
+      const archives = Array.isArray(data.archives)
+        ? data.archives
+        : [];
+
+      const validArchives = archives
+        .filter(item =>
+          item.snapshot_key &&
+          item.manifest_valid === true
+        )
+        .sort((a, b) => {
+          const dateA = Date.parse(a.created_at || "") || 0;
+          const dateB = Date.parse(b.created_at || "") || 0;
+          return dateB - dateA;
+        });
+
+      if (validArchives.length) {
+        lastSnapshotKey = validArchives[0].snapshot_key;
+      }
+
+      return data;
     });
   });
 
   document.getElementById("verify").addEventListener("click", () => {
     run(null, async () => {
       if (!lastSnapshotKey) {
-        const listing = await api("/api/archives");
-        const archives = listing.archives || [];
-        const latest = archives.find(item =>
-          item.snapshot_key && item.manifest_valid === true
-        );
-
-        if (!latest) {
-          throw new Error(
-            "Aucune archive avec manifeste valide trouvée. Crée d'abord une sauvegarde."
-          );
-        }
-
-        lastSnapshotKey = latest.snapshot_key;
+        await getLatestArchive();
       }
 
       const url = "/api/archives/verify?key=" +
         encodeURIComponent(lastSnapshotKey);
 
       return await api(url);
+    });
+  });
+
+  document.getElementById("preview").addEventListener("click", () => {
+    run(null, async () => {
+      const archive = await getLatestArchive();
+
+      const url = "/api/archives/preview?key=" +
+        encodeURIComponent(archive.snapshot_key);
+
+      const result = await api(url);
+
+      return {
+        message: "Prévisualisation reçue. Aucune modification D1 effectuée.",
+        archive: {
+          snapshot_key: archive.snapshot_key,
+          created_at: archive.created_at || null
+        },
+        preview: result
+      };
     });
   });
 
