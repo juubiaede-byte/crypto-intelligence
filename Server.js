@@ -364,6 +364,8 @@ async function initializeBackendTables(db) {
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_verifications_next ON ci_radar_verifications(next_check_at, outcome)`)
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_security_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, provider TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT 'unknown', checked_at TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_security_checks_discovery ON ci_radar_security_checks(discovery_key, checked_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_market_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'DexScreener', outcome TEXT NOT NULL DEFAULT 'unknown', pair_count INTEGER NOT NULL DEFAULT 0, liquidity_usd REAL, volume_24h_usd REAL, checked_at TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_market_checks_discovery ON ci_radar_market_checks(discovery_key, checked_at DESC)`)
 
   ]);
 }
@@ -2248,6 +2250,31 @@ async function verifyRadarTokenWithGoPlus(db, item) {
 async function persistRadarSecurityCheck(db, result) {
   await db.prepare(`INSERT INTO ci_radar_security_checks (check_key, discovery_key, provider, outcome, checked_at, evidence_json, error_message) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(check_key) DO UPDATE SET outcome = excluded.outcome, checked_at = excluded.checked_at, evidence_json = excluded.evidence_json, error_message = excluded.error_message`).bind(result.check_key, result.discovery_key, result.provider, result.outcome, result.checked_at, JSON.stringify(result.evidence || {}), result.error_message).run();
 }
+function dexScreenerChainId(chain) {
+  const normalized = safeString(chain, 80).trim().toLowerCase();
+  const supported = { eth: 'ethereum', ethereum: 'ethereum', '1': 'ethereum', bsc: 'bsc', binance: 'bsc', '56': 'bsc', base: 'base', '8453': 'base', polygon: 'polygon', matic: 'polygon', '137': 'polygon', arbitrum: 'arbitrum', '42161': 'arbitrum', optimism: 'optimism', '10': 'optimism', avalanche: 'avalanche', '43114': 'avalanche', solana: 'solana', sonic: 'sonic', fantom: 'fantom', '250': 'fantom', linea: 'linea', scroll: 'scroll' };
+  return supported[normalized] || normalized;
+}
+async function verifyRadarMarketData(db, item) {
+  const checkedAt = nowISO(); const checkKey = item.discovery_key + ':dexscreener';
+  const chain = dexScreenerChainId(item.chain_id);
+  try {
+    const { data, status } = await externalJSON('https://api.dexscreener.com/token-pairs/v1/' + encodeURIComponent(chain) + '/' + encodeURIComponent(item.contract_address));
+    await recordProviderUsage(db, 'dexscreener_token_pairs', true, status);
+    const pairs = Array.isArray(data) ? data : [];
+    const matching = pairs.filter((pair) => String(pair.baseToken?.address || '').toLowerCase() === item.contract_address.toLowerCase() || String(pair.quoteToken?.address || '').toLowerCase() === item.contract_address.toLowerCase());
+    const liquidities = matching.map((pair) => Number(pair.liquidity?.usd)).filter((value) => Number.isFinite(value) && value >= 0);
+    const volumes = matching.map((pair) => Number(pair.volume?.h24)).filter((value) => Number.isFinite(value) && value >= 0);
+    const outcome = pairs.length === 0 ? 'no_pair_returned' : matching.length > 0 ? 'pair_identity_confirmed_by_provider' : 'identity_unconfirmed';
+    return { check_key: checkKey, discovery_key: item.discovery_key, provider: 'DexScreener', outcome, pair_count: matching.length, liquidity_usd: liquidities.length ? liquidities.reduce((sum, value) => sum + value, 0) : null, volume_24h_usd: volumes.length ? volumes.reduce((sum, value) => sum + value, 0) : null, checked_at: checkedAt, evidence: { requested_chain: item.chain_id, dex_chain: chain, returned_pairs: pairs, matching_pair_count: matching.length, note: 'Liquidité et volume rapportés par DexScreener; ils ne prouvent ni la profondeur réelle ni la possibilité de vendre.' }, error_message: null };
+  } catch (error) {
+    await recordProviderUsage(db, 'dexscreener_token_pairs', false, error.status || 500);
+    return { check_key: checkKey, discovery_key: item.discovery_key, provider: 'DexScreener', outcome: 'unknown', pair_count: 0, liquidity_usd: null, volume_24h_usd: null, checked_at: checkedAt, evidence: { requested_chain: item.chain_id }, error_message: safeString(error.message || 'Données de marché indisponibles.', 500) };
+  }
+}
+async function persistRadarMarketCheck(db, result) {
+  await db.prepare(`INSERT INTO ci_radar_market_checks (check_key, discovery_key, provider, outcome, pair_count, liquidity_usd, volume_24h_usd, checked_at, evidence_json, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(check_key) DO UPDATE SET outcome = excluded.outcome, pair_count = excluded.pair_count, liquidity_usd = excluded.liquidity_usd, volume_24h_usd = excluded.volume_24h_usd, checked_at = excluded.checked_at, evidence_json = excluded.evidence_json, error_message = excluded.error_message`).bind(result.check_key, result.discovery_key, result.provider, result.outcome, result.pair_count, result.liquidity_usd, result.volume_24h_usd, result.checked_at, JSON.stringify(result.evidence || {}), result.error_message).run();
+}
 
 async function runRadarVerification(db) {
   const pending = await db.prepare(`SELECT d.discovery_key, d.chain_id, d.contract_address, d.pair_addresses_json FROM ci_radar_discoveries d LEFT JOIN ci_radar_verifications v ON v.discovery_key = d.discovery_key WHERE d.status = 'quarantine' AND (v.discovery_key IS NULL OR (v.next_check_at IS NOT NULL AND v.next_check_at <= ?)) ORDER BY d.first_seen_at ASC LIMIT 5`).bind(nowISO()).all();
@@ -2255,12 +2282,15 @@ async function runRadarVerification(db) {
   for (const item of pending.results || []) {
     const result = await verifyRadarTokenWithHoneypot(db, item);
     const goPlusResult = await verifyRadarTokenWithGoPlus(db, item);
+    const marketResult = await verifyRadarMarketData(db, item);
+    await persistRadarMarketCheck(db, marketResult);
     await persistRadarSecurityCheck(db, goPlusResult);
     await db.prepare(`INSERT INTO ci_radar_verifications (discovery_key, provider, outcome, simulation_success, risk, checked_at, next_check_at, evidence_json, error_message) VALUES (?, 'Honeypot.is', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(discovery_key) DO UPDATE SET provider = excluded.provider, outcome = excluded.outcome, simulation_success = excluded.simulation_success, risk = excluded.risk, checked_at = excluded.checked_at, next_check_at = excluded.next_check_at, evidence_json = excluded.evidence_json, error_message = excluded.error_message`).bind(result.discovery_key, result.outcome, result.simulation_success, result.risk, result.checked_at, result.next_check_at, JSON.stringify(result.evidence), result.error_message).run();
     summary.attempted++;
     if (result.outcome === 'honeypot_detected') summary.honeypot_detected++; else if (result.outcome === 'simulation_passed') summary.simulation_passed++; else if (result.outcome === 'unsupported') summary.unsupported++; else summary.unknown++;
     if (result.error_message) summary.errors++;
     if (goPlusResult.error_message) summary.errors++;
+    if (marketResult.error_message) summary.errors++;
   }
   return summary;
 }
@@ -3188,6 +3218,11 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     });
   }
 
+  if (method === "GET" && path === "/api/radar/market-checks") {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const result = await db.prepare(`SELECT m.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol FROM ci_radar_market_checks m JOIN ci_radar_discoveries d ON d.discovery_key = m.discovery_key ORDER BY m.checked_at DESC LIMIT ?`).bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, checks: result.results || [] });
+  }
   if (method === "GET" && path === "/api/radar/security-checks") {
     const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
     const result = await db.prepare(`SELECT s.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol FROM ci_radar_security_checks s JOIN ci_radar_discoveries d ON d.discovery_key = s.discovery_key ORDER BY s.checked_at DESC LIMIT ?`).bind(limit).all();
