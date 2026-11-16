@@ -2529,14 +2529,28 @@ async function runRadarDiscovery(db) {
     { provider: "dexscreener_boosts", url: "https://api.dexscreener.com/token-boosts/latest/v1" },
     { provider: "geckoterminal_new_pools", url: "https://api.geckoterminal.com/api/v2/networks/new_pools?include=base_token,quote_token,network,dex" }
   ];
-  // Sept réseaux majeurs supplémentaires. Avec le flux global GeckoTerminal,
-  // cela représente 8 appels GeckoTerminal par cycle, sous la limite publique
-  // annoncée d'environ 10 appels/minute.
-  for (const network of ["eth", "bsc", "base", "solana", "arbitrum", "polygon_pos", "optimism"]) {
+  // Sept réseaux supplémentaires parcourus par rotation pour élargir progressivement
+  // la couverture sans dépasser huit appels GeckoTerminal par cycle (flux global inclus).
+  let radarNetworks = ["eth", "bsc", "base", "solana", "arbitrum", "polygon_pos", "optimism"];
+  try {
+    const networkCatalog = await getGeckoTerminalNetworks(db);
+    const availableNetworks = [...new Set(
+      (networkCatalog.networks || []).map((item) => safeString(item.id, 80)).filter(Boolean)
+    )];
+    if (availableNetworks.length) {
+      const rotation = Math.floor(Date.now() / (5 * 60 * 1000)) % availableNetworks.length;
+      radarNetworks = Array.from({ length: Math.min(7, availableNetworks.length) }, (_, index) =>
+        availableNetworks[(rotation + index) % availableNetworks.length]
+      );
+    }
+  } catch {
+    // Le radar conserve les sept réseaux de repli si le catalogue est indisponible.
+  }
+  for (const network of radarNetworks) {
     endpoints.push({
       provider: "geckoterminal_network_new_pools_" + network,
       url: "https://api.geckoterminal.com/api/v2/networks/" +
-        network + "/new_pools?include=base_token,quote_token,network,dex"
+        encodeURIComponent(network) + "/new_pools?include=base_token,quote_token,network,dex"
     });
   }
 
