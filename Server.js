@@ -1659,11 +1659,17 @@ async function restoreDatabaseArchive(
       env,
       loaded.snapshotKey
     );
+    const postRestoreForeignKeyCheck = await db.prepare(
+      "PRAGMA foreign_key_check"
+    ).all();
+    const postRestoreForeignKeyViolations =
+      (postRestoreForeignKeyCheck.results || []).length;
 
     const postRestoreVerified =
       previewIsSafe(postRestorePreview) &&
       Number(postRestorePreview.totals?.insertable_rows) === 0 &&
-      Number(postRestorePreview.totals?.conflict_rows) === 0;
+      Number(postRestorePreview.totals?.conflict_rows) === 0 &&
+      postRestoreForeignKeyViolations === 0;
 
     await audit(
       db,
@@ -1701,6 +1707,7 @@ async function restoreDatabaseArchive(
         transaction_used: true
       },
       post_restore_totals: postRestorePreview.totals,
+      post_restore_foreign_key_violations: postRestoreForeignKeyViolations,
       message: postRestoreVerified
         ? "Restauration terminée et vérifiée. Aucune ligne existante n'a été écrasée."
         : "Les insertions transactionnelles ont été exécutées, mais le contrôle final nécessite une vérification."
