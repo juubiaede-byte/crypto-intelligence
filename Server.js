@@ -8777,3 +8777,47 @@ callAIProvider=async function(provider,env,prompt){
   }
   return await ciChapter15OriginalCallAIProvider(provider,env,prompt);
 };
+
+
+/* Chapitre 15 — repli IA contrôlé, uniquement entre fournisseurs configurés. */
+async function callCIProviderWithFallback(env,db,prompt,preferredProvider){
+  const configured=availableAIProviders(env);
+  const preferred=safeString(preferredProvider||"",40).toLowerCase();
+  const order=[preferred,...configured.filter(id=>id!==preferred)].filter((id,index,array)=>configured.includes(id)&&array.indexOf(id)===index).slice(0,5);
+  if(!order.length)throw new Error("Aucun fournisseur IA configuré pour le repli.");
+  const attempts=[];
+  for(const provider of order){
+    const gate=await ciProviderRuntimeGate(db,provider);
+    if(!gate.allowed){
+      attempts.push({provider,status:"deferred",reason:gate.reason,retry_at:gate.retry_at||null});
+      continue;
+    }
+    const started=Date.now();
+    try{
+      const response=await ciChapter15OriginalCallAIProvider(provider,env,prompt);
+      await recordProviderUsage(db,provider,true,200);
+      attempts.push({provider,status:"completed",latency_ms:Date.now()-started});
+      return {success:true,provider_used:provider,response,attempts,fallback_used:provider!==preferred};
+    }catch(error){
+      const message=safeString(error.message||"Erreur IA.",500);
+      await recordProviderUsage(db,provider,false,error.status||500);
+      attempts.push({provider,status:"failed",error:message});
+    }
+  }
+  return {success:false,provider_used:null,response:null,attempts,fallback_used:false};
+}
+
+const ciChapter15RoutesBeforeFallback=handleProtectedRoutes;
+handleProtectedRoutes=async function(request,env,ctx,route){
+  if(route.path==="/api/providers/ai/fallback"&&route.method==="POST"){
+    const db=getDB(env);await initializeBackendTables(db);await ensureCIProviderOrchestratorTables(db);
+    try{
+      const body=await readBody(request);
+      const prompt=safeString(body.prompt||"",20000);
+      if(!prompt)throw new Error("Le prompt est obligatoire.");
+      const result=await callCIProviderWithFallback(env,db,prompt,body.preferred_provider);
+      return json({success:result.success,...result,provider_fallback_is_not_data_equivalence:false});
+    }catch(error){return errorResponse(safeString(error.message||"Repli IA impossible.",1000),400);}
+  }
+  return await ciChapter15RoutesBeforeFallback(request,env,ctx,route);
+};
