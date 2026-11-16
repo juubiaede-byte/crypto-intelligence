@@ -93,6 +93,7 @@ const ARCHIVE_TABLES = [
   "watchlists",
   "ci_cache",
   "ci_provider_usage",
+  "ci_radar_lp_history",
   "ci_tasks",
   "ci_audit"
 ];
@@ -364,6 +365,8 @@ async function initializeBackendTables(db) {
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_verifications_next ON ci_radar_verifications(next_check_at, outcome)`)
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_security_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, provider TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT 'unknown', checked_at TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_security_checks_discovery ON ci_radar_security_checks(discovery_key, checked_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_lp_history (snapshot_id TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, provider TEXT NOT NULL, checked_at TEXT NOT NULL, assessment_status TEXT NOT NULL DEFAULT 'unknown', top10_locked_share_percent REAL, top10_unlocked_share_percent REAL, top10_lock_status_unknown_share_percent REAL, largest_lp_holder_percent REAL, first_three_lp_holders_percent REAL, reported_lp_holder_count REAL, unlock_events_json TEXT NOT NULL DEFAULT '[]', evidence_json TEXT NOT NULL DEFAULT '{}')`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_lp_history_discovery ON ci_radar_lp_history(discovery_key, checked_at DESC)`)
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_market_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'DexScreener', outcome TEXT NOT NULL DEFAULT 'unknown', pair_count INTEGER NOT NULL DEFAULT 0, liquidity_usd REAL, volume_24h_usd REAL, checked_at TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_market_checks_discovery ON ci_radar_market_checks(discovery_key, checked_at DESC)`)
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_contract_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL UNIQUE, provider TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT 'unknown', contract_code_present INTEGER, checked_at TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
@@ -2601,6 +2604,7 @@ async function runRadarVerification(db) {
       goPlusResult.evidence.liquidity_assessment = goPlusLiquidityAssessment(goPlusResult.evidence.token_security);
       goPlusResult.evidence.liquidity_assessment = goPlusLiquidityAssessmentV2(goPlusResult.evidence.token_security);
     }
+    await persistRadarLpHistory(db, goPlusResult);
     const marketResult = await verifyRadarMarketData(db, item);
     await persistRadarMarketCheck(db, marketResult);
     marketResult.pool_metrics = await persistRadarPoolMetrics(db, item.discovery_key, marketResult);
@@ -4153,6 +4157,47 @@ function goPlusLiquidityAssessmentV2(token) {
     lock_status_interpretation: "Les détenteurs sans indicateur is_locked explicite restent non classés; ils ne sont pas considérés comme déverrouillés."
   };
 }
+
+async function persistRadarLpHistory(db, goPlusResult) {
+  const assessment = goPlusResult?.evidence?.liquidity_assessment || {};
+  const checkedAt = goPlusResult?.checked_at || nowISO();
+  const tokenSecurity = goPlusResult?.evidence?.token_security || null;
+  const evidence = {
+    assessment,
+    provider_outcome: goPlusResult?.outcome || "unknown",
+    provider_error: goPlusResult?.error_message || null,
+    token_security_available: Boolean(tokenSecurity),
+    interpretation: "Historique append-only des observations LP. Les données absentes restent inconnues et ne sont pas interprétées comme une absence de risque."
+  };
+  await db.prepare(`INSERT INTO ci_radar_lp_history
+    (snapshot_id, discovery_key, provider, checked_at, assessment_status,
+     top10_locked_share_percent, top10_unlocked_share_percent,
+     top10_lock_status_unknown_share_percent, largest_lp_holder_percent,
+     first_three_lp_holders_percent, reported_lp_holder_count,
+     unlock_events_json, evidence_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      crypto.randomUUID(),
+      goPlusResult?.discovery_key || "",
+      goPlusResult?.provider || "GoPlus",
+      checkedAt,
+      safeString(assessment.status || "unknown", 40),
+      radarFiniteMetric(assessment.top10_locked_share_percent),
+      radarFiniteMetric(assessment.top10_unlocked_share_percent),
+      radarFiniteMetric(assessment.top10_lock_status_unknown_share_percent),
+      radarFiniteMetric(assessment.largest_reported_lp_holder_percent),
+      radarFiniteMetric(assessment.first_three_reported_lp_holders_percent),
+      radarFiniteMetric(assessment.lp_holder_count_reported),
+      JSON.stringify(assessment.unlock_events || []),
+      JSON.stringify(evidence)
+    ).run();
+  return {
+    saved: true,
+    snapshot_id_created: true,
+    assessment_status: assessment.status || "unknown",
+    history_mode: "append_only"
+  };
+}
+
 
 function goPlusRiskSignals(token) {
   if (!token || typeof token !== "object") return [];
