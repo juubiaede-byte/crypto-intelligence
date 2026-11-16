@@ -116,6 +116,14 @@ const ARCHIVE_TABLES = [
   ,"ci_wallet_events"
   ,"ci_wallet_behavior_signals"
   ,"ci_wallet_clusters"
+  ,"ci_conan_prediction_cycles"
+  ,"ci_conan_prediction_assets"
+  ,"ci_conan_prediction_observations"
+  ,"ci_conan_predictions"
+  ,"ci_conan_prediction_opinions"
+  ,"ci_conan_prediction_progress"
+  ,"ci_conan_prediction_results"
+  ,"ci_conan_learning_history"
 ];
 
 const ARCHIVE_PREFIX = "conan/backups/";
@@ -559,6 +567,26 @@ async function initializeBackendTables(db) {
       created_at TEXT NOT NULL
     )`)
     ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_wallet_clusters_asset ON ci_wallet_clusters(discovery_key, last_observed_at DESC)")
+
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_prediction_cycles (cycle_id TEXT PRIMARY KEY,status TEXT NOT NULL,cycle_start_date TEXT NOT NULL,current_day INTEGER NOT NULL DEFAULT 1,selection_mode TEXT NOT NULL,learning_stage TEXT NOT NULL DEFAULT 'child',methodology_version TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT)`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_cycles_status ON ci_conan_prediction_cycles(status,cycle_start_date DESC)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_prediction_assets (asset_row_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,asset_order INTEGER NOT NULL,discovery_key TEXT NOT NULL,chain_id TEXT NOT NULL,contract_address TEXT NOT NULL,token_name TEXT,token_symbol TEXT,pair_address TEXT NOT NULL,selected_at TEXT NOT NULL,selection_reason TEXT NOT NULL,UNIQUE(cycle_id,discovery_key))`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_cycle_assets ON ci_conan_prediction_assets(cycle_id,asset_order)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_prediction_observations (observation_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,discovery_key TEXT NOT NULL,cycle_day INTEGER NOT NULL,price_usd REAL,liquidity_usd REAL,volume_24h_usd REAL,buys_24h INTEGER,sells_24h INTEGER,source TEXT NOT NULL,source_observed_at TEXT,observed_at TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}')`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_observations_asset ON ci_conan_prediction_observations(cycle_id,discovery_key,observed_at DESC)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_observations_day ON ci_conan_prediction_observations(cycle_id,cycle_day)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_predictions (prediction_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,discovery_key TEXT NOT NULL,chain_id TEXT NOT NULL,contract_address TEXT NOT NULL,token_symbol TEXT,pair_address TEXT NOT NULL,locked_at TEXT NOT NULL,reference_price_usd REAL NOT NULL,reference_source TEXT NOT NULL,reference_observed_at TEXT NOT NULL,direction TEXT NOT NULL,targets_json TEXT NOT NULL,probabilities_json TEXT NOT NULL,confidence_percent REAL,invalidation_price_usd REAL,risks_json TEXT NOT NULL DEFAULT '[]',reasoning TEXT,council_summary_json TEXT NOT NULL DEFAULT '{}',methodology_version TEXT NOT NULL,UNIQUE(cycle_id,discovery_key))`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_predictions_cycle ON ci_conan_predictions(cycle_id,locked_at)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_predictions_asset ON ci_conan_predictions(discovery_key,locked_at DESC)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_prediction_opinions (opinion_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,prediction_id TEXT NOT NULL,discovery_key TEXT NOT NULL,role TEXT NOT NULL,provider TEXT,status TEXT NOT NULL,opinion_json TEXT NOT NULL DEFAULT '{}',error_message TEXT,created_at TEXT NOT NULL)`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_prediction_opinions_prediction ON ci_conan_prediction_opinions(prediction_id,created_at)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_prediction_opinions_provider ON ci_conan_prediction_opinions(provider,created_at)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_prediction_progress (prediction_id TEXT PRIMARY KEY,latest_price_usd REAL,latest_observed_at TEXT,targets_progress_json TEXT NOT NULL DEFAULT '[]',last_updated_at TEXT NOT NULL)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_prediction_results (result_id TEXT PRIMARY KEY,prediction_id TEXT NOT NULL UNIQUE,cycle_id TEXT NOT NULL,discovery_key TEXT NOT NULL,outcome_status TEXT NOT NULL,direction_correct INTEGER,reference_price_usd REAL,final_price_usd REAL,direction_change_percent REAL,targets_touched_json TEXT NOT NULL DEFAULT '[]',targets_held_1h_json TEXT NOT NULL DEFAULT '[]',learning_notes_json TEXT NOT NULL DEFAULT '{}',evaluated_at TEXT NOT NULL)`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_results_cycle ON ci_conan_prediction_results(cycle_id,evaluated_at)")
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_results_asset ON ci_conan_prediction_results(discovery_key,evaluated_at DESC)")
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_learning_history (learning_id TEXT PRIMARY KEY,cycle_id TEXT NOT NULL,learning_type TEXT NOT NULL,summary TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)`)
+    ,db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_learning_cycle ON ci_conan_learning_history(cycle_id,created_at DESC)")
 
 
 
@@ -4888,6 +4916,46 @@ async function handleProtectedRoutes(request, env, ctx, route) {
       ? await db.prepare("SELECT * FROM ci_wallet_clusters WHERE discovery_key = ? ORDER BY last_observed_at DESC LIMIT ?").bind(discoveryKey, limit).all()
       : await db.prepare("SELECT * FROM ci_wallet_clusters ORDER BY last_observed_at DESC LIMIT ?").bind(limit).all();
     return json({ success: true, count: result.results?.length || 0, clusters: result.results || [] });
+  }
+
+
+  /* ---------------- CHAPITRE 8 — CYCLE DE PRÉDICTION CONAN 15 JOURS ---------------- */
+  if (method === "POST" && path === "/api/conan/prediction-cycle/run") {
+    const result = await runConanPredictionCycle(db, env);
+    return json({ success: true, cycle: result }, result.status === "error" ? 500 : 200);
+  }
+  if (method === "GET" && path === "/api/conan/prediction-cycles") {
+    const limit=Math.max(1,Math.min(100,Number(url.searchParams.get("limit"))||30));
+    const result=await db.prepare("SELECT * FROM ci_conan_prediction_cycles ORDER BY cycle_start_date DESC LIMIT ?").bind(limit).all();
+    return json({success:true,count:result.results?.length||0,cycles:result.results||[]});
+  }
+  if (method === "GET" && path === "/api/conan/predictions") {
+    const cycleId=safeString(url.searchParams.get("cycle_id")||"",120),discoveryKey=safeString(url.searchParams.get("discovery_key")||"",200),limit=Math.max(1,Math.min(200,Number(url.searchParams.get("limit"))||50));
+    if(!cycleId&&!discoveryKey)return errorResponse("cycle_id ou discovery_key requis.");
+    const result=cycleId?await db.prepare("SELECT * FROM ci_conan_predictions WHERE cycle_id=? ORDER BY locked_at ASC LIMIT ?").bind(cycleId,limit).all():await db.prepare("SELECT * FROM ci_conan_predictions WHERE discovery_key=? ORDER BY locked_at DESC LIMIT ?").bind(discoveryKey,limit).all();
+    return json({success:true,count:result.results?.length||0,predictions:result.results||[]});
+  }
+  if (method === "GET" && path === "/api/conan/prediction-observations") {
+    const cycleId=safeString(url.searchParams.get("cycle_id")||"",120),discoveryKey=safeString(url.searchParams.get("discovery_key")||"",200),limit=Math.max(1,Math.min(2000,Number(url.searchParams.get("limit"))||500));
+    if(!cycleId&&!discoveryKey)return errorResponse("cycle_id ou discovery_key requis.");
+    const result=cycleId?await db.prepare("SELECT * FROM ci_conan_prediction_observations WHERE cycle_id=? ORDER BY observed_at ASC LIMIT ?").bind(cycleId,limit).all():await db.prepare("SELECT * FROM ci_conan_prediction_observations WHERE discovery_key=? ORDER BY observed_at DESC LIMIT ?").bind(discoveryKey,limit).all();
+    return json({success:true,count:result.results?.length||0,observations:result.results||[]});
+  }
+  if (method === "GET" && path === "/api/conan/prediction-opinions") {
+    const id=safeString(url.searchParams.get("prediction_id")||"",120);if(!id)return errorResponse("prediction_id requis.");
+    const result=await db.prepare("SELECT * FROM ci_conan_prediction_opinions WHERE prediction_id=? ORDER BY created_at ASC").bind(id).all();
+    return json({success:true,count:result.results?.length||0,opinions:result.results||[]});
+  }
+  if (method === "GET" && path === "/api/conan/prediction-results") {
+    const cycleId=safeString(url.searchParams.get("cycle_id")||"",120),discoveryKey=safeString(url.searchParams.get("discovery_key")||"",200),limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
+    if(!cycleId&&!discoveryKey)return errorResponse("cycle_id ou discovery_key requis.");
+    const result=cycleId?await db.prepare("SELECT * FROM ci_conan_prediction_results WHERE cycle_id=? ORDER BY evaluated_at ASC LIMIT ?").bind(cycleId,limit).all():await db.prepare("SELECT * FROM ci_conan_prediction_results WHERE discovery_key=? ORDER BY evaluated_at DESC LIMIT ?").bind(discoveryKey,limit).all();
+    return json({success:true,count:result.results?.length||0,results:result.results||[]});
+  }
+  if (method === "GET" && path === "/api/conan/learning-history") {
+    const cycleId=safeString(url.searchParams.get("cycle_id")||"",120),limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
+    const result=cycleId?await db.prepare("SELECT * FROM ci_conan_learning_history WHERE cycle_id=? ORDER BY created_at DESC LIMIT ?").bind(cycleId,limit).all():await db.prepare("SELECT * FROM ci_conan_learning_history ORDER BY created_at DESC LIMIT ?").bind(limit).all();
+    return json({success:true,count:result.results?.length||0,learning:result.results||[]});
   }
 
   if (method === "POST" && path === "/api/collective-intelligence/scan") {
