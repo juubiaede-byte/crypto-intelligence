@@ -6567,7 +6567,9 @@ async function evaluateConanPredictionCycle(db,cycle){
   }
   const rows=await db.prepare("SELECT outcome_status,direction_correct FROM ci_conan_prediction_results WHERE cycle_id=?").bind(cycle.cycle_id).all();
   const valid=(rows.results||[]).filter(item=>item.outcome_status==="evaluated"),correct=valid.filter(item=>Number(item.direction_correct)===1).length;
-  const summary={evaluated_predictions:valid.length,unverifiable_predictions:(rows.results||[]).filter(item=>item.outcome_status==="unverifiable").length,direction_correct:correct,direction_accuracy_percent:valid.length?correct/valid.length*100:null,formal_conan_score:"Calculé selon la pondération officielle au chapitre 9; non anticipé ici."};
+  const assetCount=await db.prepare("SELECT COUNT(*) AS count FROM ci_conan_prediction_assets WHERE cycle_id=?").bind(cycle.cycle_id).first();
+  const predictionCount=await db.prepare("SELECT COUNT(*) AS count FROM ci_conan_predictions WHERE cycle_id=?").bind(cycle.cycle_id).first();
+  const summary={selected_assets:Number(assetCount?.count||0),locked_predictions:Number(predictionCount?.count||0),assets_without_locked_prediction:Math.max(0,Number(assetCount?.count||0)-Number(predictionCount?.count||0)),evaluated_predictions:valid.length,unverifiable_predictions:(rows.results||[]).filter(item=>item.outcome_status==="unverifiable").length,direction_correct:correct,direction_accuracy_percent:valid.length?correct/valid.length*100:null,formal_conan_score:"Calculé selon la pondération officielle au chapitre 9; non anticipé ici."};
   const timestamp=nowISO();
   await db.prepare("INSERT INTO ci_conan_learning_history (learning_id,cycle_id,learning_type,summary,evidence_json,created_at) VALUES (?,?,?,?,?,?)").bind(
     cryptoRandomId(),cycle.cycle_id,"cycle_evaluation","Évaluation du cycle de 15 jours : résultats, erreurs, cibles touchées et cibles maintenues.",JSON.stringify(summary),timestamp
@@ -6597,8 +6599,9 @@ async function runConanPredictionCycle(db,env){
     for(const asset of assets){
       const existing=await db.prepare("SELECT prediction_id FROM ci_conan_predictions WHERE cycle_id=? AND discovery_key=?").bind(cycle.cycle_id,asset.discovery_key).first();
       if(existing){locks.push({discovery_key:asset.discovery_key,status:"already_locked",prediction_id:existing.prediction_id});continue;}
+      if(day!==8){locks.push({discovery_key:asset.discovery_key,status:"not_locked_on_day_8"});continue;}
       const attempt=await db.prepare("SELECT COUNT(*) AS count FROM ci_conan_prediction_opinions WHERE cycle_id=? AND discovery_key=? AND created_at>=?").bind(cycle.cycle_id,asset.discovery_key,today+"T00:00:00.000Z").first();
-      if(Number(attempt?.count||0)>0){locks.push({discovery_key:asset.discovery_key,status:"attempted_today_waiting_for_next_daily_window"});continue;}
+      if(Number(attempt?.count||0)>0){locks.push({discovery_key:asset.discovery_key,status:"attempted_today_no_duplicate_ai_calls"});continue;}
       const market=await getConanLatestMarket(db,asset.discovery_key);
       locks.push({discovery_key:asset.discovery_key,...await lockConanPredictionForAsset(db,env,cycle,asset,market,usage,dailyLimit)});
     }
