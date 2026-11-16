@@ -338,6 +338,28 @@ async function initializeBackendTables(db) {
         error_summary TEXT
       )
     `)
+,
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS ci_radar_pairs (
+        pair_key TEXT PRIMARY KEY,
+        chain_id TEXT NOT NULL,
+        pair_address TEXT NOT NULL,
+        token_address TEXT NOT NULL,
+        token_name TEXT,
+        token_symbol TEXT,
+        provider TEXT NOT NULL,
+        pair_created_at TEXT,
+        pair_details_json TEXT NOT NULL DEFAULT '{}',
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'quarantine',
+        UNIQUE(chain_id, pair_address)
+      )
+    `),
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_ci_radar_pairs_seen
+      ON ci_radar_pairs(first_seen_at DESC)
+    `)
 
   ]);
 }
@@ -2135,6 +2157,47 @@ async function persistRadarDiscoveries(db, discoveries) {
   return inserted;
 }
 
+
+async function persistRadarPairs(db, discoveries) {
+  let inserted = 0;
+  for (const item of discoveries) {
+    if (!item?.pair_address) continue;
+    const pairKey = (item.chain_id + ":" + item.pair_address).toLowerCase();
+    const existing = await db.prepare(
+      "SELECT pair_details_json FROM ci_radar_pairs WHERE pair_key = ?"
+    ).bind(pairKey).first();
+    const timestamp = nowISO();
+    const details = JSON.stringify(item.details || {});
+    if (!existing) {
+      await db.prepare(`
+        INSERT INTO ci_radar_pairs
+        (pair_key, chain_id, pair_address, token_address, token_name,
+         token_symbol, provider, pair_created_at, pair_details_json,
+         first_seen_at, last_seen_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'quarantine')
+      `).bind(
+        pairKey, item.chain_id, item.pair_address, item.contract_address,
+        item.token_name, item.token_symbol, item.source,
+        item.pair_created_at, details, timestamp, timestamp
+      ).run();
+      inserted++;
+    } else {
+      await db.prepare(`
+        UPDATE ci_radar_pairs
+        SET last_seen_at = ?, pair_details_json = ?,
+            token_name = COALESCE(token_name, ?),
+            token_symbol = COALESCE(token_symbol, ?),
+            pair_created_at = COALESCE(pair_created_at, ?)
+        WHERE pair_key = ?
+      `).bind(
+        timestamp, details, item.token_name, item.token_symbol,
+        item.pair_created_at, pairKey
+      ).run();
+    }
+  }
+  return inserted;
+}
+
 async function runRadarDiscovery(db) {
   await initializeBackendTables(db);
   const scanId = crypto.randomUUID();
@@ -2213,6 +2276,7 @@ async function runRadarDiscovery(db) {
   let errorSummary = null;
   try {
     inserted = await persistRadarDiscoveries(db, [...unique.values()]);
+    const discoveredPairs = await persistRadarPairs(db, discoveries);
     const successfulSources = Object.values(sourceResults).filter((value) => value.success).length;
     status = successfulSources === endpoints.length ? "completed" :
       successfulSources > 0 ? "partial" : "failed";
@@ -2237,6 +2301,7 @@ async function runRadarDiscovery(db) {
   );
   return {
     scan_id: scanId, status, newly_discovered_contracts: inserted,
+    newly_discovered_pairs: discoveredPairs,
     candidates_received: discoveries.length, sources: sourceResults,
     quarantine: true, scanned_at: startedAt, completed_at: nowISO()
   };
