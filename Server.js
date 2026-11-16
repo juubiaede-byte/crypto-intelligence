@@ -4142,7 +4142,7 @@ async function handleProtectedRoutes(request, env, ctx, route) {
       ? await db.prepare("SELECT l.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol, d.first_seen_at FROM ci_radar_asset_lifecycle l JOIN ci_radar_discoveries d ON d.discovery_key = l.discovery_key WHERE l.current_stage = ? ORDER BY l.updated_at DESC LIMIT ?").bind(stage, limit).all()
       : await db.prepare("SELECT l.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol, d.first_seen_at FROM ci_radar_asset_lifecycle l JOIN ci_radar_discoveries d ON d.discovery_key = l.discovery_key ORDER BY l.updated_at DESC LIMIT ?").bind(limit).all();
     const counts = await db.prepare("SELECT current_stage, COUNT(*) AS count FROM ci_radar_asset_lifecycle GROUP BY current_stage").all();
-    return json({ success: true, stages: RADAR_LIFECYCLE_STAGES, counts: counts.results || [], count: result.results?.length || 0, assets: result.results || [], synchronization, missing_synchronization: missingSynchronization });
+    return json({ success: true, stages: RADAR_LIFECYCLE_STAGES, counts: counts.results || [], count: result.results?.length || 0, assets: result.results || [], synchronization });
   }
 
   if (method === "GET" && path === "/api/radar/lifecycle-history") {
