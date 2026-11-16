@@ -94,6 +94,7 @@ const ARCHIVE_TABLES = [
   "ci_cache",
   "ci_provider_usage",
   "ci_radar_lp_history",
+  "ci_radar_onchain_pool_history",
   "ci_tasks",
   "ci_audit"
 ];
@@ -382,6 +383,9 @@ async function initializeBackendTables(db) {
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_onchain_pool_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT, pair_address TEXT NOT NULL, dex_id TEXT, outcome TEXT NOT NULL, checked_at TEXT NOT NULL, token0_address TEXT, token1_address TEXT, reserve0_raw TEXT, reserve1_raw TEXT, reserve0_adjusted REAL, reserve1_adjusted REAL, token0_decimals INTEGER, token1_decimals INTEGER, block_timestamp INTEGER, evidence_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_checks_discovery ON ci_radar_onchain_pool_checks(discovery_key, checked_at DESC)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_checks_pair ON ci_radar_onchain_pool_checks(chain_id, pair_address, checked_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_onchain_pool_history (snapshot_id TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT NOT NULL, pair_address TEXT NOT NULL, checked_at TEXT NOT NULL, outcome TEXT NOT NULL, token0_address TEXT, token1_address TEXT, reserve0_adjusted REAL, reserve1_adjusted REAL, token0_decimals INTEGER, token1_decimals INTEGER, block_timestamp INTEGER, previous_snapshot_id TEXT, reserve0_change_percent REAL, reserve1_change_percent REAL, risk_signal TEXT NOT NULL DEFAULT 'none', evidence_json TEXT NOT NULL DEFAULT '{}')`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_history_pair ON ci_radar_onchain_pool_history(chain_id, pair_address, checked_at DESC)`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_history_discovery ON ci_radar_onchain_pool_history(discovery_key, checked_at DESC)`)
 
   ]);
 }
@@ -2571,6 +2575,71 @@ async function verifyRadarOnchainPool(db, item, pair) {
     return { ...base, outcome: "unknown", evidence: { rpc_chain_id: rpc.chain_id, method: "eth_call" }, error_message: safeString(error.message || "Lecture on-chain impossible.", 500) };
   }
 }
+
+
+async function persistRadarOnchainPoolHistory(db, result) {
+  if (!result || result.outcome !== "onchain_reserves_read" ||
+      !(result.reserve0_adjusted > 0) || !(result.reserve1_adjusted > 0)) {
+    return { saved: false, reason: "onchain_reserves_not_verified" };
+  }
+  const previous = await db.prepare(`SELECT snapshot_id, token0_address, token1_address,
+      reserve0_adjusted, reserve1_adjusted, checked_at
+    FROM ci_radar_onchain_pool_history
+    WHERE chain_id = ? AND pair_address = ? AND outcome = 'onchain_reserves_read'
+    ORDER BY checked_at DESC LIMIT 1`)
+    .bind(result.chain_id, result.pair_address).first();
+  let reserve0Change = null;
+  let reserve1Change = null;
+  let riskSignal = "none";
+  const sameTokenOrder = previous &&
+    String(previous.token0_address || "").toLowerCase() === String(result.token0_address || "").toLowerCase() &&
+    String(previous.token1_address || "").toLowerCase() === String(result.token1_address || "").toLowerCase();
+  if (sameTokenOrder) {
+    if (Number(previous.reserve0_adjusted) > 0) {
+      reserve0Change = ((result.reserve0_adjusted / Number(previous.reserve0_adjusted)) - 1) * 100;
+    }
+    if (Number(previous.reserve1_adjusted) > 0) {
+      reserve1Change = ((result.reserve1_adjusted / Number(previous.reserve1_adjusted)) - 1) * 100;
+    }
+    if ((reserve0Change !== null && reserve0Change <= -25) ||
+        (reserve1Change !== null && reserve1Change <= -25)) {
+      riskSignal = "large_onchain_reserve_reduction_observed";
+    }
+  }
+  const snapshotId = crypto.randomUUID();
+  const evidence = {
+    source: "PublicNode eth_call",
+    reserve_values: "onchain_read",
+    previous_snapshot_comparison: Boolean(sameTokenOrder),
+    same_token_order: Boolean(sameTokenOrder),
+    interpretation: riskSignal === "none"
+      ? "Aucune baisse individuelle de réserve supérieure ou égale à 25 % observée depuis le dernier relevé comparable."
+      : "Baisse importante de réserve observée. Cela peut provenir d'un retrait de liquidité, d'un swap ou d'une autre activité; ce signal seul ne prouve pas un rug pull.",
+    previous_checked_at: sameTokenOrder ? previous.checked_at : null
+  };
+  await db.prepare(`INSERT INTO ci_radar_onchain_pool_history
+    (snapshot_id, discovery_key, chain_id, pair_address, checked_at, outcome,
+     token0_address, token1_address, reserve0_adjusted, reserve1_adjusted,
+     token0_decimals, token1_decimals, block_timestamp, previous_snapshot_id,
+     reserve0_change_percent, reserve1_change_percent, risk_signal, evidence_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      snapshotId, result.discovery_key, result.chain_id, result.pair_address,
+      result.checked_at, result.outcome, result.token0_address || null,
+      result.token1_address || null, result.reserve0_adjusted, result.reserve1_adjusted,
+      result.token0_decimals ?? null, result.token1_decimals ?? null,
+      result.block_timestamp ?? null, sameTokenOrder ? previous.snapshot_id : null,
+      reserve0Change, reserve1Change, riskSignal, JSON.stringify(evidence)
+    ).run();
+  return {
+    saved: true,
+    snapshot_id: snapshotId,
+    compared_with_previous: Boolean(sameTokenOrder),
+    reserve0_change_percent: reserve0Change,
+    reserve1_change_percent: reserve1Change,
+    risk_signal: riskSignal
+  };
+}
+
 async function runRadarOnchainPoolChecks(db, item, marketResult) {
   const pairs = Array.isArray(marketResult?.evidence?.returned_pairs) ? marketResult.evidence.returned_pairs.filter((pair) => pair?.pairAddress).slice(0, 2) : [];
   const summary = { attempted: 0, onchain_reserves_read: 0, unsupported_pair_interface: 0, unsupported_chain: 0, unknown: 0, batch_limit_per_token: 2 };
@@ -2582,6 +2651,8 @@ async function runRadarOnchainPoolChecks(db, item, marketResult) {
       result.reserve0_adjusted ?? null, result.reserve1_adjusted ?? null, result.token0_decimals ?? null, result.token1_decimals ?? null,
       result.block_timestamp ?? null, JSON.stringify(result.evidence || {}), result.error_message
     ).run();
+    const onchainHistory = await persistRadarOnchainPoolHistory(db, result);
+    result.history_snapshot = onchainHistory;
     summary.attempted++;
     if (result.outcome === "onchain_reserves_read") summary.onchain_reserves_read++;
     if (result.outcome === "unsupported_pair_interface" || result.outcome === "reserves_read_decimals_unknown") summary.unsupported_pair_interface++;
