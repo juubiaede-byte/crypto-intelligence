@@ -5681,6 +5681,139 @@ async function runRadarAICouncil(env, db, discoveryKey) {
 }
 
 
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 6 — INTELLIGENCE COLLECTIVE ET DÉTECTION D'OPPORTUNITÉS           */
+/* -------------------------------------------------------------------------- */
+
+const RADAR_COLLECTIVE_METHODOLOGY = {
+  version: "collective-v1",
+  weights: { liquidity_and_depth: 25, market_activity: 20, buy_sell_balance: 15, independent_evaluation: 20, evidence_coverage: 20 },
+  safeguards: [
+    "Un prix bas ou une hausse ne prouvent pas une sous-évaluation.",
+    "Capitalisation, FDV et offre restent inconnues si aucune donnée sourcée n'existe.",
+    "Liquidité déclarée et profondeur on-chain estimée sont deux mesures distinctes.",
+    "Une possibilité de vente inconnue n'est jamais considérée comme confirmée.",
+    "Un risque critique bloque toute qualification favorable.",
+    "Une corrélation statistique ne prouve ni causalité ni coordination."
+  ]
+};
+
+function collectiveParseJSON(value, fallback = {}) {
+  try { return typeof value === "string" ? JSON.parse(value) : value ?? fallback; }
+  catch { return fallback; }
+}
+
+function collectiveSectionValue(section, field) {
+  const item = section && section[field];
+  if (item === null || item === undefined) return null;
+  if (typeof item === "object" && !Array.isArray(item)) return item.value ?? item.normalized_value ?? null;
+  return item;
+}
+
+function collectivePearson(xs, ys) {
+  if (xs.length < 5 || xs.length !== ys.length) return null;
+  const mx = xs.reduce((a,b)=>a+b,0)/xs.length, my = ys.reduce((a,b)=>a+b,0)/ys.length;
+  let n=0, dx=0, dy=0;
+  for(let i=0;i<xs.length;i++){const x=xs[i]-mx,y=ys[i]-my;n+=x*y;dx+=x*x;dy+=y*y;}
+  const d=Math.sqrt(dx*dy);
+  return d>0?n/d:null;
+}
+
+async function runCollectiveOpportunityScan(db, requestedLimit = 100) {
+  const limit=Math.max(1,Math.min(250,Number(requestedLimit)||100));
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_collective_opportunity_runs (run_id TEXT PRIMARY KEY,status TEXT NOT NULL,assets_examined INTEGER NOT NULL DEFAULT 0,signals_created INTEGER NOT NULL DEFAULT 0,candidates_count INTEGER NOT NULL DEFAULT 0,correlations_count INTEGER NOT NULL DEFAULT 0,methodology_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_collective_opportunity_signals (signal_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,discovery_key TEXT NOT NULL,signal_type TEXT NOT NULL,severity TEXT NOT NULL,confidence_percent REAL,metrics_json TEXT NOT NULL DEFAULT '{}',evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_signals_asset ON ci_collective_opportunity_signals(discovery_key,created_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_signals_run ON ci_collective_opportunity_signals(run_id,created_at DESC)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_collective_opportunity_history (history_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,discovery_key TEXT NOT NULL,classification TEXT NOT NULL,opportunity_score REAL NOT NULL DEFAULT 0,confidence_percent REAL NOT NULL DEFAULT 0,price_change_24h REAL,activity_ratio REAL,buy_pressure REAL,liquidity_usd REAL,pool_depth_usd REAL,market_cap_usd REAL,fdv_usd REAL,circulating_supply REAL,total_supply REAL,sellability_status TEXT NOT NULL DEFAULT 'unknown',critical_risk INTEGER NOT NULL DEFAULT 0,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_history_asset ON ci_collective_opportunity_history(discovery_key,created_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_collective_history_run ON ci_collective_opportunity_history(run_id,created_at DESC)")
+  ]);
+
+  const runId=cryptoRandomId(), createdAt=nowISO();
+  const discovered=await db.prepare("SELECT discovery_key,chain_id,contract_address,token_name,token_symbol,status FROM ci_radar_discoveries ORDER BY last_seen_at DESC LIMIT ?").bind(limit).all();
+  let signalsCreated=0,candidatesCount=0;
+  const snapshotKeys=[];
+
+  for(const asset of discovered.results||[]){
+    const poolResult=await db.prepare("SELECT * FROM ci_radar_pool_metrics WHERE discovery_key = ? ORDER BY observed_at DESC LIMIT 20").bind(asset.discovery_key).all();
+    const byPair=new Map();
+    for(const row of poolResult.results||[]) if(!byPair.has(row.pair_address)) byPair.set(row.pair_address,row);
+    const pairs=[...byPair.values()], metricRows=pairs.map(row=>collectiveParseJSON(row.evidence_json,{}));
+    const sum=field=>pairs.length?pairs.reduce((n,row)=>n+(radarFiniteMetric(row[field])||0),0):null;
+    const liquidity=sum("liquidity_usd"),volume=sum("volume_24h_usd"),buys=sum("buys_24h"),sells=sum("sells_24h");
+    const activityRatio=liquidity>0&&volume!==null?volume/liquidity:null;
+    const buyPressure=buys!==null&&sells!==null&&buys+sells>0?buys/(buys+sells):null;
+    const changes=metricRows.map(x=>radarFiniteMetric(x.price_change_24h_percent)).filter(x=>x!==null);
+    const priceChange=changes.length?changes.reduce((a,b)=>a+b,0)/changes.length:null;
+    const caps=metricRows.map(x=>radarFiniteMetric(x.market_cap_usd)).filter(x=>x!==null);
+    const fdvs=metricRows.map(x=>radarFiniteMetric(x.fdv_usd)).filter(x=>x!==null);
+    const marketCap=caps.length?Math.max(...caps):null,fdv=fdvs.length?Math.max(...fdvs):null;
+
+    const depth=await db.prepare("SELECT estimated_pool_depth_usd,checked_at FROM ci_radar_onchain_liquidity_assessments WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT 1").bind(asset.discovery_key).first();
+    const poolDepth=radarFiniteMetric(depth?.estimated_pool_depth_usd);
+    const evaluation=await db.prepare("SELECT overall_score,coverage_percent,confidence_percent,evaluation_status,critical_risk,risk_flags_json,evaluated_at FROM ci_investment_evaluations WHERE discovery_key = ? ORDER BY evaluated_at DESC LIMIT 1").bind(asset.discovery_key).first();
+    const report=await db.prepare("SELECT sections_json,coverage_percent,confidence_percent,report_version,updated_at FROM ci_investigation_reports WHERE discovery_key = ? ORDER BY report_version DESC,updated_at DESC LIMIT 1").bind(asset.discovery_key).first();
+    const sections=collectiveParseJSON(report?.sections_json,{});
+    const tokenomics=sections.tokenomics||{},liquiditySection=sections.liquidity_market||{};
+    const circulating=radarFiniteMetric(collectiveSectionValue(tokenomics,"circulating_supply"));
+    const totalSupply=radarFiniteMetric(collectiveSectionValue(tokenomics,"total_supply")??collectiveSectionValue(tokenomics,"max_supply"));
+    const sellabilityRaw=collectiveSectionValue(liquiditySection,"sellability");
+    const sellability=typeof sellabilityRaw==="boolean"?(sellabilityRaw?"reported_sellable_unverified":"reported_unsellable_unverified"):safeString(sellabilityRaw||"unknown",80);
+    const riskFlags=collectiveParseJSON(evaluation?.risk_flags_json,[]);
+    const critical=Number(evaluation?.critical_risk)===1||(Array.isArray(riskFlags)&&riskFlags.some(x=>/honeypot|cannot.?sell|rug.?pull|scam|malicious|critical/i.test(typeof x==="string"?x:JSON.stringify(x))));
+    
+    const liquidityScore=poolDepth!==null&&liquidity!==null?Math.min(25,Math.max(0,Math.log10(Math.max(1,poolDepth))*2.5+Math.log10(Math.max(1,liquidity))*1.5)):liquidity!==null?Math.min(12,Math.log10(Math.max(1,liquidity))*2):0;
+    const activityScore=activityRatio!==null?Math.min(20,Math.max(0,activityRatio*4)):0;
+    const balanceScore=buyPressure!==null?Math.min(15,Math.max(0,(1-Math.abs(buyPressure-.55)/.55)*15)):0;
+    const evaluationScore=evaluation?Math.min(20,Math.max(0,Number(evaluation.overall_score||0)*.2)):0;
+    const coverage=radarFiniteMetric(evaluation?.coverage_percent??report?.coverage_percent)||0;
+    const evidenceScore=Math.min(20,Math.max(0,coverage*.2));
+    const score=Math.round((liquidityScore+activityScore+balanceScore+evaluationScore+evidenceScore)*100)/100;
+    const observed=[liquidity,volume,buys,sells,poolDepth,marketCap,fdv,circulating,totalSupply].filter(x=>x!==null).length;
+    const confidence=Math.round(Math.min(100,observed/9*65+(evaluation?Number(evaluation.confidence_percent||0)*.35:0)));
+    const classification=critical?"blocked_critical_risk":(score>=60&&evaluation?.evaluation_status==="eligible"&&poolDepth!==null&&sellability==="reported_sellable_unverified"?"watchlist_candidate_requires_verification":"research_needed");
+    if(classification==="watchlist_candidate_requires_verification")candidatesCount++;
+    const metrics={liquidity_usd_provider_reported:liquidity,pool_depth_usd_onchain_estimate:poolDepth,volume_24h_usd_provider_reported:volume,buys_24h:buys,sells_24h:sells,buy_pressure_ratio:buyPressure,volume_to_liquidity_ratio:activityRatio,price_change_24h_percent_context_only:priceChange,market_cap_usd:marketCap,fdv_usd:fdv,circulating_supply:circulating,total_or_max_supply:totalSupply,sellability_status:sellability,investment_evaluation:evaluation||null};
+    const evidence={asset:{discovery_key:asset.discovery_key,chain_id:asset.chain_id,contract_address:asset.contract_address,name:asset.token_name,symbol:asset.token_symbol,stage:asset.status},sources:[...new Set(pairs.map(x=>x.source).filter(Boolean))],metrics,report_version:report?.report_version||null,report_updated_at:report?.updated_at||null,methodology:RADAR_COLLECTIVE_METHODOLOGY.version,limitations:["Liquidité déclarée par fournisseur; profondeur estimée séparément.","Vente non vérifiée par ce moteur.","Score de tri, pas valeur intrinsèque ni conseil d'achat."]};
+    const addSignal=async(type,severity,conf,detail)=>{await db.prepare("INSERT INTO ci_collective_opportunity_signals (signal_id,run_id,discovery_key,signal_type,severity,confidence_percent,metrics_json,evidence_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(cryptoRandomId(),runId,asset.discovery_key,type,severity,conf,JSON.stringify(metrics),JSON.stringify(detail),createdAt).run();signalsCreated++;};
+    if(buys!==null&&sells!==null&&buys+sells>=10&&buyPressure>=.75)await addSignal("buy_pressure_anomaly","watch",Math.min(85,Math.round(50+(buyPressure-.75)*100)),{buys_24h:buys,sells_24h:sells,note:"Déséquilibre de transactions, pas preuve d'accumulation nette."});
+    if(activityRatio!==null&&activityRatio>=3&&liquidity>0)await addSignal("volume_liquidity_dislocation","watch",60,{volume_to_liquidity_ratio:activityRatio,note:"Peut signaler activité réelle, liquidité faible ou wash trading; vérification requise."});
+    if(priceChange!==null&&Math.abs(priceChange)>=25)await addSignal("large_price_move_context","context",55,{price_change_24h_percent:priceChange,note:"Contexte de marché uniquement; ne prouve pas une sous-évaluation."});
+    if(critical)await addSignal("critical_risk_veto","critical",95,{risk_flags:riskFlags,note:"Risque critique: bloque toute qualification favorable."});
+    await db.prepare(`INSERT INTO ci_collective_opportunity_history (history_id,run_id,discovery_key,classification,opportunity_score,confidence_percent,price_change_24h,activity_ratio,buy_pressure,liquidity_usd,pool_depth_usd,market_cap_usd,fdv_usd,circulating_supply,total_supply,sellability_status,critical_risk,evidence_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+      cryptoRandomId(),runId,asset.discovery_key,classification,score,confidence,priceChange,activityRatio,buyPressure,liquidity,poolDepth,marketCap,fdv,circulating,totalSupply,sellability,critical?1:0,JSON.stringify(evidence),createdAt
+    ).run();
+    snapshotKeys.push(asset.discovery_key);
+  }
+
+  // Corrélations de rendements: minimum cinq scans communs et seuil absolu 0,80.
+  let correlations=0;
+  const keys=snapshotKeys.slice(0,40);
+  if(keys.length>=2){
+    const marks=keys.map(()=>"?").join(",");
+    const rows=await db.prepare("SELECT run_id,discovery_key,price_change_24h FROM ci_collective_opportunity_history WHERE discovery_key IN ("+marks+") AND price_change_24h IS NOT NULL ORDER BY created_at DESC LIMIT 2000").bind(...keys).all();
+    const series=new Map();
+    for(const row of rows.results||[]){if(!series.has(row.discovery_key))series.set(row.discovery_key,new Map());if(!series.get(row.discovery_key).has(row.run_id))series.get(row.discovery_key).set(row.run_id,Number(row.price_change_24h));}
+    const ids=[...series.keys()];
+    for(let i=0;i<ids.length;i++)for(let j=i+1;j<ids.length;j++){
+      const left=series.get(ids[i]),right=series.get(ids[j]),common=[...left.keys()].filter(k=>right.has(k)).slice(0,20);
+      if(common.length<5)continue;
+      const coefficient=collectivePearson(common.map(k=>left.get(k)),common.map(k=>right.get(k)));
+      if(coefficient===null||Math.abs(coefficient)<.8)continue;
+      const detail={correlation_type:"pearson_price_change_24h",coefficient:Math.round(coefficient*1000)/1000,common_observations:common.length,discovery_keys:[ids[i],ids[j]],note:"Association historique descriptive, sans preuve de causalité ni de coordination."};
+      await db.prepare("INSERT INTO ci_collective_opportunity_signals (signal_id,run_id,discovery_key,signal_type,severity,confidence_percent,metrics_json,evidence_json,created_at) VALUES (?,?,?,'cross_asset_price_correlation','research',?,'{}',?,?)").bind(cryptoRandomId(),runId,ids[i],Math.round(Math.abs(coefficient)*100),JSON.stringify(detail),createdAt).run();
+      correlations++;signalsCreated++;
+    }
+  }
+  await db.prepare("INSERT INTO ci_collective_opportunity_runs (run_id,status,assets_examined,signals_created,candidates_count,correlations_count,methodology_json,created_at) VALUES (?, 'completed', ?, ?, ?, ?, ?, ?)").bind(runId,snapshotKeys.length,signalsCreated,candidatesCount,correlations,JSON.stringify(RADAR_COLLECTIVE_METHODOLOGY),createdAt).run();
+  await audit(db,"collective_opportunity_scan_completed",runId+" — "+snapshotKeys.length+" actifs examinés; "+signalsCreated+" signaux.");
+  return {run_id:runId,status:"completed",assets_examined:snapshotKeys.length,signals_created:signalsCreated,watchlist_candidates:candidatesCount,historical_correlations:correlations,created_at:createdAt,methodology:RADAR_COLLECTIVE_METHODOLOGY,note:"Pistes de recherche documentées, jamais recommandations d'achat ni preuves de sous-évaluation."};
+}
+
+
 export default {
   async fetch(request, env, ctx) {
     const response = await handleRequest(request, env, ctx);
