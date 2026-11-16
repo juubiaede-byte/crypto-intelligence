@@ -9289,3 +9289,21 @@ handleProtectedRoutes=async function(request,env,ctx,route){
   }
   return await ciChapter17PreviousProtectedRoutes(request,env,ctx,route);
 };
+
+
+/* Avant chaque sauvegarde complète, initialise et inscrit les modules persistants
+   connus dans la liste blanche R2 afin d'éviter une archive partielle par oubli. */
+const ciChapter17CreateArchiveWithModuleRegistration=createDatabaseArchive;
+createDatabaseArchive=async function(db,env){
+  await initializeBackendTables(db);
+  await ensureRadarWalletTables(db);
+  await ensureConanAdaptiveObservationTables(db);
+  await ensureConanIncubatorTables(db);
+  await ensureConanOwnedCodeWorkspace(db);
+  await ensureConanMemoryTables(db);
+  await ensureCIProviderManagementTables(db);
+  await ensureCIProviderOrchestratorTables(db);
+  await ensureCITelegramTables(db);
+  await ensureCIHistoryTables(db);
+  return await ciChapter17CreateArchiveWithModuleRegistration(db,env);
+};
