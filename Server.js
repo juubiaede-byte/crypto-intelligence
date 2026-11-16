@@ -9307,3 +9307,165 @@ createDatabaseArchive=async function(db,env){
   await ensureCIHistoryTables(db);
   return await ciChapter17CreateArchiveWithModuleRegistration(db,env);
 };
+
+
+/* ============================================================
+   CHAPITRE 19 — FIABILITÉ, TRANSPARENCE ET QUALITÉ DES DONNÉES
+   Registre append-only des observations, preuves et incertitudes.
+   Aucune donnée absente n'est transformée en valeur supposée.
+   ============================================================ */
+const CI_CHAPTER19_RELIABILITY_TRANSPARENCY_V1 = "ci-reliability-transparency-v1";
+
+async function ensureCIReliabilityTables(db){
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_reliability_observations (
+      observation_id TEXT PRIMARY KEY,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      field_key TEXT NOT NULL,
+      value_json TEXT,
+      evidence_kind TEXT NOT NULL,
+      source_name TEXT,
+      source_ref TEXT,
+      observed_at TEXT,
+      recorded_at TEXT NOT NULL,
+      retrieval_mode TEXT NOT NULL DEFAULT 'unknown',
+      max_age_seconds INTEGER,
+      confidence_percent REAL,
+      uncertainty_json TEXT NOT NULL DEFAULT '[]',
+      missing_reason TEXT,
+      conflict_group TEXT,
+      methodology_version TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_reliability_entity ON ci_reliability_observations(entity_type,entity_id,field_key,recorded_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_reliability_conflict ON ci_reliability_observations(conflict_group,recorded_at DESC)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_reliability_reviews (
+      review_id TEXT PRIMARY KEY,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      review_status TEXT NOT NULL,
+      reviewed_fields_json TEXT NOT NULL DEFAULT '[]',
+      missing_fields_json TEXT NOT NULL DEFAULT '[]',
+      conflict_fields_json TEXT NOT NULL DEFAULT '[]',
+      stale_fields_json TEXT NOT NULL DEFAULT '[]',
+      review_notes TEXT,
+      reviewed_at TEXT NOT NULL,
+      methodology_version TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_reliability_reviews_entity ON ci_reliability_reviews(entity_type,entity_id,reviewed_at DESC)")
+  ]);
+}
+
+function ciReliabilityParseJSON(value,fallback=null){
+  try{return value===null||value===undefined?fallback:JSON.parse(value);}catch{return fallback;}
+}
+
+function ciReliabilityNormalizeObservation(body){
+  const entityType=safeString(body?.entity_type,60);
+  const entityId=safeString(body?.entity_id,200);
+  const fieldKey=safeString(body?.field_key,120);
+  const kind=safeString(body?.evidence_kind||"observation",30).toLowerCase();
+  const allowedKinds=["fact","observation","hypothesis","missing","conflict"];
+  if(!entityType||!entityId||!fieldKey) throw new Error("entity_type, entity_id et field_key sont obligatoires.");
+  if(!allowedKinds.includes(kind)) throw new Error("evidence_kind doit être fact, observation, hypothesis, missing ou conflict.");
+  const mode=safeString(body?.retrieval_mode||"unknown",20).toLowerCase();
+  if(!["live","cache","archive","manual","unknown"].includes(mode)) throw new Error("retrieval_mode invalide.");
+  const confidence=body?.confidence_percent===undefined||body?.confidence_percent===null?null:Number(body.confidence_percent);
+  if(confidence!==null&&(!Number.isFinite(confidence)||confidence<0||confidence>100)) throw new Error("confidence_percent doit être compris entre 0 et 100.");
+  const maxAge=body?.max_age_seconds===undefined||body?.max_age_seconds===null?null:Number(body.max_age_seconds);
+  if(maxAge!==null&&(!Number.isInteger(maxAge)||maxAge<0)) throw new Error("max_age_seconds doit être un entier positif ou nul.");
+  const sourceName=safeString(body?.source_name,120)||null;
+  const sourceRef=safeString(body?.source_ref,1000)||null;
+  if((kind==="fact"||kind==="observation")&&!sourceName&&!sourceRef) throw new Error("Une observation factuelle doit indiquer sa source.");
+  const observedAt=safeString(body?.observed_at,50)||null;
+  if(observedAt&&Number.isNaN(Date.parse(observedAt))) throw new Error("observed_at doit être une date lisible.");
+  const uncertainty=Array.isArray(body?.uncertainty)?body.uncertainty.slice(0,30).map(v=>safeString(v,300)).filter(Boolean):[];
+  const missingReason=kind==="missing"?(safeString(body?.missing_reason,500)||"Donnée non disponible"):null;
+  const value=kind==="missing"?null:(body?.value===undefined?null:body.value);
+  return {entityType,entityId,fieldKey,kind,mode,confidence,maxAge,sourceName,sourceRef,observedAt,uncertainty,missingReason,value,conflictGroup:safeString(body?.conflict_group,160)||null};
+}
+
+async function recordCIReliabilityObservation(db,body){
+  await ensureCIReliabilityTables(db);
+  const item=ciReliabilityNormalizeObservation(body||{});
+  const id=crypto.randomUUID();
+  const recordedAt=nowISO();
+  await db.prepare(`INSERT INTO ci_reliability_observations
+    (observation_id,entity_type,entity_id,field_key,value_json,evidence_kind,source_name,source_ref,observed_at,recorded_at,retrieval_mode,max_age_seconds,confidence_percent,uncertainty_json,missing_reason,conflict_group,methodology_version)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+      id,item.entityType,item.entityId,item.fieldKey,item.value===null?null:JSON.stringify(item.value),
+      item.kind,item.sourceName,item.sourceRef,item.observedAt,recordedAt,item.mode,item.maxAge,item.confidence,
+      JSON.stringify(item.uncertainty),item.missingReason,item.conflictGroup,CI_CHAPTER19_RELIABILITY_TRANSPARENCY_V1
+    ).run();
+  return {observation_id:id,entity_type:item.entityType,entity_id:item.entityId,field_key:item.fieldKey,evidence_kind:item.kind,source_name:item.sourceName,source_ref:item.sourceRef,observed_at:item.observedAt,recorded_at:recordedAt,retrieval_mode:item.mode,confidence_percent:item.confidence,uncertainty:item.uncertainty,missing_reason:item.missingReason,methodology_version:CI_CHAPTER19_RELIABILITY_TRANSPARENCY_V1};
+}
+
+async function getCIReliabilityObservations(db,options={}){
+  await ensureCIReliabilityTables(db);
+  const entityType=safeString(options.entity_type,60);
+  const entityId=safeString(options.entity_id,200);
+  const fieldKey=safeString(options.field_key,120);
+  const limit=Math.max(1,Math.min(500,Number(options.limit)||100));
+  if(!entityType||!entityId) throw new Error("entity_type et entity_id sont obligatoires.");
+  let sql="SELECT * FROM ci_reliability_observations WHERE entity_type=? AND entity_id=?";
+  const bindings=[entityType,entityId];
+  if(fieldKey){sql+=" AND field_key=?";bindings.push(fieldKey);}
+  sql+=" ORDER BY recorded_at DESC LIMIT ?";
+  bindings.push(limit);
+  const result=await db.prepare(sql).bind(...bindings).all();
+  const now=Date.now();
+  const observations=(result.results||[]).map(row=>{
+    const age=row.observed_at?Math.max(0,Math.floor((now-Date.parse(row.observed_at))/1000)):null;
+    const stale=row.max_age_seconds!==null&&row.max_age_seconds!==undefined&&age!==null?age>Number(row.max_age_seconds):false;
+    return {...row,value:ciReliabilityParseJSON(row.value_json),uncertainty:ciReliabilityParseJSON(row.uncertainty_json,[]),age_seconds:age,is_stale:stale};
+  });
+  const fields={};
+  for(const item of observations){
+    if(!fields[item.field_key]) fields[item.field_key]={latest:item,observations:0,has_conflict:false,has_missing:false,has_hypothesis:false};
+    const state=fields[item.field_key];state.observations++;
+    if(item.evidence_kind==="conflict")state.has_conflict=true;
+    if(item.evidence_kind==="missing")state.has_missing=true;
+    if(item.evidence_kind==="hypothesis")state.has_hypothesis=true;
+  }
+  return {entity_type:entityType,entity_id:entityId,count:observations.length,fields,observations,methodology_version:CI_CHAPTER19_RELIABILITY_TRANSPARENCY_V1};
+}
+
+async function reviewCIReliabilityEntity(db,body){
+  const entityType=safeString(body?.entity_type,60),entityId=safeString(body?.entity_id,200);
+  if(!entityType||!entityId) throw new Error("entity_type et entity_id sont obligatoires.");
+  const data=await getCIReliabilityObservations(db,{entity_type:entityType,entity_id:entityId,limit:500});
+  const fields=data.fields;
+  const missing=Object.keys(fields).filter(k=>fields[k].latest.evidence_kind==="missing"||fields[k].has_missing);
+  const conflicts=Object.keys(fields).filter(k=>fields[k].has_conflict);
+  const stale=Object.keys(fields).filter(k=>fields[k].latest.is_stale);
+  const hypotheses=Object.keys(fields).filter(k=>fields[k].latest.evidence_kind==="hypothesis");
+  const reviewed=Object.keys(fields).filter(k=>fields[k].latest.evidence_kind==="fact"||fields[k].latest.evidence_kind==="observation");
+  const status=conflicts.length?"conflicting":missing.length||stale.length?"incomplete":hypotheses.length?"contains_hypotheses":reviewed.length?"evidence_recorded":"no_evidence";
+  const id=crypto.randomUUID(),at=nowISO();
+  await db.prepare(`INSERT INTO ci_reliability_reviews
+    (review_id,entity_type,entity_id,review_status,reviewed_fields_json,missing_fields_json,conflict_fields_json,stale_fields_json,review_notes,reviewed_at,methodology_version)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).bind(id,entityType,entityId,status,JSON.stringify(reviewed),JSON.stringify(missing),JSON.stringify(conflicts),JSON.stringify(stale),safeString(body?.review_notes,1000)||null,at,CI_CHAPTER19_RELIABILITY_TRANSPARENCY_V1).run();
+  return {review_id:id,entity_type:entityType,entity_id:entityId,review_status:status,reviewed_fields:reviewed,missing_fields:missing,conflict_fields:conflicts,stale_fields:stale,hypothesis_fields:hypotheses,reviewed_at:at,warning:"Cette revue résume uniquement les observations enregistrées dans ce registre; elle ne certifie pas indépendamment les sources ni la vérité des valeurs."};
+}
+
+const ciChapter19PreviousProtectedRoutes=handleProtectedRoutes;
+handleProtectedRoutes=async function(request,env,ctx,route){
+  const {path,method}=route;
+  const paths=["/api/reliability/observations","/api/reliability/review"];
+  if(paths.includes(path)){
+    const db=getDB(env);await initializeBackendTables(db);await ensureCIReliabilityTables(db);
+    if(method==="POST"&&path==="/api/reliability/observations"){
+      try{return json({success:true,observation:await recordCIReliabilityObservation(db,await request.json())},201);}
+      catch(error){return errorResponse(safeString(error.message||"Observation invalide.",1000),400);}
+    }
+    if(method==="GET"&&path==="/api/reliability/observations"){
+      try{const url=new URL(request.url);return json({success:true,...await getCIReliabilityObservations(db,{entity_type:url.searchParams.get("entity_type"),entity_id:url.searchParams.get("entity_id"),field_key:url.searchParams.get("field_key"),limit:url.searchParams.get("limit")})});}
+      catch(error){return errorResponse(safeString(error.message||"Lecture impossible.",1000),400);}
+    }
+    if(method==="POST"&&path==="/api/reliability/review"){
+      try{return json({success:true,review:await reviewCIReliabilityEntity(db,await request.json())},201);}
+      catch(error){return errorResponse(safeString(error.message||"Revue impossible.",1000),400);}
+    }
+  }
+  return await ciChapter19PreviousProtectedRoutes(request,env,ctx,route);
+};
