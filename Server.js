@@ -7527,15 +7527,15 @@ function validateConanOwnedCodeSource(source){
   if(!code.trim())issues.push("Le code ne peut pas être vide.");
   if(code.length>30000)issues.push("La taille maximale d'une révision est de 30 000 caractères.");
   const forbidden=[
-    {pattern:/\beval\s*\(/i,label:"eval"},
-    {pattern:/\bnew\s+Function\s*\(/i,label:"Function constructor"},
-    {pattern:/\bimport\s*\(/i,label:"dynamic import"},
-    {pattern:/\bfetch\s*\(/i,label:"network fetch"},
-    {pattern:/\bglobalThis\b/i,label:"globalThis"},
-    {pattern:/\bprocess\b/i,label:"process"},
-    {pattern:/\brequire\s*\(/i,label:"require"},
-    {pattern:/\bDeno\b/i,label:"Deno"},
-    {pattern:/\bWebAssembly\b/i,label:"WebAssembly"}
+    {pattern:/\\beval\\s*\\(/i,label:"eval"},
+    {pattern:/\\bnew\\s+Function\\s*\\(/i,label:"Function constructor"},
+    {pattern:/\\bimport\\s*\\(/i,label:"dynamic import"},
+    {pattern:/\\bfetch\\s*\\(/i,label:"network fetch"},
+    {pattern:/\\bglobalThis\\b/i,label:"globalThis"},
+    {pattern:/\\bprocess\\b/i,label:"process"},
+    {pattern:/\\brequire\\s*\\(/i,label:"require"},
+    {pattern:/\\bDeno\\b/i,label:"Deno"},
+    {pattern:/\\bWebAssembly\\b/i,label:"WebAssembly"}
   ];
   for(const item of forbidden)if(item.pattern.test(code))issues.push("API non autorisée dans l'espace de code isolé : "+item.label+".");
   return {valid:issues.length===0,issues,source_characters:code.length,execution_status:"not_executable_by_application_worker",note:"Validation statique uniquement; aucune exécution de code arbitraire n'est autorisée."};
@@ -7665,3 +7665,26 @@ handleProtectedRoutes = async function(request,env,ctx,route){
   }
   return await conanChapter12BeforeOwnedCodeWorkspace(request,env,ctx,route);
 };
+
+
+// Corrected final validator declaration; later function declaration takes precedence
+// while preserving every previously committed line (append-only chapter history).
+function validateConanOwnedCodeSource(source){
+  const code=String(source??"");
+  const issues=[];
+  if(!code.trim())issues.push("Le code ne peut pas être vide.");
+  if(code.length>30000)issues.push("La taille maximale d'une révision est de 30 000 caractères.");
+  const forbidden=[
+    {pattern:/\beval\s*\(/i,label:"eval"},
+    {pattern:/\bnew\s+Function\s*\(/i,label:"Function constructor"},
+    {pattern:/\bimport\s*\(/i,label:"dynamic import"},
+    {pattern:/\bfetch\s*\(/i,label:"network fetch"},
+    {pattern:/\bglobalThis\b/i,label:"globalThis"},
+    {pattern:/\bprocess\b/i,label:"process"},
+    {pattern:/\brequire\s*\(/i,label:"require"},
+    {pattern:/\bDeno\b/i,label:"Deno"},
+    {pattern:/\bWebAssembly\b/i,label:"WebAssembly"}
+  ];
+  for(const item of forbidden)if(item.pattern.test(code))issues.push("API non autorisée dans l'espace de code isolé : "+item.label+".");
+  return {valid:issues.length===0,issues,source_characters:code.length,execution_status:"not_executable_by_application_worker",note:"Validation statique uniquement; aucune exécution de code arbitraire n'est autorisée."};
+}
