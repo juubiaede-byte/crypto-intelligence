@@ -8285,3 +8285,65 @@ handleProtectedRoutes = async function(request,env,ctx,route){
   }
   return await ciChapter14PreviousRoutes(request,env,ctx,route);
 };
+
+
+/* Adaptateurs de lecture contrôlée pour les nouvelles sources du catalogue. */
+async function fetchCIProviderReferenceData(db,env,body){
+  await ensureCIProviderManagementTables(db);
+  const id=safeString(body.provider_id||"",60).toLowerCase();
+  const operation=safeString(body.operation||"",60).toLowerCase();
+  const config=await db.prepare("SELECT enabled,authorized FROM ci_provider_registry WHERE provider_id=?").bind(id).first();
+  if(!config||!config.enabled||!config.authorized)throw new Error("Source non autorisée ou désactivée.");
+  const cacheKey="ci-provider-data:"+id+":"+operation+":"+safeString(body.symbol||"",20).toUpperCase();
+  const cached=await cacheGet(db,cacheKey);
+  if(cached)return {...cached,cached:true};
+  const started=Date.now();
+  let result,statusCode=200;
+  if(id==="defillama"&&operation==="protocols"){
+    const response=await externalJSON("https://api.llama.fi/protocols");statusCode=response.status;
+    result={provider:id,operation,data:Array.isArray(response.data)?response.data:[],fetched_at:nowISO(),cached:false};
+  }else if(id==="blockscout"&&operation==="stats"){
+    const response=await externalJSON("https://eth.blockscout.com/api/v2/stats");statusCode=response.status;
+    result={provider:id,operation,data:response.data,fetched_at:nowISO(),cached:false};
+  }else if(id==="etherscan"&&operation==="latest_block"){
+    if(!env.ETHERSCAN_API_KEY)throw new Error("Secret ETHERSCAN_API_KEY absent des secrets Worker.");
+    const endpoint=new URL("https://api.etherscan.io/v2/api");endpoint.searchParams.set("chainid","1");endpoint.searchParams.set("module","proxy");endpoint.searchParams.set("action","eth_blockNumber");endpoint.searchParams.set("apikey",env.ETHERSCAN_API_KEY);
+    const response=await externalJSON(endpoint.toString());statusCode=response.status;
+    if(!response.data.result)throw new Error(safeString(response.data.message||response.data.result||"Réponse Etherscan sans numéro de bloc.",500));
+    result={provider:id,operation,chain_id:"1",block_number_hex:response.data.result,fetched_at:nowISO(),cached:false};
+  }else if(id==="coinmarketcap"&&operation==="quotes_latest"){
+    if(!env.COINMARKETCAP_API_KEY)throw new Error("Secret COINMARKETCAP_API_KEY absent des secrets Worker.");
+    const symbol=safeString(body.symbol||"",20).toUpperCase();
+    if(!/^[A-Z0-9]{2,20}$/.test(symbol))throw new Error("Un symbole de crypto-actif valide est obligatoire.");
+    const endpoint=new URL("https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest");endpoint.searchParams.set("symbol",symbol);endpoint.searchParams.set("convert","USD");
+    const response=await externalJSON(endpoint.toString(),{headers:{"X-CMC_PRO_API_KEY":env.COINMARKETCAP_API_KEY}});statusCode=response.status;
+    result={provider:id,operation,symbol,data:response.data.data||null,fetched_at:nowISO(),cached:false};
+  }else{
+    throw new Error("Opération non prise en charge pour ce fournisseur. Aucune autre chaîne n'est ajoutée.");
+  }
+  const latency=Date.now()-started,timestamp=nowISO();
+  await cacheSet(db,cacheKey,result,id==="defillama"?300:60);
+  await db.prepare("INSERT INTO ci_provider_usage_metrics (metric_id,provider_id,operation,success,status_code,latency_ms,created_at) VALUES (?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),id,operation,1,statusCode,latency,timestamp
+  ).run();
+  return {...result,latency_ms:latency};
+}
+
+const ciChapter14DashboardBeforeMonthly = getCIProviderDashboard;
+getCIProviderDashboard = async function(db,env){
+  const dashboard=await ciChapter14DashboardBeforeMonthly(db,env);
+  const monthly=await db.prepare("SELECT provider_id,COUNT(*) AS calls,SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS successes,SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failures FROM ci_provider_usage_metrics WHERE created_at>=? GROUP BY provider_id").bind(new Date(Date.now()-30*86400000).toISOString()).all();
+  const monthlyMap=new Map((monthly.results||[]).map(row=>[row.provider_id,row]));
+  dashboard.providers=dashboard.providers.map(item=>({...item,calls_last_30d:Number(monthlyMap.get(item.id)?.calls)||0,successes_last_30d:Number(monthlyMap.get(item.id)?.successes)||0,failures_last_30d:Number(monthlyMap.get(item.id)?.failures)||0}));
+  return dashboard;
+};
+
+const ciChapter14RoutesBeforeData = handleProtectedRoutes;
+handleProtectedRoutes = async function(request,env,ctx,route){
+  if(route.path==="/api/providers/data"&&route.method==="POST"){
+    const db=getDB(env);await initializeBackendTables(db);await ensureCIProviderManagementTables(db);
+    try{return json({success:true,...await fetchCIProviderReferenceData(db,env,await readBody(request))});}
+    catch(error){return errorResponse(safeString(error.message||"Lecture fournisseur impossible.",1000),400);}
+  }
+  return await ciChapter14RoutesBeforeData(request,env,ctx,route);
+};
