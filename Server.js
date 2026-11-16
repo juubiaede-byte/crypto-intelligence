@@ -4936,7 +4936,9 @@ function normalizeRadarInvestmentEvidence(value) {
 function calculateRadarInvestmentEvaluation(body) {
   const supplied = body.criteria && typeof body.criteria === "object" && !Array.isArray(body.criteria) ? body.criteria : {};
   const riskFlags = Array.isArray(body.risk_flags) ? body.risk_flags.map(item => safeString(item, 300)).filter(Boolean).slice(0, 50) : [];
-  const criticalRisk = body.critical_risk === true || safeString(body.risk_level || "", 40).toLowerCase() === "critical";
+  const criticalRiskFlags = new Set(["is_honeypot", "honeypot_confirmed", "cannot_sell", "cannot_sell_all", "confirmed_scam", "confirmed_rug_pull", "malicious_contract"]);
+  const criticalRiskFromFlags = riskFlags.some(flag => criticalRiskFlags.has(flag.toLowerCase().replace(/[\\s-]+/g, "_")));
+  const criticalRisk = body.critical_risk === true || safeString(body.risk_level || "", 40).toLowerCase() === "critical" || criticalRiskFromFlags;
   const criteria = {};
   const evidence = {};
   const missing = [];
@@ -4969,6 +4971,7 @@ function calculateRadarInvestmentEvaluation(body) {
   if (criticalRisk) status = "blocked_critical_risk";
   else if (overallScore < 50 && coverage >= 50) status = "not_recommended";
   else if (overallScore >= 70 && coverage >= 80 && confidence >= 60 &&
+    criteria.security.status === "assessed" && criteria.liquidity.status === "assessed" &&
     (lifecycleStage === "investigation_lab" || lifecycleStage === "potential_investment_circle")) status = "eligible";
   else if (coverage >= 50) status = "watchlist_review";
   return {
@@ -4986,7 +4989,9 @@ function calculateRadarInvestmentEvaluation(body) {
       eligible_score_minimum: 70,
       eligible_coverage_minimum_percent: 80,
       eligible_confidence_minimum_percent: 60,
-      critical_risk_blocks_entry: true
+      mandatory_criteria: ["security", "liquidity"],
+      critical_risk_blocks_entry: true,
+      auto_blocked_risk_flags: [...criticalRiskFlags]
     },
     interpretation: "Le score est la somme des contributions pondérées sur 100; un critère absent contribue zéro. La couverture indique le poids des critères réellement documentés. La confiance est pondérée puis réduite par la couverture. Une donnée manquante n'est jamais assimilée à une preuve positive."
   };
