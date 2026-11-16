@@ -1399,6 +1399,7 @@ async function restoreDatabaseArchive(
   }
 
   const safetyBackup = await createDatabaseArchive(db, env);
+  let batchCommitted = false;
 
   try {
     const freshPreview = await previewDatabaseArchive(
@@ -1616,6 +1617,7 @@ async function restoreDatabaseArchive(
     );
 
     await db.batch(statements);
+    batchCommitted = true;
 
     const postRestorePreview = await previewDatabaseArchive(
       db,
@@ -1681,8 +1683,8 @@ async function restoreDatabaseArchive(
       success: false,
       application: APP_NAME,
       operation: "archive_restore",
-      restoration_executed: false,
-      database_modified: false,
+      restoration_executed: batchCommitted,
+      database_modified: batchCommitted && plannedInsertRows > 0,
       archive: {
         snapshot_key: loaded.snapshotKey,
         checksum: loaded.verification.expected_checksum
