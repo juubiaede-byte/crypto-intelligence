@@ -94,6 +94,10 @@
     Prévisualiser la restauration (sans modifier D1)
   </button>
 
+
+  <button id="restore" class="danger">
+    Restaurer une archive (confirmation obligatoire)
+  </button>
   <button id="clear" class="danger">Effacer la clé de cette page</button>
 
   <h2>Résultat</h2>
@@ -303,6 +307,68 @@
         },
         preview: result
       };
+    });
+  });
+
+
+
+  document.getElementById("restore").addEventListener("click", () => {
+    run(null, async () => {
+      const archive = await getLatestArchive();
+
+      const accepted = window.confirm(
+        "ATTENTION : une restauration va insérer uniquement les lignes absentes. " +
+        "Aucune ligne existante ne sera écrasée ni supprimée. " +
+        "Une sauvegarde de sécurité sera créée avant l'opération. Continuer ?"
+      );
+
+      if (!accepted) {
+        return { message: "Restauration annulée. Aucune modification D1 effectuée." };
+      }
+
+      const confirmation = window.prompt(
+        "Pour confirmer, saisis exactement : RESTAURER CETTE ARCHIVE"
+      );
+
+      if (confirmation !== "RESTAURER CETTE ARCHIVE") {
+        return { message: "Confirmation incorrecte. Aucune modification D1 effectuée." };
+      }
+
+      const response = await fetch("/api/archives/restore", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + getSecret(),
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        cache: "no-store",
+        credentials: "same-origin",
+        redirect: "error",
+        body: JSON.stringify({
+          snapshot_key: archive.snapshot_key,
+          checksum: archive.checksum,
+          confirmation
+        })
+      });
+
+      const text = await response.text();
+      let data;
+
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        throw new Error("Réponse non JSON reçue. HTTP " + response.status);
+      }
+
+      if (!response.ok || data.success === false) {
+        return {
+          message: "Restauration non effectuée ou interrompue.",
+          http_status: response.status,
+          result: data
+        };
+      }
+
+      return data;
     });
   });
 
