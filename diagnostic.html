@@ -1,0 +1,250 @@
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Diagnostic — CRYPTO INTELLIGENCE</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #101522;
+      color: #edf2ff;
+      font-family: Arial, sans-serif;
+    }
+    main {
+      max-width: 700px;
+      margin: auto;
+    }
+    h1 { font-size: 23px; }
+    p { color: #b8c3d9; line-height: 1.5; }
+    input, button {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 14px;
+      margin: 8px 0;
+      border-radius: 9px;
+      font-size: 15px;
+    }
+    input {
+      background: #202a3d;
+      border: 1px solid #52617b;
+      color: white;
+    }
+    button {
+      border: 0;
+      background: #2868d7;
+      color: white;
+      font-weight: bold;
+    }
+    button.secondary { background: #34435d; }
+    button.danger { background: #754044; }
+    button:disabled { opacity: .5; }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: #080d17;
+      border: 1px solid #34435d;
+      border-radius: 9px;
+      padding: 14px;
+      min-height: 100px;
+      color: #c8e2ff;
+      font-size: 13px;
+    }
+    .warning {
+      border-left: 4px solid #e4a83b;
+      padding: 10px;
+      background: #28251d;
+    }
+    .small { font-size: 12px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>CRYPTO INTELLIGENCE</h1>
+  <p>Outil privé de diagnostic D1 et R2.</p>
+
+  <p class="warning">
+    Ta clé APP_SECRET est utilisée uniquement en mémoire
+    pendant cette session. Elle n'est pas enregistrée,
+    ni envoyée dans l'adresse de la page.
+    Ne partage jamais cette clé.
+  </p>
+
+  <label for="secret">Clé secrète APP_SECRET</label>
+  <input
+    id="secret"
+    type="password"
+    autocomplete="off"
+    autocapitalize="off"
+    spellcheck="false"
+    placeholder="Saisis ta clé secrète Cloudflare"
+  >
+
+  <button id="connect">Vérifier l'accès sécurisé et D1</button>
+  <button id="archiveStatus" class="secondary">Vérifier le service R2</button>
+  <button id="backup">Créer une sauvegarde D1 vers R2</button>
+  <button id="list" class="secondary">Afficher les archives</button>
+  <button id="verify" class="secondary">Vérifier la dernière archive SHA-256</button>
+  <button id="clear" class="danger">Effacer la clé de cette page</button>
+
+  <h2>Résultat</h2>
+  <pre id="result">En attente d'une opération.</pre>
+  <p class="small">
+    Les opérations de sauvegarde ajoutent une archive dans R2.
+    Elles ne suppriment pas les données D1 ni les archives existantes.
+  </p>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const secretInput = document.getElementById("secret");
+  const output = document.getElementById("result");
+  const buttons = Array.from(document.querySelectorAll("button"));
+
+  let secret = "";
+  let lastSnapshotKey = "";
+
+  function display(value) {
+    output.textContent = typeof value === "string"
+      ? value
+      : JSON.stringify(value, null, 2);
+  }
+
+  function getSecret() {
+    const value = secretInput.value.trim();
+    if (!value) {
+      throw new Error("Saisis d'abord APP_SECRET.");
+    }
+    secret = value;
+    return secret;
+  }
+
+  async function api(path, method = "GET") {
+    const token = getSecret();
+
+    const response = await fetch(path, {
+      method,
+      headers: {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/json"
+      },
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "error"
+    });
+
+    const text = await response.text();
+    let data;
+
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error("Réponse non JSON reçue. HTTP " + response.status);
+    }
+
+    if (!response.ok || data.success === false) {
+      throw new Error(
+        "HTTP " + response.status + " : " +
+        (data.error || "Opération refusée.")
+      );
+    }
+
+    return data;
+  }
+
+  async function run(button, operation) {
+    buttons.forEach(item => item.disabled = true);
+    display("Opération en cours…");
+
+    try {
+      const result = await operation();
+      display(result);
+    } catch (error) {
+      display("ERREUR : " + (error.message || "Erreur inconnue."));
+    } finally {
+      buttons.forEach(item => item.disabled = false);
+    }
+  }
+
+  document.getElementById("connect").addEventListener("click", () => {
+    run(null, async () => {
+      const data = await api("/api/status");
+      return {
+        message: "Accès sécurisé et interrogation D1 réussis.",
+        result: data
+      };
+    });
+  });
+
+  document.getElementById("archiveStatus").addEventListener("click", () => {
+    run(null, async () => {
+      return await api("/api/archives/status");
+    });
+  });
+
+  document.getElementById("backup").addEventListener("click", () => {
+    run(null, async () => {
+      const data = await api("/api/archives/backup", "POST");
+
+      lastSnapshotKey = data.archive?.snapshot_key || "";
+
+      return {
+        message: "Réponse de création de sauvegarde reçue.",
+        archive: data.archive,
+        verification_possible: Boolean(lastSnapshotKey)
+      };
+    });
+  });
+
+  document.getElementById("list").addEventListener("click", () => {
+    run(null, async () => {
+      return await api("/api/archives");
+    });
+  });
+
+  document.getElementById("verify").addEventListener("click", () => {
+    run(null, async () => {
+      if (!lastSnapshotKey) {
+        const listing = await api("/api/archives");
+        const archives = listing.archives || [];
+        const latest = archives.find(item =>
+          item.snapshot_key && item.manifest_valid === true
+        );
+
+        if (!latest) {
+          throw new Error(
+            "Aucune archive avec manifeste valide trouvée. Crée d'abord une sauvegarde."
+          );
+        }
+
+        lastSnapshotKey = latest.snapshot_key;
+      }
+
+      const url = "/api/archives/verify?key=" +
+        encodeURIComponent(lastSnapshotKey);
+
+      return await api(url);
+    });
+  });
+
+  document.getElementById("clear").addEventListener("click", () => {
+    secret = "";
+    secretInput.value = "";
+    lastSnapshotKey = "";
+    display("Clé effacée de cette page.");
+  });
+
+  window.addEventListener("pagehide", () => {
+    secret = "";
+    lastSnapshotKey = "";
+    secretInput.value = "";
+  });
+})();
+</script>
+</body>
+</html>
