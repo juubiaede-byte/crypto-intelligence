@@ -2284,6 +2284,11 @@ async function runRadarVerification(db) {
   for (const item of pending.results || []) {
     const result = await verifyRadarTokenWithHoneypot(db, item);
     const goPlusResult = await verifyRadarTokenWithGoPlus(db, item);
+    const goPlusSignals = goPlusRiskSignals(goPlusResult.evidence?.token_security);
+    if (goPlusResult.outcome !== 'unsupported' && goPlusResult.outcome !== 'unknown') {
+      goPlusResult.outcome = goPlusSignals.length ? 'risk_signals' : 'no_flags_returned';
+      goPlusResult.evidence = { ...(goPlusResult.evidence || {}), interpreted_risk_signals: goPlusSignals, risk_assessment_version: 2 };
+    }
     const marketResult = await verifyRadarMarketData(db, item);
     await persistRadarMarketCheck(db, marketResult);
     await persistRadarSecurityCheck(db, goPlusResult);
