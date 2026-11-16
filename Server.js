@@ -7022,3 +7022,174 @@ export default {
     else await conanTask;
   }
 };
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 11 — OBSERVATION ADAPTATIVE ET APPRENTISSAGE PROGRESSIF DE CONAN  */
+/* -------------------------------------------------------------------------- */
+const CONAN_ADAPTIVE_OBSERVATION_METHODOLOGY = "conan-adaptive-observation-7-to-1-v1";
+const CONAN_ADAPTIVE_INITIAL_DAYS = 7;
+const CONAN_ADAPTIVE_MIN_DAYS = 1;
+const CONAN_ADAPTIVE_MAX_DAYS = 7;
+const CONAN_ADAPTIVE_FIRST_STEP_WINS = 3;
+const CONAN_ADAPTIVE_NEXT_STEP_WINS = 5;
+const CONAN_ADAPTIVE_HOLD_ACCURACY_PERCENT = 70;
+const CONAN_ADAPTIVE_DECLINE_ACCURACY_PERCENT = 60;
+const CONAN_ADAPTIVE_MIN_DECLINE_SAMPLE = 5;
+
+async function ensureConanAdaptiveObservationTables(db){
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_adaptive_observation_state (
+      state_id TEXT PRIMARY KEY,
+      observation_days INTEGER NOT NULL DEFAULT 7,
+      stage_index INTEGER NOT NULL DEFAULT 0,
+      consecutive_new_wins INTEGER NOT NULL DEFAULT 0,
+      verified_evaluations INTEGER NOT NULL DEFAULT 0,
+      verified_wins INTEGER NOT NULL DEFAULT 0,
+      last_accuracy_percent REAL,
+      last_sample_size INTEGER NOT NULL DEFAULT 0,
+      last_processed_at TEXT,
+      last_adjustment_reason TEXT,
+      methodology_version TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_adaptive_observation_history (
+      event_id TEXT PRIMARY KEY,
+      previous_days INTEGER NOT NULL,
+      new_days INTEGER NOT NULL,
+      adjustment_type TEXT NOT NULL,
+      trigger_result_id TEXT,
+      rolling_accuracy_percent REAL,
+      rolling_sample_size INTEGER NOT NULL DEFAULT 0,
+      consecutive_new_wins INTEGER NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      methodology_version TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_adaptive_history_created ON ci_conan_adaptive_observation_history(created_at DESC)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_adaptive_processed_results (
+      result_id TEXT PRIMARY KEY,
+      processed_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_adaptive_processed_at ON ci_conan_adaptive_processed_results(processed_at DESC)")
+  ]);
+  const timestamp=nowISO();
+  await db.prepare("INSERT OR IGNORE INTO ci_conan_adaptive_observation_state (state_id,observation_days,stage_index,consecutive_new_wins,verified_evaluations,verified_wins,methodology_version,updated_at) VALUES ('primary',7,0,0,0,0,?,?)").bind(CONAN_ADAPTIVE_OBSERVATION_METHODOLOGY,timestamp).run();
+  /* Les résultats antérieurs au chapitre 11 constituent l'historique de départ,
+     pas de nouvelles victoires acquises sous cette politique adaptative. */
+  await db.prepare("INSERT OR IGNORE INTO ci_conan_adaptive_processed_results (result_id,processed_at) SELECT result_id,? FROM ci_conan_prediction_results").bind(timestamp).run();
+  if(Array.isArray(ARCHIVE_TABLES)){
+    for(const table of ["ci_conan_adaptive_observation_state","ci_conan_adaptive_observation_history","ci_conan_adaptive_processed_results"]){
+      if(!ARCHIVE_TABLES.includes(table))ARCHIVE_TABLES.push(table);
+    }
+  }
+}
+
+async function getConanAdaptiveObservationState(db){
+  await ensureConanAdaptiveObservationTables(db);
+  const state=await db.prepare("SELECT * FROM ci_conan_adaptive_observation_state WHERE state_id='primary'").first();
+  return {
+    ...state,
+    policy:"7 jours au départ; 3 nouvelles victoires vérifiées pour passer à 6 jours; puis 5 nouvelles victoires vérifiées par palier jusqu'à 1 jour.",
+    hold_accuracy_percent:CONAN_ADAPTIVE_HOLD_ACCURACY_PERCENT,
+    decline_accuracy_percent:CONAN_ADAPTIVE_DECLINE_ACCURACY_PERCENT,
+    decline_minimum_sample:CONAN_ADAPTIVE_MIN_DECLINE_SAMPLE,
+    observation_days:Number(state?.observation_days)||CONAN_ADAPTIVE_INITIAL_DAYS,
+    next_step_required_wins:Number(state?.stage_index)===0?CONAN_ADAPTIVE_FIRST_STEP_WINS:CONAN_ADAPTIVE_NEXT_STEP_WINS
+  };
+}
+
+async function processConanAdaptiveObservationResults(db){
+  await ensureConanAdaptiveObservationTables(db);
+  let state=await db.prepare("SELECT * FROM ci_conan_adaptive_observation_state WHERE state_id='primary'").first();
+  const pending=await db.prepare("SELECT r.result_id,r.direction_correct,r.evaluated_at,r.cycle_id,r.prediction_id FROM ci_conan_prediction_results r LEFT JOIN ci_conan_adaptive_processed_results p ON p.result_id=r.result_id WHERE p.result_id IS NULL AND r.outcome_status='evaluated' AND r.direction_correct IS NOT NULL ORDER BY r.evaluated_at ASC,r.result_id ASC LIMIT 500").all();
+  const rows=pending.results||[];
+  const changes=[];
+  for(const item of rows){
+    const timestamp=nowISO();
+    await db.prepare("INSERT OR IGNORE INTO ci_conan_adaptive_processed_results (result_id,processed_at) VALUES (?,?)").bind(item.result_id,timestamp).run();
+    const rolling=await db.prepare("SELECT r.direction_correct FROM ci_conan_prediction_results r WHERE r.outcome_status='evaluated' AND r.direction_correct IS NOT NULL ORDER BY r.evaluated_at DESC,r.result_id DESC LIMIT 10").all();
+    const sample=rolling.results||[];
+    const wins=sample.filter(row=>Number(row.direction_correct)===1).length;
+    const accuracy=sample.length?wins/sample.length*100:null;
+    let days=Number(state.observation_days)||7;
+    let stage=Number(state.stage_index)||0;
+    let consecutive=Number(state.consecutive_new_wins)||0;
+    let adjustment=null,reason=null;
+    if(sample.length>=CONAN_ADAPTIVE_MIN_DECLINE_SAMPLE&&accuracy<CONAN_ADAPTIVE_DECLINE_ACCURACY_PERCENT&&days<CONAN_ADAPTIVE_MAX_DAYS){
+      const previous=days;
+      days=Math.min(CONAN_ADAPTIVE_MAX_DAYS,days+1);
+      stage=Math.max(0,7-days);
+      consecutive=0;
+      adjustment="extended_after_accuracy_decline";
+      reason="La précision glissante est passée sous 60% sur au moins cinq prédictions vérifiables; la période est rallongée d'un jour et la progression est réinitialisée.";
+      await db.prepare("INSERT INTO ci_conan_adaptive_observation_history (event_id,previous_days,new_days,adjustment_type,trigger_result_id,rolling_accuracy_percent,rolling_sample_size,consecutive_new_wins,reason,evidence_json,methodology_version,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+        cryptoRandomId(),previous,days,adjustment,item.result_id,accuracy,sample.length,consecutive,reason,
+        JSON.stringify({cycle_id:item.cycle_id,prediction_id:item.prediction_id,verified_result_id:item.result_id,rolling_wins:wins,rolling_evaluations:sample.length,threshold_percent:CONAN_ADAPTIVE_DECLINE_ACCURACY_PERCENT}),
+        CONAN_ADAPTIVE_OBSERVATION_METHODOLOGY,timestamp
+      ).run();
+      changes.push({result_id:item.result_id,previous_days:previous,observation_days:days,adjustment,accuracy_percent:accuracy});
+    }else if(Number(item.direction_correct)===1){
+      consecutive+=1;
+      const required=stage===0?CONAN_ADAPTIVE_FIRST_STEP_WINS:CONAN_ADAPTIVE_NEXT_STEP_WINS;
+      const minimumSample=stage===0?3:5;
+      if(consecutive>=required&&sample.length>=minimumSample&&accuracy!==null&&accuracy>=CONAN_ADAPTIVE_HOLD_ACCURACY_PERCENT&&days>CONAN_ADAPTIVE_MIN_DAYS){
+        const previous=days;
+        days=Math.max(CONAN_ADAPTIVE_MIN_DAYS,days-1);
+        stage=Math.max(0,7-days);
+        consecutive=0;
+        adjustment="shortened_after_verified_wins";
+        reason="Seuil de nouvelles victoires vérifiées atteint et précision glissante maintenue à au moins 70%; réduction d'un jour.";
+        await db.prepare("INSERT INTO ci_conan_adaptive_observation_history (event_id,previous_days,new_days,adjustment_type,trigger_result_id,rolling_accuracy_percent,rolling_sample_size,consecutive_new_wins,reason,evidence_json,methodology_version,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+          cryptoRandomId(),previous,days,adjustment,item.result_id,accuracy,sample.length,consecutive,reason,
+          JSON.stringify({cycle_id:item.cycle_id,prediction_id:item.prediction_id,verified_result_id:item.result_id,rolling_wins:wins,rolling_evaluations:sample.length,required_new_wins:required,minimum_sample:minimumSample,hold_accuracy_percent:CONAN_ADAPTIVE_HOLD_ACCURACY_PERCENT}),
+          CONAN_ADAPTIVE_OBSERVATION_METHODOLOGY,timestamp
+        ).run();
+        changes.push({result_id:item.result_id,previous_days:previous,observation_days:days,adjustment,accuracy_percent:accuracy});
+      }
+    }
+    const totals=await db.prepare("SELECT COUNT(*) AS evaluated,SUM(CASE WHEN direction_correct=1 THEN 1 ELSE 0 END) AS wins FROM ci_conan_prediction_results WHERE outcome_status='evaluated' AND direction_correct IS NOT NULL").first();
+    await db.prepare("UPDATE ci_conan_adaptive_observation_state SET observation_days=?,stage_index=?,consecutive_new_wins=?,verified_evaluations=?,verified_wins=?,last_accuracy_percent=?,last_sample_size=?,last_processed_at=?,last_adjustment_reason=?,methodology_version=?,updated_at=? WHERE state_id='primary'").bind(
+      days,stage,consecutive,Number(totals?.evaluated)||0,Number(totals?.wins)||0,accuracy,sample.length,timestamp,reason||state.last_adjustment_reason||null,CONAN_ADAPTIVE_OBSERVATION_METHODOLOGY,timestamp
+    ).run();
+    state={...state,observation_days:days,stage_index:stage,consecutive_new_wins:consecutive,verified_evaluations:Number(totals?.evaluated)||0,verified_wins:Number(totals?.wins)||0,last_accuracy_percent:accuracy,last_sample_size:sample.length,last_processed_at:timestamp,last_adjustment_reason:reason||state.last_adjustment_reason||null};
+  }
+  return {state:await getConanAdaptiveObservationState(db),processed_results:rows.length,changes};
+}
+
+async function getConanAdaptiveObservationHistory(db,limit=100){
+  await ensureConanAdaptiveObservationTables(db);
+  const result=await db.prepare("SELECT * FROM ci_conan_adaptive_observation_history ORDER BY created_at DESC LIMIT ?").bind(Math.max(1,Math.min(500,Number(limit)||100))).all();
+  return result.results||[];
+}
+
+const conanChapter11OriginalRunCycle = runConanPredictionCycle;
+runConanPredictionCycle = async function(db,env){
+  const result=await conanChapter11OriginalRunCycle(db,env);
+  try{
+    const adaptive=await processConanAdaptiveObservationResults(db);
+    return {...(result&&typeof result==="object"?result:{result}),adaptive_observation:{observation_days:adaptive.state.observation_days,consecutive_new_wins:adaptive.state.consecutive_new_wins,last_accuracy_percent:adaptive.state.last_accuracy_percent,processed_results:adaptive.processed_results,changes:adaptive.changes}};
+  }catch(error){
+    await audit(db,"conan_adaptive_observation_error",safeString(error.message||"Erreur du moteur d'observation adaptative.",700));
+    return {...(result&&typeof result==="object"?result:{result}),adaptive_observation:{status:"error",message:safeString(error.message||"Erreur adaptative.",500)}};
+  }
+};
+
+const conanChapter11OriginalProtectedRoutes = handleProtectedRoutes;
+handleProtectedRoutes = async function(request,env,ctx,route){
+  const {path,method,url}=route;
+  if(method==="GET"&&path==="/api/conan/adaptive-observation"){
+    const db=getDB(env);
+    await initializeBackendTables(db);
+    const state=await getConanAdaptiveObservationState(db);
+    return json({success:true,methodology:CONAN_ADAPTIVE_OBSERVATION_METHODOLOGY,state,policy:{initial_days:7,minimum_days:1,maximum_days:7,first_reduction_after_new_verified_wins:3,subsequent_reductions_after_new_verified_wins:5,hold_accuracy_percent:70,accuracy_decline_percent:60,accuracy_decline_minimum_sample:5,unverifiable_results_count:false},note:"Cette politique adaptative conserve le cycle de prédiction de 15 jours du chapitre 8; elle expose et historise le palier d'observation distinct sans modifier rétroactivement les cycles déjà créés."});
+  }
+  if(method==="GET"&&path==="/api/conan/adaptive-observation/history"){
+    const db=getDB(env);
+    await initializeBackendTables(db);
+    const history=await getConanAdaptiveObservationHistory(db,url.searchParams.get("limit"));
+    return json({success:true,count:history.length,history});
+  }
+  return await conanChapter11OriginalProtectedRoutes(request,env,ctx,route);
+};
