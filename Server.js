@@ -4754,6 +4754,15 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, scan: result }, 201);
   }
 
+  if (method === "POST" && path === "/api/collective-intelligence/council-compare") {
+    const body = await readBody(request);
+    const discoveryKey = safeString(body.discovery_key || "", 200);
+    if (!discoveryKey) return errorResponse("discovery_key requis.");
+    const comparison = await recordCollectiveCouncilComparison(db, discoveryKey);
+    if (comparison.error) return errorResponse(comparison.error, comparison.status || 404);
+    return json({ success: true, comparison }, 201);
+  }
+
   if (method === "GET" && path === "/api/collective-intelligence/opportunities") {
     const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
     const stage = safeString(url.searchParams.get("stage") || "", 80);
@@ -5811,6 +5820,47 @@ async function runCollectiveOpportunityScan(db, requestedLimit = 100) {
   await db.prepare("INSERT INTO ci_collective_opportunity_runs (run_id,status,assets_examined,signals_created,candidates_count,correlations_count,methodology_json,created_at) VALUES (?, 'completed', ?, ?, ?, ?, ?, ?)").bind(runId,snapshotKeys.length,signalsCreated,candidatesCount,correlations,JSON.stringify(RADAR_COLLECTIVE_METHODOLOGY),createdAt).run();
   await audit(db,"collective_opportunity_scan_completed",runId+" — "+snapshotKeys.length+" actifs examinés; "+signalsCreated+" signaux.");
   return {run_id:runId,status:"completed",assets_examined:snapshotKeys.length,signals_created:signalsCreated,watchlist_candidates:candidatesCount,historical_correlations:correlations,created_at:createdAt,methodology:RADAR_COLLECTIVE_METHODOLOGY,note:"Pistes de recherche documentées, jamais recommandations d'achat ni preuves de sous-évaluation."};
+}
+
+
+
+async function recordCollectiveCouncilComparison(db, discoveryKey) {
+  const session = await db.prepare("SELECT * FROM ci_ai_council_sessions WHERE discovery_key = ? ORDER BY created_at DESC LIMIT 1").bind(discoveryKey).first();
+  if (!session) return { error: "Aucune session du conseil IA disponible pour cet actif.", status: 404 };
+  const rows = await db.prepare("SELECT role, provider, status, opinion_json, error_message, created_at FROM ci_ai_council_opinions WHERE session_id = ? ORDER BY created_at ASC").bind(session.session_id).all();
+  const opinions = (rows.results || []).map(row => ({ ...row, parsed: collectiveParseJSON(row.opinion_json, {}) }));
+  const experts = opinions.filter(item => item.role !== "arbiter" && item.status === "completed");
+  const arbiter = opinions.find(item => item.role === "arbiter" && item.status === "completed") || null;
+  const stances = [...new Set(experts.map(item => item.parsed.stance).filter(Boolean))];
+  const riskStatements = experts.flatMap(item => Array.isArray(item.parsed.risks) ? item.parsed.risks.map(risk => ({ role: item.role, risk })) : []);
+  const hypotheses = experts.flatMap(item => Array.isArray(item.parsed.hypotheses) ? item.parsed.hypotheses.map(hypothesis => ({ role: item.role, hypothesis })) : []);
+  const facts = experts.flatMap(item => Array.isArray(item.parsed.facts) ? item.parsed.facts.map(fact => ({ role: item.role, fact })) : []);
+  const critical = Number(session.critical_risk_signal) === 1 || experts.some(item => item.parsed.critical_risk_signal === true);
+  const disagreement = stances.length > 1 || riskStatements.length > 0;
+  const runId = cryptoRandomId(), createdAt = nowISO();
+  const evidence = {
+    session_id: session.session_id,
+    completed_roles: experts.map(item => item.role),
+    missing_or_failed_roles: opinions.filter(item => item.status !== "completed").map(item => ({ role: item.role, status: item.status, error: item.error_message || null })),
+    stances_by_role: experts.map(item => ({ role: item.role, stance: item.parsed.stance || "unknown", confidence_percent: item.parsed.confidence_percent ?? item.parsed.confidence ?? null })),
+    arbiter_opinion: arbiter?.parsed || null,
+    risks_by_role: riskStatements,
+    facts_by_role: facts,
+    hypotheses_by_role: hypotheses,
+    disagreements: stances.length > 1 ? { stances, note: "Les avis divergents sont conservés et ne sont pas moyennés." } : null,
+    critical_risk_veto: critical,
+    interpretation: "Les affirmations des IA sont des opinions de modèles et ne deviennent pas des faits vérifiés sans preuve externe."
+  };
+  await db.prepare("INSERT INTO ci_collective_opportunity_runs (run_id,status,assets_examined,signals_created,candidates_count,correlations_count,methodology_json,created_at) VALUES (?, 'council_comparison', 1, 1, 0, 0, ?, ?)").bind(runId, JSON.stringify({ version: "collective-council-compare-v1" }), createdAt).run();
+  await db.prepare("INSERT INTO ci_collective_opportunity_signals (signal_id,run_id,discovery_key,signal_type,severity,confidence_percent,metrics_json,evidence_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(), runId, discoveryKey, critical ? "council_critical_risk_veto" : disagreement ? "council_divergence_and_hypotheses" : "council_cross_check",
+    critical ? "critical" : disagreement ? "research" : "context",
+    experts.length ? Math.round(experts.reduce((n,item)=>n+Number(item.parsed.confidence_percent ?? item.parsed.confidence ?? 0),0)/experts.length) : null,
+    JSON.stringify({ expert_opinions: experts.length, distinct_stances: stances.length }),
+    JSON.stringify(evidence), createdAt
+  ).run();
+  await audit(db, "collective_council_comparison", discoveryKey + " — " + (critical ? "risque critique" : "comparaison des avis"));
+  return { run_id: runId, discovery_key: discoveryKey, session_id: session.session_id, experts_compared: experts.length, arbiter_available: !!arbiter, critical_risk_veto: critical, disagreement_detected: disagreement, risks: riskStatements, hypotheses, facts, evidence, created_at: createdAt };
 }
 
 
