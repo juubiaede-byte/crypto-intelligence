@@ -2398,6 +2398,7 @@ async function runRadarVerification(db) {
     marketResult.pool_metrics = await persistRadarPoolMetrics(db, item.discovery_key, marketResult);
     marketResult.pool_metrics.asset_links_saved = await persistRadarPoolMetricAssetLinks(db, item.discovery_key, marketResult);
     marketResult.pool_metric_history = await persistRadarPoolMetricHistory(db, item.discovery_key, marketResult);
+    marketResult.onchain_pool_checks = await runRadarOnchainPoolChecks(db, item, marketResult);
     await persistRadarSecurityCheck(db, goPlusResult);
     await db.prepare(`INSERT INTO ci_radar_verifications (discovery_key, provider, outcome, simulation_success, risk, checked_at, next_check_at, evidence_json, error_message) VALUES (?, 'Honeypot.is', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(discovery_key) DO UPDATE SET provider = excluded.provider, outcome = excluded.outcome, simulation_success = excluded.simulation_success, risk = excluded.risk, checked_at = excluded.checked_at, next_check_at = excluded.next_check_at, evidence_json = excluded.evidence_json, error_message = excluded.error_message`).bind(result.discovery_key, result.outcome, result.simulation_success, result.risk, result.checked_at, result.next_check_at, JSON.stringify(result.evidence), result.error_message).run();
     summary.attempted++;
@@ -3392,6 +3393,20 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, count: result.results?.length || 0, metrics: result.results || [], note: "Liquidités déclarées par DexScreener; profondeur exécutable et impact de prix non vérifiés." });
   }
 
+  if (method === "GET" && path === "/api/radar/onchain-pool-checks") {
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 200));
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const pairAddress = safeString(url.searchParams.get("pair_address") || "", 160);
+    let query = "SELECT * FROM ci_radar_onchain_pool_checks WHERE 1 = 1";
+    const values = [];
+    if (discoveryKey) { query += " AND discovery_key = ?"; values.push(discoveryKey); }
+    if (pairAddress) { query += " AND lower(pair_address) = lower(?)"; values.push(pairAddress); }
+    query += " ORDER BY checked_at DESC LIMIT ?";
+    values.push(limit);
+    const result = await db.prepare(query).bind(...values).all();
+    return json({ success: true, count: result.results?.length || 0, checks: result.results || [], note: "Réserves brutes lues sur la blockchain via une ABI compatible Uniswap V2; ce résultat n'est pas une profondeur exécutable en USD ni une simulation d'impact de prix." });
+  }
+
   if (method === "GET" && path === "/api/radar/contract-checks") {
     const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
     const result = await db.prepare("SELECT c.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol FROM ci_radar_contract_checks c JOIN ci_radar_discoveries d ON d.discovery_key = c.discovery_key ORDER BY c.checked_at DESC LIMIT ?").bind(limit).all();
@@ -3786,14 +3801,16 @@ function goPlusLiquidityAssessment(token) {
   const holders = token.lp_holders.filter((holder) => holder && typeof holder === "object");
   const parsed = holders.map((holder) => ({
     percent: radarFiniteMetric(holder.percent),
-    locked: goPlusValueIsEnabled(holder.is_locked),
+    locked: holder.is_locked === undefined || holder.is_locked === null || holder.is_locked === "" ? null : goPlusValueIsEnabled(holder.is_locked),
     address: safeString(holder.address || "", 160) || null,
     tag: safeString(holder.tag || "", 120) || null,
     locked_detail: Array.isArray(holder.locked_detail) ? holder.locked_detail : []
   }));
   const known = parsed.filter((holder) => holder.percent !== null);
-  const lockedShare = known.filter((holder) => holder.locked).reduce((sum, holder) => sum + holder.percent, 0);
-  const unlockedShare = known.filter((holder) => !holder.locked).reduce((sum, holder) => sum + holder.percent, 0);
+  const lockKnown = known.filter((holder) => holder.locked !== null);
+  const lockedShare = lockKnown.filter((holder) => holder.locked === true).reduce((sum, holder) => sum + holder.percent, 0);
+  const unlockedShare = lockKnown.filter((holder) => holder.locked === false).reduce((sum, holder) => sum + holder.percent, 0);
+  const unclassifiedLockShare = known.filter((holder) => holder.locked === null).reduce((sum, holder) => sum + holder.percent, 0);
   const topHolderShare = known.length ? Math.max(...known.map((holder) => holder.percent)) : null;
   const topThreeShare = known.slice(0, 3).reduce((sum, holder) => sum + holder.percent, 0);
   const unlockEvents = parsed.flatMap((holder) => holder.locked_detail.map((detail) => ({
@@ -3809,8 +3826,9 @@ function goPlusLiquidityAssessment(token) {
     lp_total_supply_reported: token.lp_total_supply ?? null,
     top_lp_holders_returned: holders.length,
     top_holders_with_percentage: known.length,
-    top10_locked_share_percent: known.length ? lockedShare * 100 : null,
-    top10_unlocked_share_percent: known.length ? unlockedShare * 100 : null,
+    top10_locked_share_percent: lockKnown.length ? lockedShare * 100 : null,
+    top10_unlocked_share_percent: lockKnown.length ? unlockedShare * 100 : null,
+    top10_lock_status_unknown_share_percent: known.length ? unclassifiedLockShare * 100 : null,
     largest_reported_lp_holder_percent: topHolderShare === null ? null : topHolderShare * 100,
     first_three_reported_lp_holders_percent: known.length ? topThreeShare * 100 : null,
     unlock_events: unlockEvents,
