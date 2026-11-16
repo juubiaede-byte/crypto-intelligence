@@ -4734,6 +4734,41 @@ async function handleProtectedRoutes(request, env, ctx, route) {
 
   /* ---------------- CHAPITRE 5 — CONSEIL DES CINQ IA ----------------------- */
 
+
+  /* ---------------- CHAPITRE 6 — INTELLIGENCE COLLECTIVE ------------------ */
+
+  if (method === "POST" && path === "/api/collective-intelligence/scan") {
+    const body = await readBody(request);
+    const result = await runCollectiveOpportunityScan(db, body.limit);
+    return json({ success: true, scan: result }, 201);
+  }
+
+  if (method === "GET" && path === "/api/collective-intelligence/opportunities") {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const stage = safeString(url.searchParams.get("stage") || "", 80);
+    const result = stage
+      ? await db.prepare("SELECT * FROM ci_collective_opportunity_history WHERE classification = ? ORDER BY created_at DESC LIMIT ?").bind(stage, limit).all()
+      : await db.prepare("SELECT * FROM ci_collective_opportunity_history ORDER BY created_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, opportunities: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/api/collective-intelligence/signals") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const runId = safeString(url.searchParams.get("run_id") || "", 120);
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    if (!discoveryKey && !runId) return errorResponse("discovery_key ou run_id requis.");
+    const result = discoveryKey
+      ? await db.prepare("SELECT * FROM ci_collective_opportunity_signals WHERE discovery_key = ? ORDER BY created_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_collective_opportunity_signals WHERE run_id = ? ORDER BY created_at DESC LIMIT ?").bind(runId, limit).all();
+    return json({ success: true, count: result.results?.length || 0, signals: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/api/collective-intelligence/runs") {
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit")) || 50));
+    const result = await db.prepare("SELECT * FROM ci_collective_opportunity_runs ORDER BY created_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, runs: result.results || [] });
+  }
+
   if (method === "POST" && path === "/api/ai/council/analyze") {
     const body = await readBody(request);
     const discoveryKey = safeString(body.discovery_key || "", 200);
