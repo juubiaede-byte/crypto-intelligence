@@ -4964,10 +4964,13 @@ async function handleProtectedRoutes(request, env, ctx, route) {
   }
   if (method === "GET" && path === "/api/conan/score") {
     const cycleId=safeString(url.searchParams.get("cycle_id")||"",120);
-    if(!cycleId)return errorResponse("cycle_id requis.");
-    const result=await db.prepare("SELECT * FROM ci_conan_score_history WHERE cycle_id=? LIMIT 1").bind(cycleId).first();
-    if(!result)return errorResponse("Aucun score calculé pour ce cycle.",404);
-    return json({success:true,score:result});
+    if(cycleId){
+      const result=await db.prepare("SELECT * FROM ci_conan_score_history WHERE cycle_id=? LIMIT 1").bind(cycleId).first();
+      if(!result)return errorResponse("Aucun score calculé pour ce cycle.",404);
+      return json({success:true,score:result});
+    }
+    const overall=await db.prepare("SELECT COUNT(*) AS cycles_count,SUM(evaluated_predictions) AS evaluated_predictions,SUM(unverifiable_predictions) AS unverifiable_predictions,SUM(evaluated_predictions*score_total)/NULLIF(SUM(evaluated_predictions),0) AS score_total,SUM(evaluated_predictions*direction_score)/NULLIF(SUM(evaluated_predictions),0) AS direction_score,SUM(evaluated_predictions*targets_technical_score)/NULLIF(SUM(evaluated_predictions),0) AS targets_technical_score,SUM(evaluated_predictions*probability_calibration_score)/NULLIF(SUM(evaluated_predictions),0) AS probability_calibration_score,SUM(evaluated_predictions*project_quality_score)/NULLIF(SUM(evaluated_predictions),0) AS project_quality_score,SUM(evaluated_predictions*market_activity_score)/NULLIF(SUM(evaluated_predictions),0) AS market_activity_score,SUM(evaluated_predictions*risk_management_score)/NULLIF(SUM(evaluated_predictions),0) AS risk_management_score FROM ci_conan_score_history WHERE score_total IS NOT NULL AND evaluated_predictions>0").first();
+    return json({success:true,scope:"all_evaluated_cycles_weighted_by_verified_prediction_count",score:overall?.score_total??null,cycles_count:Number(overall?.cycles_count||0),evaluated_predictions:Number(overall?.evaluated_predictions||0),unverifiable_predictions:Number(overall?.unverifiable_predictions||0),components:overall?{direction:overall.direction_score,targets_technical:overall.targets_technical_score,probability_calibration:overall.probability_calibration_score,project_quality:overall.project_quality_score,market_activity:overall.market_activity_score,risk_management:overall.risk_management_score}:null,methodology_version:CONAN_SCORE_METHODOLOGY,weights:CONAN_SCORE_WEIGHTS});
   }
   if (method === "GET" && path === "/api/conan/learning-history") {
     const cycleId=safeString(url.searchParams.get("cycle_id")||"",120),limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
@@ -6639,8 +6642,8 @@ async function calculateAndPersistConanScore(db,cycle){
     calibrationTotal+=calibration;
 
     const [investment,report,observations,opinions]=await Promise.all([
-      db.prepare("SELECT overall_score,coverage_percent,confidence_percent,critical_risk,evaluation_status FROM ci_investment_evaluations WHERE discovery_key=? ORDER BY evaluated_at DESC LIMIT 1").bind(prediction.discovery_key).first(),
-      db.prepare("SELECT coverage_percent,confidence_percent,report_status FROM ci_investigation_reports WHERE discovery_key=? ORDER BY report_version DESC LIMIT 1").bind(prediction.discovery_key).first(),
+      db.prepare("SELECT overall_score,coverage_percent,confidence_percent,critical_risk,evaluation_status FROM ci_investment_evaluations WHERE discovery_key=? AND evaluated_at<=? ORDER BY evaluated_at DESC LIMIT 1").bind(prediction.discovery_key,prediction.locked_at).first(),
+      db.prepare("SELECT coverage_percent,confidence_percent,report_status FROM ci_investigation_reports WHERE discovery_key=? AND updated_at<=? ORDER BY report_version DESC LIMIT 1").bind(prediction.discovery_key,prediction.locked_at).first(),
       db.prepare("SELECT price_usd,liquidity_usd,volume_24h_usd,buys_24h,sells_24h,observed_at FROM ci_conan_prediction_observations WHERE cycle_id=? AND discovery_key=? AND observed_at>=? ORDER BY observed_at ASC").bind(cycle.cycle_id,prediction.discovery_key,prediction.locked_at).all(),
       db.prepare("SELECT role,status,opinion_json,error_message FROM ci_conan_prediction_opinions WHERE prediction_id=?").bind(prediction.prediction_id).all()
     ]);
@@ -6656,7 +6659,8 @@ async function calculateAndPersistConanScore(db,cycle){
     const hasBuys=samples.some(item=>radarFiniteMetric(item.buys_24h)!==null);
     const hasSells=samples.some(item=>radarFiniteMetric(item.sells_24h)!==null);
     const activityCoverage=[hasLiquidity,hasVolume,hasBuys,hasSells].filter(Boolean).length/4;
-    const transactionCount=samples.reduce((sum,item)=>sum+Math.max(0,Number(item.buys_24h)||0)+Math.max(0,Number(item.sells_24h)||0),0);
+    const latestSample=samples[samples.length-1]||{};
+    const transactionCount=Math.max(0,Number(latestSample.buys_24h)||0)+Math.max(0,Number(latestSample.sells_24h)||0);
     const transactionActivity=Math.min(1,Math.log1p(transactionCount)/Math.log(101));
     const persistence=Math.min(1,samples.length/3);
     const activity=5*activityCoverage+5*transactionActivity+5*persistence;
