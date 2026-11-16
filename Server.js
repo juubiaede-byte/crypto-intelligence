@@ -6696,7 +6696,8 @@ async function calculateAndPersistConanScore(db,cycle){
   const total=conanClamp(directionScore+targetsTechnicalScore+probabilityCalibrationScore+projectQualityScore+marketActivityScore+riskManagementScore,0,100);
   const components={
     weights:CONAN_SCORE_WEIGHTS,
-    direction:{score:directionScore,max:25,correct:directionCorrect,evaluated:count,formula:"25 × directions correct / prédictions évaluées"},
+    prediction_quality:{score:directionScore+targetsTechnicalScore+probabilityCalibrationScore,max:50,formula:"Sous-score prédiction = direction /25 + précision technique des cibles /15 + calibration des probabilités /10."},
+    direction:{score:directionScore,max:25,correct:directionCorrect,evaluated:count,formula:"25 × directions correctes / prédictions évaluées"},
     target_technical:{score:targetsTechnicalScore,max:15,formula:"Par cible : 1 si maintenue une heure, 0.5 si seulement touchée, 0 sinon; moyenne par prédiction puis moyenne du cycle."},
     probability_calibration:{score:probabilityCalibrationScore,max:10,formula:"10 × (1 − Brier moyen); événement cible = cible touchée, probabilité exprimée entre 0 et 1."},
     project_quality:{score:projectQualityScore,max:20,formula:"20 × score investissement/100 × (70 % couverture évaluation + 30 % couverture dossier)/100; données absentes = 0 et signalées."},
@@ -6713,7 +6714,7 @@ async function calculateAndPersistConanScore(db,cycle){
   return {score_total:total,score_status:"calculated",components:{
     direction:directionScore,targets_technical:targetsTechnicalScore,probability_calibration:probabilityCalibrationScore,
     project_quality:projectQualityScore,market_activity:marketActivityScore,risk_management:riskManagementScore
-  },evaluated_predictions:count,unverifiable_predictions:unverifiable,methodology_version:CONAN_SCORE_METHODOLOGY};
+  },prediction_quality_score:directionScore+targetsTechnicalScore+probabilityCalibrationScore,evaluated_predictions:count,unverifiable_predictions:unverifiable,methodology_version:CONAN_SCORE_METHODOLOGY};
 }
 
 async function evaluateConanPredictionCycle(db,cycle){
