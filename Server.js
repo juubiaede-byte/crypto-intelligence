@@ -8218,3 +8218,70 @@ handleProtectedRoutes = async function(request,env,ctx,route){
   }
   return await conanChapter14OriginalProtectedRoutes(request,env,ctx,route);
 };
+
+
+/* Chapitre 14 — test isolé préalable pour les nouvelles sources. */
+async function testCIProviderBeforeAuthorization(db,env,providerId){
+  await ensureCIProviderManagementTables(db);
+  const id=safeString(providerId||"",60).toLowerCase();
+  const item=CI_PROVIDER_CATALOGUE.find(value=>value.id===id);
+  if(!item||item.integration!=="new_isolated")throw new Error("Ce parcours est réservé aux nouvelles sources isolées.");
+  const started=Date.now();
+  let status="failed",httpStatus=null,details={},failure=null;
+  try{
+    if(id==="defillama"){
+      const result=await externalJSON("https://api.llama.fi/protocols");
+      httpStatus=result.status;details={protocols_returned:Array.isArray(result.data)?result.data.length:0};status="completed";
+    }else if(id==="blockscout"){
+      const result=await externalJSON("https://eth.blockscout.com/api/v2/stats");
+      httpStatus=result.status;details={response_received:Boolean(result.data)};status="completed";
+    }else if(id==="coinmarketcap"){
+      if(!env.COINMARKETCAP_API_KEY)throw new Error("Secret COINMARKETCAP_API_KEY absent des secrets Worker.");
+      const result=await externalJSON("https://pro-api.coinmarketcap.com/v1/cryptocurrency/map?limit=1",{headers:{"X-CMC_PRO_API_KEY":env.COINMARKETCAP_API_KEY}});
+      httpStatus=result.status;details={assets_returned:Array.isArray(result.data.data)?result.data.data.length:0};status="completed";
+    }else if(id==="etherscan"){
+      if(!env.ETHERSCAN_API_KEY)throw new Error("Secret ETHERSCAN_API_KEY absent des secrets Worker.");
+      const endpoint=new URL("https://api.etherscan.io/v2/api");
+      endpoint.searchParams.set("chainid","1");endpoint.searchParams.set("module","proxy");endpoint.searchParams.set("action","eth_blockNumber");endpoint.searchParams.set("apikey",env.ETHERSCAN_API_KEY);
+      const result=await externalJSON(endpoint.toString());httpStatus=result.status;details={rpc_response_received:Boolean(result.data.result)};
+      status=result.data.result?"completed":"provider_error";
+    }
+  }catch(error){failure=safeString(error.message||"Échec du test isolé.",700);}
+  const latency=Date.now()-started,timestamp=nowISO(),testId=cryptoRandomId();
+  await db.prepare("INSERT INTO ci_provider_test_history (test_id,provider_id,test_type,status,http_status,latency_ms,details_json,tested_at) VALUES (?,?,?,?,?,?,?,?)").bind(
+    testId,id,"pre_authorization_isolated_probe",status,httpStatus,latency,JSON.stringify({...details,error:failure}),timestamp
+  ).run();
+  await db.prepare("UPDATE ci_provider_registry SET last_test_at=?,last_test_status=?,last_error=?,updated_at=? WHERE provider_id=?").bind(timestamp,status,failure,timestamp,id).run();
+  await db.prepare("INSERT INTO ci_provider_usage_metrics (metric_id,provider_id,operation,success,status_code,latency_ms,created_at) VALUES (?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),id,"pre_authorization_isolated_probe",status==="completed"?1:0,httpStatus,latency,timestamp
+  ).run();
+  return {test_id:testId,provider_id:id,status,http_status:httpStatus,latency_ms:latency,details,error:failure,authorized:false,isolated_test_only:true};
+}
+
+const ciChapter14ConfigureAfterTest = configureCIProvider;
+configureCIProvider = async function(db,env,body){
+  const id=safeString(body.provider_id||"",60).toLowerCase();
+  const item=CI_PROVIDER_CATALOGUE.find(value=>value.id===id);
+  if(item?.integration==="new_isolated"){
+    const test=await db.prepare("SELECT status FROM ci_provider_test_history WHERE provider_id=? AND test_type='pre_authorization_isolated_probe' ORDER BY tested_at DESC LIMIT 1").bind(id).first();
+    if(!test||test.status!=="completed")throw new Error("Cette nouvelle source doit réussir son test isolé avant toute autorisation.");
+  }
+  return await ciChapter14ConfigureAfterTest(db,env,body);
+};
+
+const ciChapter14PreviousRoutes = handleProtectedRoutes;
+handleProtectedRoutes = async function(request,env,ctx,route){
+  if(route.path==="/api/providers/test"&&route.method==="POST"){
+    const body=await readBody(request);
+    const db=getDB(env);
+    await initializeBackendTables(db);
+    await ensureCIProviderManagementTables(db);
+    const item=CI_PROVIDER_CATALOGUE.find(value=>value.id===safeString(body.provider_id||"",60).toLowerCase());
+    const config=item?await db.prepare("SELECT enabled,authorized FROM ci_provider_registry WHERE provider_id=?").bind(item.id).first():null;
+    if(item?.integration==="new_isolated"&&(!config||!config.authorized)){
+      try{return json({success:true,...await testCIProviderBeforeAuthorization(db,env,item.id,body)});}
+      catch(error){return errorResponse(safeString(error.message||"Test isolé refusé.",1000),400);}
+    }
+  }
+  return await ciChapter14PreviousRoutes(request,env,ctx,route);
+};
