@@ -6339,6 +6339,277 @@ async function runRadarWalletScan(db, options = {}) {
 }
 
 
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 8 — CONAN : CYCLE D'OBSERVATION, PRÉDICTION ET APPRENTISSAGE 15 J */
+/* -------------------------------------------------------------------------- */
+const CONAN_PREDICTION_METHODOLOGY = "conan-15d-v1";
+const CONAN_PROVIDER_DAILY_LIMIT_DEFAULT = 5;
+const CONAN_OBSERVATION_MIN_INTERVAL_MS = 15 * 60 * 1000;
+const CONAN_FORECAST_ROLES = [
+  {id:"fundamentals",name:"IA Fondamentale",task:"Évalue les fondamentaux, l'utilité et les événements vérifiables qui peuvent influer sur le prix."},
+  {id:"financial",name:"IA Financière",task:"Analyse prix, volumes, liquidité, volatilité et scénarios chiffrés à partir des observations fournies."},
+  {id:"security",name:"IA Sécurité",task:"Évalue les risques de contrat, liquidité et manipulation; identifie les conditions d'invalidation."},
+  {id:"growth",name:"IA Croissance",task:"Évalue activité, adoption et catalyseurs vérifiables; sépare faits et hypothèses."},
+  {id:"arbiter",name:"IA Arbitre",task:"Confronte les quatre avis indépendants et produit une prévision prudente sans effacer leurs désaccords."}
+];
+
+function conanUtcDate(value=new Date()){return new Date(value).toISOString().slice(0,10);}
+function conanCycleDay(startDate,today=conanUtcDate()){
+  return Math.max(1,Math.floor((Date.parse(today+"T00:00:00.000Z")-Date.parse(startDate+"T00:00:00.000Z"))/86400000)+1);
+}
+
+function normalizeConanForecast(raw,referencePrice){
+  const value=raw&&typeof raw==="object"&&!Array.isArray(raw)?raw:{};
+  const direction=["up","down","sideways"].includes(String(value.direction||"").toLowerCase())?String(value.direction).toLowerCase():null;
+  const targets=(Array.isArray(value.targets)?value.targets.slice(0,3):[]).map((item,index)=>{
+    const price=radarFiniteMetric(item?.price_usd??item?.price??item?.target_price);
+    const probability=radarFiniteMetric(item?.probability_percent??item?.probability);
+    if(price===null||price<=0||probability===null||probability<0||probability>100)return null;
+    if(direction==="up"&&price<=referencePrice)return null;
+    if(direction==="down"&&price>=referencePrice)return null;
+    return {target_index:index+1,price_usd:price,probability_percent:probability,horizon:"15_day_cycle"};
+  }).filter(Boolean);
+  const confidence=radarFiniteMetric(value.confidence_percent??value.confidence);
+  const invalidation=radarFiniteMetric(value.invalidation_price_usd??value.invalidation_price);
+  if(!direction||!targets.length)return null;
+  if(direction==="up"&&invalidation!==null&&invalidation>=referencePrice)return null;
+  if(direction==="down"&&invalidation!==null&&invalidation<=referencePrice)return null;
+  return {
+    direction,targets,
+    confidence_percent:confidence===null?null:Math.max(0,Math.min(100,confidence)),
+    invalidation_price_usd:invalidation,
+    risks:Array.isArray(value.risks)?value.risks.slice(0,20).map(item=>safeString(typeof item==="object"?(item.statement||item.description):item,800)).filter(Boolean):[],
+    reasoning:safeString(value.reasoning||value.summary||value.conclusion||"",3000)
+  };
+}
+
+async function ensureConanPredictionTables(db){await initializeBackendTables(db);}
+
+async function getConanLatestMarket(db,discoveryKey){
+  return await db.prepare("SELECT discovery_key,chain_id,pair_address,price_usd,liquidity_usd,volume_24h_usd,buys_24h,sells_24h,observed_at,source FROM ci_radar_pool_metrics WHERE discovery_key=? AND price_usd>0 ORDER BY observed_at DESC LIMIT 1").bind(discoveryKey).first();
+}
+
+async function selectConanCycleAssets(db){
+  const result=await db.prepare("SELECT d.discovery_key,d.chain_id,d.contract_address,d.token_name,d.token_symbol,m.pair_address,m.price_usd,m.source,m.observed_at,m.liquidity_usd,m.volume_24h_usd FROM ci_radar_discoveries d JOIN ci_radar_pool_metrics m ON m.metric_key=(SELECT pm.metric_key FROM ci_radar_pool_metrics pm WHERE pm.discovery_key=d.discovery_key AND pm.price_usd>0 ORDER BY pm.observed_at DESC LIMIT 1) WHERE m.price_usd>0 ORDER BY RANDOM() LIMIT 100").all();
+  const candidates=result.results||[];
+  if(candidates.length<2)return {assets:[],mode:"unavailable",reason:"Moins de deux actifs distincts disposent d'un prix source exploitable."};
+  const historyResult=await db.prepare("SELECT p.discovery_key,AVG(CASE WHEN r.direction_correct=1 THEN 100 WHEN r.direction_correct=0 THEN 0 ELSE NULL END) AS accuracy,COUNT(r.result_id) AS sample_count FROM ci_conan_predictions p JOIN ci_conan_prediction_results r ON r.prediction_id=p.prediction_id WHERE r.outcome_status='evaluated' GROUP BY p.discovery_key").all();
+  const history=new Map((historyResult.results||[]).map(row=>[row.discovery_key,{accuracy:radarFiniteMetric(row.accuracy),count:Number(row.sample_count)||0}]));
+  const experienced=history.size>0;
+  if(!experienced){
+    for(let i=candidates.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[candidates[i],candidates[j]]=[candidates[j],candidates[i]];}
+  }else{
+    candidates.sort((a,b)=>{
+      const ah=history.get(a.discovery_key),bh=history.get(b.discovery_key);
+      const av=ah?ah.accuracy+Math.min(ah.count,10)*0.25:50;
+      const bv=bh?bh.accuracy+Math.min(bh.count,10)*0.25:50;
+      return bv-av||(Math.random()-0.5);
+    });
+  }
+  return {assets:candidates.slice(0,2),mode:experienced?"experience_weighted_with_exploration":"random_initial",reason:experienced?"Sélection pondérée par les résultats antérieurs évalués, avec exploration des actifs sans historique.":"Sélection initiale aléatoire parmi les actifs possédant un prix observé."};
+}
+
+async function createConanPredictionCycle(db){
+  const today=conanUtcDate();
+  const completed=await db.prepare("SELECT cycle_id FROM ci_conan_prediction_cycles WHERE status='completed' AND completed_at>=? LIMIT 1").bind(today+"T00:00:00.000Z").first();
+  if(completed)return {status:"cycle_completed_today",cycle_id:completed.cycle_id};
+  const selection=await selectConanCycleAssets(db);
+  if(selection.assets.length!==2)return {status:"waiting_for_two_assets",reason:selection.reason};
+  const id=cryptoRandomId(),timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_conan_prediction_cycles (cycle_id,status,cycle_start_date,current_day,selection_mode,learning_stage,methodology_version,created_at,updated_at) VALUES (?,'observing',?,1,?,'child',?,?,?)").bind(id,today,selection.mode,CONAN_PREDICTION_METHODOLOGY,timestamp,timestamp).run();
+  for(let i=0;i<2;i++){
+    const asset=selection.assets[i];
+    await db.prepare("INSERT INTO ci_conan_prediction_assets (asset_row_id,cycle_id,asset_order,discovery_key,chain_id,contract_address,token_name,token_symbol,pair_address,selected_at,selection_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(
+      cryptoRandomId(),id,i+1,asset.discovery_key,asset.chain_id,asset.contract_address,asset.token_name,asset.token_symbol,asset.pair_address,timestamp,selection.reason
+    ).run();
+  }
+  await db.prepare("INSERT INTO ci_conan_learning_history (learning_id,cycle_id,learning_type,summary,evidence_json,created_at) VALUES (?,?,?,?,?,?)").bind(
+    cryptoRandomId(),id,"cycle_started","Début du cycle de 15 jours : deux actifs distincts; observation initiale pendant les jours 1 à 7.",JSON.stringify({selection_mode:selection.mode,selection_reason:selection.reason,assets:selection.assets.map(item=>({discovery_key:item.discovery_key,chain_id:item.chain_id,contract_address:item.contract_address,pair_address:item.pair_address,price_usd:item.price_usd,source:item.source,observed_at:item.observed_at}))}),timestamp
+  ).run();
+  await audit(db,"conan_prediction_cycle_started","Cycle "+id+" lancé avec deux actifs distincts.");
+  return {status:"started",cycle_id:id,cycle_start_date:today,selection_mode:selection.mode,assets:selection.assets.map(item=>({discovery_key:item.discovery_key,chain_id:item.chain_id,contract_address:item.contract_address,symbol:item.token_symbol,price_usd:item.price_usd,source:item.source}))};
+}
+
+async function getConanProviderUsage(db,since){
+  const result=await db.prepare("SELECT provider,COUNT(*) AS calls FROM (SELECT provider,created_at FROM ci_ai_council_opinions WHERE provider IS NOT NULL AND status IN ('completed','failed') AND created_at>=? UNION ALL SELECT provider,created_at FROM ci_conan_prediction_opinions WHERE provider IS NOT NULL AND status IN ('completed','failed') AND created_at>=?) GROUP BY provider").bind(since,since).all();
+  return new Map((result.results||[]).map(row=>[row.provider,Number(row.calls)||0]));
+}
+
+async function callConanForecastRole(db,env,cycle,asset,predictionId,role,context,usage,dailyLimit){
+  const providers=availableAIProviders(env);
+  const provider=providers.filter(item=>(usage.get(item)||0)<dailyLimit).sort((a,b)=>(usage.get(a)||0)-(usage.get(b)||0))[0];
+  if(!provider){
+    const message="Plafond journalier local atteint; appel non effectué, aucun avis simulé.";
+    await db.prepare("INSERT INTO ci_conan_prediction_opinions (opinion_id,cycle_id,prediction_id,discovery_key,role,provider,status,opinion_json,error_message,created_at) VALUES (?,?,?,?,?,NULL,'skipped_quota','{}',?,?)").bind(cryptoRandomId(),cycle.cycle_id,predictionId,asset.discovery_key,role.id,message,nowISO()).run();
+    return null;
+  }
+  const prompt=[
+    "CRYPTO INTELLIGENCE — CONAN — PRÉVISION DU CYCLE DE 15 JOURS",
+    "RÔLE : "+role.name+" ("+role.id+"). MISSION : "+role.task,
+    "DONNÉES ET OBSERVATIONS : "+JSON.stringify(context),
+    "Prévision pour la période de suivi du jour 8 au jour 15. Le prix de référence fourni ne doit pas être remplacé.",
+    "Ne fabrique aucun prix, volume, fait ou source. Distingue faits, hypothèses, risques et inconnues. Une probabilité n'est pas une garantie.",
+    "Retourne uniquement un JSON : direction ('up','down','sideways'), targets (1 à 3 objets {price_usd,probability_percent}), confidence_percent, invalidation_price_usd, risks (tableau), reasoning.",
+    "Pour up, les cibles sont au-dessus du prix de référence; pour down, elles sont en dessous. Si les données sont insuffisantes, ne fabrique pas de cible.",
+    role.id==="arbiter"?"Compare les quatre avis indépendants fournis, conserve leurs désaccords et arbitre prudemment.":"Avis indépendant requis; n'imite pas les autres rôles."
+  ].join("\n");
+  try{
+    const parsed=parseAIResponse(await callAIProvider(provider,env,prompt));
+    const forecast=normalizeConanForecast(parsed,context.reference_price_usd);
+    const status=forecast?"completed":"invalid_response";
+    await db.prepare("INSERT INTO ci_conan_prediction_opinions (opinion_id,cycle_id,prediction_id,discovery_key,role,provider,status,opinion_json,error_message,created_at) VALUES (?,?,?,?,?,?,?,?,NULL,?)").bind(
+      cryptoRandomId(),cycle.cycle_id,predictionId,asset.discovery_key,role.id,provider,status,JSON.stringify({raw:parsed,normalized_forecast:forecast}),nowISO()
+    ).run();
+    usage.set(provider,(usage.get(provider)||0)+1);
+    await recordProviderUsage(db,provider,true,200);
+    return {role:role.id,provider,status,forecast,raw:parsed};
+  }catch(error){
+    const message=safeString(error.message||"Erreur fournisseur IA.",700);
+    await db.prepare("INSERT INTO ci_conan_prediction_opinions (opinion_id,cycle_id,prediction_id,discovery_key,role,provider,status,opinion_json,error_message,created_at) VALUES (?,?,?,?,?,?,'failed','{}',?,?)").bind(
+      cryptoRandomId(),cycle.cycle_id,predictionId,asset.discovery_key,role.id,provider,message,nowISO()
+    ).run();
+    usage.set(provider,(usage.get(provider)||0)+1);
+    await recordProviderUsage(db,provider,false,error.status||500);
+    return {role:role.id,provider,status:"failed",error:message};
+  }
+}
+
+async function lockConanPredictionForAsset(db,env,cycle,asset,market,usage,dailyLimit){
+  const existing=await db.prepare("SELECT prediction_id FROM ci_conan_predictions WHERE cycle_id=? AND discovery_key=?").bind(cycle.cycle_id,asset.discovery_key).first();
+  if(existing)return {status:"already_locked",prediction_id:existing.prediction_id};
+  if(!market||!Number.isFinite(Number(market.price_usd))||Number(market.price_usd)<=0)return {status:"waiting_for_reference_price"};
+  const predictionId=cryptoRandomId();
+  const observations=await db.prepare("SELECT cycle_day,price_usd,liquidity_usd,volume_24h_usd,buys_24h,sells_24h,source,source_observed_at,observed_at FROM ci_conan_prediction_observations WHERE cycle_id=? AND discovery_key=? ORDER BY observed_at ASC LIMIT 500").bind(cycle.cycle_id,asset.discovery_key).all();
+  const context={
+    asset:{discovery_key:asset.discovery_key,chain_id:asset.chain_id,contract_address:asset.contract_address,symbol:asset.token_symbol,pair_address:asset.pair_address},
+    reference_price_usd:Number(market.price_usd),reference_source:market.source,reference_observed_at:market.observed_at,
+    observations:observations.results||[],cycle_start_date:cycle.cycle_start_date,lock_day:8,evaluation_day:15
+  };
+  const experts=[];
+  for(const role of CONAN_FORECAST_ROLES.filter(item=>item.id!=="arbiter"))experts.push(await callConanForecastRole(db,env,cycle,asset,predictionId,role,context,usage,dailyLimit));
+  const usable=experts.filter(item=>item&&item.status==="completed"&&item.forecast);
+  if(usable.length<2)return {status:"insufficient_ai_opinions",expert_opinions:usable.length,required:2};
+  const arbiterRole=CONAN_FORECAST_ROLES.find(item=>item.id==="arbiter");
+  const arbiter=await callConanForecastRole(db,env,cycle,asset,predictionId,arbiterRole,{...context,independent_opinions:usable.map(item=>({role:item.role,provider:item.provider,forecast:item.forecast}))},usage,dailyLimit);
+  if(!arbiter||arbiter.status!=="completed"||!arbiter.forecast)return {status:"arbiter_forecast_unavailable",expert_opinions:usable.length};
+  const forecast=arbiter.forecast,lockedAt=nowISO();
+  const summary={expert_roles:usable.map(item=>({role:item.role,provider:item.provider,direction:item.forecast.direction,confidence_percent:item.forecast.confidence_percent})),arbiter_provider:arbiter.provider,expert_disagreement:new Set(usable.map(item=>item.forecast.direction)).size>1};
+  await db.prepare("INSERT OR IGNORE INTO ci_conan_predictions (prediction_id,cycle_id,discovery_key,chain_id,contract_address,token_symbol,pair_address,locked_at,reference_price_usd,reference_source,reference_observed_at,direction,targets_json,probabilities_json,confidence_percent,invalidation_price_usd,risks_json,reasoning,council_summary_json,methodology_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+    predictionId,cycle.cycle_id,asset.discovery_key,asset.chain_id,asset.contract_address,asset.token_symbol,asset.pair_address,lockedAt,Number(market.price_usd),safeString(market.source||"unknown",120),market.observed_at,forecast.direction,JSON.stringify(forecast.targets),JSON.stringify(forecast.targets.map(item=>item.probability_percent)),forecast.confidence_percent,forecast.invalidation_price_usd,JSON.stringify(forecast.risks),forecast.reasoning,JSON.stringify(summary),CONAN_PREDICTION_METHODOLOGY
+  ).run();
+  const progress=forecast.targets.map(item=>({target_index:item.target_index,price_usd:item.price_usd,probability_percent:item.probability_percent,touched_at:null,held_1h_at:null,verification_method:null}));
+  await db.prepare("INSERT OR IGNORE INTO ci_conan_prediction_progress (prediction_id,latest_price_usd,latest_observed_at,targets_progress_json,last_updated_at) VALUES (?,?,?,?,?)").bind(predictionId,market.price_usd,market.observed_at,JSON.stringify(progress),lockedAt).run();
+  await audit(db,"conan_prediction_locked","Prévision verrouillée pour "+asset.discovery_key+"; prix de référence "+market.price_usd+".");
+  return {status:"locked",prediction_id:predictionId,direction:forecast.direction,targets:forecast.targets,reference_price_usd:Number(market.price_usd),locked_at:lockedAt,expert_opinions:usable.length};
+}
+
+function conanTargetReached(direction,price,target){
+  return direction==="up"?price>=target:direction==="down"?price<=target:Math.abs((price-target)/target)*100<=1;
+}
+
+async function recordConanPredictionObservation(db,cycle,asset,cycleDay){
+  const market=await getConanLatestMarket(db,asset.discovery_key);
+  if(!market||!Number.isFinite(Number(market.price_usd))||Number(market.price_usd)<=0)return {status:"missing_price"};
+  const last=await db.prepare("SELECT observed_at FROM ci_conan_prediction_observations WHERE cycle_id=? AND discovery_key=? ORDER BY observed_at DESC LIMIT 1").bind(cycle.cycle_id,asset.discovery_key).first();
+  const previous=last?Date.parse(last.observed_at):0;
+  if(previous&&Date.now()-previous<CONAN_OBSERVATION_MIN_INTERVAL_MS)return {status:"sample_interval_not_elapsed",price_usd:market.price_usd};
+  const timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_conan_prediction_observations (observation_id,cycle_id,discovery_key,cycle_day,price_usd,liquidity_usd,volume_24h_usd,buys_24h,sells_24h,source,source_observed_at,observed_at,evidence_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),cycle.cycle_id,asset.discovery_key,cycleDay,market.price_usd,market.liquidity_usd,market.volume_24h_usd,market.buys_24h,market.sells_24h,safeString(market.source||"unknown",120),market.observed_at,timestamp,
+    JSON.stringify({provider_source:market.source,market_metric_observed_at:market.observed_at,live_status:"dernier relevé fournisseur persisté; pas une cotation directe garantie"})
+  ).run();
+  const prediction=await db.prepare("SELECT * FROM ci_conan_predictions WHERE cycle_id=? AND discovery_key=?").bind(cycle.cycle_id,asset.discovery_key).first();
+  if(prediction){
+    const row=await db.prepare("SELECT targets_progress_json FROM ci_conan_prediction_progress WHERE prediction_id=?").bind(prediction.prediction_id).first();
+    let targets=[];try{targets=JSON.parse(row?.targets_progress_json||"[]");}catch{targets=[];}
+    for(const target of targets){
+      const reached=conanTargetReached(prediction.direction,Number(market.price_usd),Number(target.price_usd));
+      if(reached&&!target.touched_at)target.touched_at=timestamp;
+      if(reached&&target.touched_at&&!target.held_1h_at&&Date.now()-Date.parse(target.touched_at)>=3600000){
+        target.held_1h_at=timestamp;
+        target.verification_method="two_sampled_observations_at_least_one_hour_apart";
+      }
+    }
+    await db.prepare("INSERT INTO ci_conan_prediction_progress (prediction_id,latest_price_usd,latest_observed_at,targets_progress_json,last_updated_at) VALUES (?,?,?,?,?) ON CONFLICT(prediction_id) DO UPDATE SET latest_price_usd=excluded.latest_price_usd,latest_observed_at=excluded.latest_observed_at,targets_progress_json=excluded.targets_progress_json,last_updated_at=excluded.last_updated_at").bind(
+      prediction.prediction_id,market.price_usd,timestamp,JSON.stringify(targets),timestamp
+    ).run();
+  }
+  return {status:"observed",price_usd:market.price_usd,source:market.source,observed_at:timestamp};
+}
+
+async function evaluateConanPredictionCycle(db,cycle){
+  const predictions=await db.prepare("SELECT * FROM ci_conan_predictions WHERE cycle_id=? ORDER BY locked_at ASC").bind(cycle.cycle_id).all();
+  const evaluated=[];
+  for(const prediction of predictions.results||[]){
+    const exists=await db.prepare("SELECT result_id FROM ci_conan_prediction_results WHERE prediction_id=?").bind(prediction.prediction_id).first();
+    if(exists)continue;
+    const observations=await db.prepare("SELECT price_usd,observed_at,source FROM ci_conan_prediction_observations WHERE cycle_id=? AND discovery_key=? AND observed_at>=? AND price_usd>0 ORDER BY observed_at ASC").bind(cycle.cycle_id,prediction.discovery_key,prediction.locked_at).all();
+    const samples=observations.results||[],final=samples.length?samples[samples.length-1]:null;
+    if(!final){
+      await db.prepare("INSERT INTO ci_conan_prediction_results (result_id,prediction_id,cycle_id,discovery_key,outcome_status,direction_correct,reference_price_usd,final_price_usd,direction_change_percent,targets_touched_json,targets_held_1h_json,learning_notes_json,evaluated_at) VALUES (?,?,?,?, 'unverifiable',NULL,?,NULL,NULL,'[]','[]',?,?)").bind(
+        cryptoRandomId(),prediction.prediction_id,cycle.cycle_id,prediction.discovery_key,prediction.reference_price_usd,JSON.stringify({reason:"Aucun prix source exploitable après verrouillage."}),nowISO()
+      ).run();
+      evaluated.push({prediction_id:prediction.prediction_id,status:"unverifiable"});continue;
+    }
+    const change=(Number(final.price_usd)-Number(prediction.reference_price_usd))/Number(prediction.reference_price_usd)*100;
+    const directionCorrect=prediction.direction==="up"?(change>0?1:0):prediction.direction==="down"?(change<0?1:0):(Math.abs(change)<=3?1:0);
+    const progress=await db.prepare("SELECT targets_progress_json FROM ci_conan_prediction_progress WHERE prediction_id=?").bind(prediction.prediction_id).first();
+    let targets=[];try{targets=JSON.parse(progress?.targets_progress_json||"[]");}catch{targets=[];}
+    const touched=targets.filter(item=>item.touched_at).map(item=>({target_index:item.target_index,price_usd:item.price_usd,touched_at:item.touched_at}));
+    const held=targets.filter(item=>item.held_1h_at).map(item=>({target_index:item.target_index,price_usd:item.price_usd,held_1h_at:item.held_1h_at,verification_method:item.verification_method}));
+    const notes={direction_rule:"Comparaison entre le prix de référence verrouillé et le dernier prix observé au jour 15.",sideways_rule:"Variation absolue de 3 % ou moins.",target_rule:"Contact et confirmation par deux observations favorables espacées d'au moins une heure sont distincts; aucune continuité permanente n'est affirmée.",observations_after_lock:samples.length,first_observation:samples[0]?.observed_at||null,final_observation:final.observed_at,final_source:final.source,direction_change_percent:change,direction_correct:directionCorrect===1};
+    await db.prepare("INSERT INTO ci_conan_prediction_results (result_id,prediction_id,cycle_id,discovery_key,outcome_status,direction_correct,reference_price_usd,final_price_usd,direction_change_percent,targets_touched_json,targets_held_1h_json,learning_notes_json,evaluated_at) VALUES (?,?,?,?, 'evaluated',?,?,?,?,?,?,?,?)").bind(
+      cryptoRandomId(),prediction.prediction_id,cycle.cycle_id,prediction.discovery_key,directionCorrect,prediction.reference_price_usd,final.price_usd,change,JSON.stringify(touched),JSON.stringify(held),JSON.stringify(notes),nowISO()
+    ).run();
+    evaluated.push({prediction_id:prediction.prediction_id,status:"evaluated",direction_correct:directionCorrect===1,change_percent:change,targets_touched:touched.length,targets_held_1h:held.length});
+  }
+  const rows=await db.prepare("SELECT outcome_status,direction_correct FROM ci_conan_prediction_results WHERE cycle_id=?").bind(cycle.cycle_id).all();
+  const valid=(rows.results||[]).filter(item=>item.outcome_status==="evaluated"),correct=valid.filter(item=>Number(item.direction_correct)===1).length;
+  const summary={evaluated_predictions:valid.length,unverifiable_predictions:(rows.results||[]).filter(item=>item.outcome_status==="unverifiable").length,direction_correct:correct,direction_accuracy_percent:valid.length?correct/valid.length*100:null,formal_conan_score:"Calculé selon la pondération officielle au chapitre 9; non anticipé ici."};
+  const timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_conan_learning_history (learning_id,cycle_id,learning_type,summary,evidence_json,created_at) VALUES (?,?,?,?,?,?)").bind(
+    cryptoRandomId(),cycle.cycle_id,"cycle_evaluation","Évaluation du cycle de 15 jours : résultats, erreurs, cibles touchées et cibles maintenues.",JSON.stringify(summary),timestamp
+  ).run();
+  await db.prepare("UPDATE ci_conan_prediction_cycles SET status='completed',current_day=15,updated_at=?,completed_at=? WHERE cycle_id=?").bind(timestamp,timestamp,cycle.cycle_id).run();
+  await audit(db,"conan_prediction_cycle_completed","Cycle "+cycle.cycle_id+" évalué : "+valid.length+" prévisions vérifiables, "+correct+" directions correctes.");
+  return {status:"completed",cycle_id:cycle.cycle_id,summary,evaluated};
+}
+
+async function runConanPredictionCycle(db,env){
+  try{
+    await ensureConanPredictionTables(db);
+    let cycle=await db.prepare("SELECT * FROM ci_conan_prediction_cycles WHERE status IN ('observing','tracking') ORDER BY cycle_start_date ASC LIMIT 1").first();
+    if(!cycle)return await createConanPredictionCycle(db);
+    const today=conanUtcDate(),day=conanCycleDay(cycle.cycle_start_date,today);
+    if(day>15)return await evaluateConanPredictionCycle(db,cycle);
+    const result=await db.prepare("SELECT * FROM ci_conan_prediction_assets WHERE cycle_id=? ORDER BY asset_order ASC").bind(cycle.cycle_id).all();
+    const assets=result.results||[],observations=[];
+    for(const asset of assets)observations.push({discovery_key:asset.discovery_key,...await recordConanPredictionObservation(db,cycle,asset,day)});
+    if(day<8){
+      await db.prepare("UPDATE ci_conan_prediction_cycles SET current_day=?,updated_at=? WHERE cycle_id=?").bind(day,nowISO(),cycle.cycle_id).run();
+      return {status:"observing",cycle_id:cycle.cycle_id,day,phase:"observation_days_1_to_7",observations,predictions_locked:0};
+    }
+    await db.prepare("UPDATE ci_conan_prediction_cycles SET status='tracking',current_day=?,updated_at=? WHERE cycle_id=?").bind(day,nowISO(),cycle.cycle_id).run();
+    const configured=Number(env.AI_COUNCIL_DAILY_PROVIDER_CALL_LIMIT),dailyLimit=Number.isFinite(configured)?Math.max(1,Math.min(50,Math.floor(configured))):CONAN_PROVIDER_DAILY_LIMIT_DEFAULT;
+    const usage=await getConanProviderUsage(db,new Date(Date.now()-86400000).toISOString()),locks=[];
+    for(const asset of assets){
+      const existing=await db.prepare("SELECT prediction_id FROM ci_conan_predictions WHERE cycle_id=? AND discovery_key=?").bind(cycle.cycle_id,asset.discovery_key).first();
+      if(existing){locks.push({discovery_key:asset.discovery_key,status:"already_locked",prediction_id:existing.prediction_id});continue;}
+      const attempt=await db.prepare("SELECT COUNT(*) AS count FROM ci_conan_prediction_opinions WHERE cycle_id=? AND discovery_key=? AND created_at>=?").bind(cycle.cycle_id,asset.discovery_key,today+"T00:00:00.000Z").first();
+      if(Number(attempt?.count||0)>0){locks.push({discovery_key:asset.discovery_key,status:"attempted_today_waiting_for_next_daily_window"});continue;}
+      const market=await getConanLatestMarket(db,asset.discovery_key);
+      locks.push({discovery_key:asset.discovery_key,...await lockConanPredictionForAsset(db,env,cycle,asset,market,usage,dailyLimit)});
+    }
+    if(day>=15)return {...await evaluateConanPredictionCycle(db,{...cycle,current_day:day,status:"tracking"}),observations,locks};
+    return {status:"tracking",cycle_id:cycle.cycle_id,day,phase:"prediction_lock_and_tracking_days_8_to_15",observations,locks};
+  }catch(error){
+    await audit(db,"conan_prediction_cycle_error",safeString(error.message||"Erreur du cycle Conan.",1000));
+    return {status:"error",error:safeString(error.message||"Erreur du cycle Conan.",700)};
+  }
+}
+
+
 export default {
   async fetch(request, env, ctx) {
     const response = await handleRequest(request, env, ctx);
