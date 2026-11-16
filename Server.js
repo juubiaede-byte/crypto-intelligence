@@ -77,6 +77,8 @@ const JSON_HEADERS = {
 };
 
 const ARCHIVE_TABLES = [
+  "ci_investigation_reports",
+  "ci_investigation_evidence",
   "ai_opinions",
   "alerts",
   "analyses",
@@ -432,6 +434,38 @@ async function initializeBackendTables(db) {
       actor TEXT NOT NULL DEFAULT 'api'
     )`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_investment_decisions_asset ON ci_investment_decisions(discovery_key, decided_at DESC)`)
+
+
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_investigation_reports (
+      report_id TEXT PRIMARY KEY,
+      discovery_key TEXT NOT NULL,
+      report_version INTEGER NOT NULL DEFAULT 1,
+      report_status TEXT NOT NULL DEFAULT 'incomplete',
+      coverage_percent REAL NOT NULL DEFAULT 0,
+      confidence_percent REAL NOT NULL DEFAULT 0,
+      sections_json TEXT NOT NULL DEFAULT '{}',
+      missing_data_json TEXT NOT NULL DEFAULT '[]',
+      risk_register_json TEXT NOT NULL DEFAULT '[]',
+      sources_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      analyst TEXT NOT NULL DEFAULT 'api'
+    )`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_investigation_reports_asset ON ci_investigation_reports(discovery_key, report_version DESC, updated_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_investigation_evidence (
+      evidence_id TEXT PRIMARY KEY,
+      report_id TEXT NOT NULL,
+      discovery_key TEXT NOT NULL,
+      section_key TEXT NOT NULL,
+      field_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      source TEXT NOT NULL,
+      observed_at TEXT,
+      confidence_percent REAL,
+      evidence_status TEXT NOT NULL DEFAULT 'observed',
+      recorded_at TEXT NOT NULL
+    )`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_investigation_evidence_report ON ci_investigation_evidence(report_id, section_key, field_key, recorded_at DESC)`)
 
 
   ]);
@@ -4640,6 +4674,52 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, count: result.results?.length || 0, decisions: result.results || [] });
   }
 
+
+  /* ---------------- CHAPITRE 4 — LABORATOIRE D'INVESTIGATION -------------- */
+
+  if (method === "POST" && path === "/api/radar/investigation/report") {
+    const body = await readBody(request);
+    const discoveryKey = safeString(body.discovery_key || "", 200);
+    if (!discoveryKey) return errorResponse("discovery_key requis.");
+    const asset = await db.prepare("SELECT discovery_key FROM ci_radar_discoveries WHERE discovery_key = ?").bind(discoveryKey).first();
+    if (!asset) return errorResponse("Actif radar introuvable.", 404);
+    const lifecycle = await db.prepare("SELECT current_stage FROM ci_radar_asset_lifecycle WHERE discovery_key = ?").bind(discoveryKey).first();
+    if (!lifecycle || !["precursors", "investigation_lab", "potential_investment_circle"].includes(lifecycle.current_stage)) {
+      return errorResponse("Le dossier d'investigation est réservé aux actifs ayant atteint les précurseurs ou une étape ultérieure.", 409);
+    }
+    const report = buildRadarInvestigationReport(body.sections || {}, body.risks || []);
+    const saved = await persistRadarInvestigationReport(db, discoveryKey, report, body.analyst || "api");
+    await audit(db, "investigation_report_created", discoveryKey + " — version " + saved.report_version + " — couverture " + saved.coverage_percent + "%");
+    return json({ success: true, report: saved }, 201);
+  }
+
+  if (method === "GET" && path === "/api/radar/investigation/report") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    if (!discoveryKey) return errorResponse("discovery_key requis.");
+    const report = await getLatestRadarInvestigationReport(db, discoveryKey);
+    if (!report) return json({ success: true, report: null, message: "Aucun dossier d'investigation enregistré." });
+    return json({ success: true, report, methodology: RADAR_INVESTIGATION_SECTIONS });
+  }
+
+  if (method === "GET" && path === "/api/radar/investigation/history") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    if (!discoveryKey) return errorResponse("discovery_key requis.");
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit")) || 50));
+    const result = await db.prepare("SELECT report_id, discovery_key, report_version, report_status, coverage_percent, confidence_percent, missing_data_json, sources_json, created_at, updated_at, analyst FROM ci_investigation_reports WHERE discovery_key = ? ORDER BY report_version DESC LIMIT ?").bind(discoveryKey, limit).all();
+    return json({ success: true, count: result.results?.length || 0, history: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/api/radar/investigation/evidence") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    if (!discoveryKey) return errorResponse("discovery_key requis.");
+    const reportId = safeString(url.searchParams.get("report_id") || "", 120);
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 300));
+    const result = reportId
+      ? await db.prepare("SELECT * FROM ci_investigation_evidence WHERE discovery_key = ? AND report_id = ? ORDER BY recorded_at DESC LIMIT ?").bind(discoveryKey, reportId, limit).all()
+      : await db.prepare("SELECT * FROM ci_investigation_evidence WHERE discovery_key = ? ORDER BY recorded_at DESC LIMIT ?").bind(discoveryKey, limit).all();
+    return json({ success: true, count: result.results?.length || 0, evidence: result.results || [] });
+  }
+
   return errorResponse("Route API introuvable.", 404);
 }
 
@@ -5103,6 +5183,148 @@ async function getRadarInvestmentCircle(db, limit = 100) {
     WHERE l.current_stage = 'potential_investment_circle'
     ORDER BY e.overall_score DESC, l.entered_stage_at DESC LIMIT ?`).bind(Math.max(1, Math.min(500, Number(limit) || 100))).all();
   return result.results || [];
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 4 — LABORATOIRE D'INVESTIGATION                                   */
+/* -------------------------------------------------------------------------- */
+
+const RADAR_INVESTIGATION_SECTIONS = [
+  { key: "origin_history", label: "Origine et historique", fields: ["launch_date", "origin_story", "chain", "contract", "migration_history"] },
+  { key: "team", label: "Équipe et contributeurs", fields: ["founders", "team_members", "public_profiles", "track_record"] },
+  { key: "technology_utility", label: "Technologie et utilité", fields: ["technology", "use_case", "utility", "roadmap", "technical_documentation"] },
+  { key: "tokenomics", label: "Tokenomics et distribution", fields: ["total_supply", "max_supply", "circulating_supply", "distribution", "vesting", "unlock_schedule", "emissions"] },
+  { key: "valuation", label: "Valorisation", fields: ["market_cap", "fully_diluted_valuation", "valuation_method", "valuation_timestamp"] },
+  { key: "liquidity_market", label: "Liquidité et marché", fields: ["liquidity_usd", "pool_depth", "volume_24h", "spread", "sellability", "slippage"] },
+  { key: "reputation_community", label: "Réputation et communauté", fields: ["community_channels", "community_quality", "reputation_signals", "sentiment_context"] },
+  { key: "partnerships", label: "Partenariats", fields: ["partners", "announcements", "verification_status"] },
+  { key: "development_adoption", label: "Développement et adoption", fields: ["repository_activity", "release_activity", "developers", "users", "transactions", "integrations", "adoption_metrics"] },
+  { key: "risks", label: "Risques", fields: ["security_risks", "centralization_risks", "regulatory_risks", "market_risks", "operational_risks", "conflicts_of_interest"] }
+];
+
+function normalizeRadarInvestigationSection(sectionKey, value) {
+  const definition = RADAR_INVESTIGATION_SECTIONS.find(section => section.key === sectionKey);
+  if (!definition || !value || typeof value !== "object" || Array.isArray(value)) return null;
+  const normalized = {};
+  const missing = [];
+  const sources = new Set();
+  let confidenceTotal = 0;
+  let confidenceCount = 0;
+  for (const field of definition.fields) {
+    const item = value[field];
+    if (item === undefined || item === null || item === "") {
+      missing.push(field);
+      normalized[field] = { status: "unknown", value: null, source: null, confidence_percent: null };
+      continue;
+    }
+    const record = item && typeof item === "object" && !Array.isArray(item) && Object.prototype.hasOwnProperty.call(item, "value")
+      ? item : { value: item };
+    const source = safeString(record.source || "", 500);
+    const confidence = Number(record.confidence_percent);
+    const status = ["verified", "observed", "estimated", "unverified", "disputed"].includes(record.status)
+      ? record.status : (source ? "observed" : "unverified");
+    if (source) sources.add(source);
+    const validConfidence = Number.isFinite(confidence) && confidence >= 0 && confidence <= 100 ? confidence : null;
+    if (validConfidence !== null) { confidenceTotal += validConfidence; confidenceCount++; }
+    normalized[field] = {
+      status,
+      value: record.value,
+      source: source || null,
+      observed_at: safeString(record.observed_at || "", 80) || null,
+      confidence_percent: validConfidence,
+      notes: safeString(record.notes || "", 1000) || null
+    };
+  }
+  return {
+    section_key: sectionKey,
+    label: definition.label,
+    fields: normalized,
+    missing_fields: missing,
+    coverage_percent: Math.round(((definition.fields.length - missing.length) / definition.fields.length) * 100),
+    confidence_percent: confidenceCount ? Math.round(confidenceTotal / confidenceCount) : null,
+    sources: [...sources]
+  };
+}
+
+function buildRadarInvestigationReport(sectionsInput, riskInput) {
+  const sections = {};
+  const missing = [];
+  const allSources = new Set();
+  let totalFields = 0;
+  let suppliedFields = 0;
+  let confidenceTotal = 0;
+  let confidenceCount = 0;
+  for (const definition of RADAR_INVESTIGATION_SECTIONS) {
+    const section = normalizeRadarInvestigationSection(definition.key, sectionsInput?.[definition.key]);
+    if (!section) {
+      missing.push({ section: definition.key, fields: definition.fields, reason: "Section absente ou invalide." });
+      totalFields += definition.fields.length;
+      continue;
+    }
+    sections[definition.key] = section;
+    totalFields += definition.fields.length;
+    suppliedFields += definition.fields.length - section.missing_fields.length;
+    for (const source of section.sources) allSources.add(source);
+    if (section.confidence_percent !== null) { confidenceTotal += section.confidence_percent; confidenceCount++; }
+    if (section.missing_fields.length) missing.push({ section: definition.key, fields: section.missing_fields, reason: "Données non fournies; elles restent inconnues." });
+  }
+  const risks = Array.isArray(riskInput) ? riskInput.slice(0, 100).map(item => ({
+    risk: safeString(item?.risk || item?.description || "", 1000),
+    severity: ["critical", "high", "medium", "low", "unknown"].includes(safeString(item?.severity || "unknown", 20).toLowerCase()) ? safeString(item?.severity || "unknown", 20).toLowerCase() : "unknown",
+    status: ["confirmed", "suspected", "mitigated", "unverified"].includes(safeString(item?.status || "unverified", 20).toLowerCase()) ? safeString(item?.status || "unverified", 20).toLowerCase() : "unverified",
+    source: safeString(item?.source || "", 500) || null,
+    notes: safeString(item?.notes || "", 1000) || null
+  })).filter(item => item.risk) : [];
+  const coverage = totalFields ? Math.round(suppliedFields / totalFields * 100) : 0;
+  return {
+    sections,
+    missing_data: missing,
+    risk_register: risks,
+    sources: [...allSources],
+    coverage_percent: coverage,
+    confidence_percent: confidenceCount ? Math.round(confidenceTotal / confidenceCount) : 0,
+    report_status: coverage === 100 ? "complete" : suppliedFields > 0 ? "incomplete" : "empty",
+    methodology: "Chaque champ est conservé avec son statut, sa source et sa confiance. Une absence est affichée comme inconnue, jamais comme zéro ou comme fait. Les estimations et éléments non vérifiés restent explicitement distingués."
+  };
+}
+
+async function persistRadarInvestigationReport(db, discoveryKey, report, analyst = "api") {
+  const previous = await db.prepare("SELECT MAX(report_version) AS version FROM ci_investigation_reports WHERE discovery_key = ?").bind(discoveryKey).first();
+  const version = Number(previous?.version || 0) + 1;
+  const reportId = cryptoRandomId();
+  const timestamp = nowISO();
+  await db.prepare(`INSERT INTO ci_investigation_reports
+    (report_id, discovery_key, report_version, report_status, coverage_percent, confidence_percent,
+     sections_json, missing_data_json, risk_register_json, sources_json, created_at, updated_at, analyst)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      reportId, discoveryKey, version, report.report_status, report.coverage_percent,
+      report.confidence_percent, JSON.stringify(report.sections), JSON.stringify(report.missing_data),
+      JSON.stringify(report.risk_register), JSON.stringify(report.sources), timestamp, timestamp,
+      safeString(analyst, 80) || "api"
+    ).run();
+  const evidenceStatements = [];
+  for (const [sectionKey, section] of Object.entries(report.sections)) {
+    for (const [fieldKey, field] of Object.entries(section.fields || {})) {
+      if (field.value === null || field.value === undefined) continue;
+      evidenceStatements.push(db.prepare(`INSERT INTO ci_investigation_evidence
+        (evidence_id, report_id, discovery_key, section_key, field_key, value_json, source, observed_at, confidence_percent, evidence_status, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+          cryptoRandomId(), reportId, discoveryKey, sectionKey, fieldKey, JSON.stringify(field.value),
+          field.source || "source_not_provided", field.observed_at, field.confidence_percent,
+          field.status, timestamp
+        ));
+    }
+  }
+  for (let offset = 0; offset < evidenceStatements.length; offset += 50) {
+    await db.batch(evidenceStatements.slice(offset, offset + 50));
+  }
+  return { report_id: reportId, report_version: version, created_at: timestamp, ...report };
+}
+
+async function getLatestRadarInvestigationReport(db, discoveryKey) {
+  return db.prepare("SELECT * FROM ci_investigation_reports WHERE discovery_key = ? ORDER BY report_version DESC LIMIT 1")
+    .bind(discoveryKey).first();
 }
 
 export default {
