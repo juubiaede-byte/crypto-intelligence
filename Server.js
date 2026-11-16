@@ -2527,6 +2527,7 @@ async function runRadarDiscovery(db) {
   const endpoints = [
     { provider: "dexscreener_profiles", url: "https://api.dexscreener.com/token-profiles/latest/v1" },
     { provider: "dexscreener_boosts", url: "https://api.dexscreener.com/token-boosts/latest/v1" },
+    { provider: "dexscreener_boosts_top", url: "https://api.dexscreener.com/token-boosts/top/v1" },
     { provider: "geckoterminal_new_pools", url: "https://api.geckoterminal.com/api/v2/networks/new_pools?include=base_token,quote_token,network,dex" }
   ];
   // Sept réseaux supplémentaires parcourus par rotation pour élargir progressivement
@@ -2574,6 +2575,16 @@ async function runRadarDiscovery(db) {
           token.chainId, token.tokenAddress, token.name, token.symbol, provider,
           { url: token.url || null, description: token.description || null,
             icon: token.icon || null, links: token.links || [] }
+        ));
+      }
+    }
+
+    if (provider === "dexscreener_boosts_top") {
+      for (const token of radarArray(response.data)) {
+        discoveries.push(normalizeRadarToken(
+          token.chainId, token.tokenAddress, token.name, token.symbol, provider,
+          { url: token.url || null, icon: token.icon || null,
+            links: token.links || [], total_amount: token.totalAmount ?? null }
         ));
       }
     }
