@@ -9079,3 +9079,19 @@ dispatchCITelegramAlerts=async function(db,env,limit=10){
   }
   return {processed:results.length,results,posting_identity:"application_backend_bot_only",category_rate_limits:true};
 };
+
+
+/* Chapitre 16 — déclenchement asynchrone de la diffusion après mise en file. */
+const ciChapter16RoutesBeforeAutoDispatch=handleProtectedRoutes;
+handleProtectedRoutes=async function(request,env,ctx,route){
+  const response=await ciChapter16RoutesBeforeAutoDispatch(request,env,ctx,route);
+  if(request.method==="POST"&&(route.path==="/api/telegram/alert"||route.path==="/api/telegram/queue")&&response.ok){
+    try{
+      const db=getDB(env);
+      const task=dispatchCITelegramAlerts(db,env,10).catch(error=>console.error("Telegram async dispatch error:",safeString(error.message||"Erreur.",500)));
+      if(ctx?.waitUntil)ctx.waitUntil(task);
+      else await task;
+    }catch(error){console.error("Telegram dispatch scheduling error:",safeString(error.message||"Erreur.",500));}
+  }
+  return response;
+};
