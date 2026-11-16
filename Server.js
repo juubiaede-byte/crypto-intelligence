@@ -5506,7 +5506,7 @@ async function runRadarAICouncil(env, db, discoveryKey) {
   const limitValue = Number(env.AI_COUNCIL_DAILY_PROVIDER_CALL_LIMIT);
   const dailyLimit = Number.isFinite(limitValue) ? Math.max(1, Math.min(50, Math.floor(limitValue))) : 5;
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const usageResult = await db.prepare("SELECT provider, COUNT(*) AS calls FROM ci_ai_council_opinions WHERE status = 'completed' AND created_at >= ? GROUP BY provider").bind(since).all();
+  const usageResult = await db.prepare("SELECT provider, COUNT(*) AS calls FROM ci_ai_council_opinions WHERE status IN ('completed', 'failed') AND created_at >= ? GROUP BY provider").bind(since).all();
   const usage = new Map((usageResult.results || []).map(row => [row.provider, Number(row.calls) || 0]));
   const available = () => providers.filter(provider => (usage.get(provider) || 0) < dailyLimit);
   const chooseProvider = () => {
@@ -5570,6 +5570,7 @@ async function runRadarAICouncil(env, db, discoveryKey) {
           cryptoRandomId(), sessionId, discoveryKey, role.id, provider,
           RADAR_AI_COUNCIL_PROMPT_VERSION, message, nowISO()
         ).run();
+      usage.set(provider, (usage.get(provider) || 0) + 1);
       await recordProviderUsage(db, provider, false, error.status || 500);
       return null;
     }
