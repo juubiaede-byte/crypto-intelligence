@@ -4145,6 +4145,41 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, stages: RADAR_LIFECYCLE_STAGES, counts: counts.results || [], count: result.results?.length || 0, assets: result.results || [], synchronization });
   }
 
+  if (method === "GET" && path === "/api/radar/lifecycle-detail") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    if (!discoveryKey) return errorResponse("Le paramètre discovery_key est obligatoire.");
+    await syncRadarAssetLifecycle(db, 5000);
+    await syncRadarAssetLifecycleMissing(db, 1000);
+    const asset = await db.prepare(
+      "SELECT discovery_key, chain_id, contract_address, token_name, token_symbol, first_seen_at, status, review_reason FROM ci_radar_discoveries WHERE discovery_key = ?"
+    ).bind(discoveryKey).first();
+    if (!asset) return errorResponse("Actif radar introuvable.", 404);
+    const lifecycle = await db.prepare(
+      "SELECT * FROM ci_radar_asset_lifecycle WHERE discovery_key = ?"
+    ).bind(discoveryKey).first();
+    const history = await db.prepare(
+      "SELECT * FROM ci_radar_asset_lifecycle_history WHERE discovery_key = ? ORDER BY transitioned_at ASC, event_id ASC LIMIT 1000"
+    ).bind(discoveryKey).all();
+    const events = history.results || [];
+    const lastEvent = events.length ? events[events.length - 1] : null;
+    const historyConsistent = !!lifecycle && !!lastEvent && lastEvent.to_stage === lifecycle.current_stage;
+    return json({
+      success: true,
+      asset,
+      lifecycle: lifecycle || null,
+      history: events,
+      history_count: events.length,
+      history_consistency: {
+        structurally_consistent: historyConsistent,
+        current_stage: lifecycle?.current_stage || null,
+        last_recorded_stage: lastEvent?.to_stage || null,
+        note: historyConsistent
+          ? "La dernière étape de l'historique correspond à l'étape courante."
+          : "Historique absent ou désaccord avec l'étape courante; contrôle approfondi requis."
+      }
+    });
+  }
+
   if (method === "GET" && path === "/api/radar/lifecycle-history") {
     const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
     const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 200));
