@@ -7996,3 +7996,225 @@ handleProtectedRoutes = async function(request,env,ctx,route){
   }
   return await conanChapter13OriginalProtectedRoutes(request,env,ctx,route);
 };
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 14 — REGISTRE, CONNEXIONS ET GOUVERNANCE DES FOURNISSEURS          */
+/* -------------------------------------------------------------------------- */
+
+const CI_PROVIDER_CATALOGUE_VERSION = "ci-provider-catalogue-v1";
+const CI_PROVIDER_CATALOGUE = [
+  {id:"coingecko",name:"CoinGecko",kind:"market_data",integration:"existing",credential:"COINGECKO_API_KEY",free_tier:"plan-dependent",terms_url:"https://www.coingecko.com/en/api_terms"},
+  {id:"coinmarketcap",name:"CoinMarketCap",kind:"market_data",integration:"new_isolated",credential:"COINMARKETCAP_API_KEY",free_tier:"plan-dependent",terms_url:"https://coinmarketcap.com/api/terms/"},
+  {id:"dexscreener",name:"DexScreener",kind:"dex_data",integration:"existing",credential:null,free_tier:"public-endpoints; limits may apply",terms_url:"https://docs.dexscreener.com/"},
+  {id:"geckoterminal",name:"GeckoTerminal",kind:"dex_data",integration:"existing",credential:null,free_tier:"public-api; limits may apply",terms_url:"https://www.geckoterminal.com/dex-api"},
+  {id:"defillama",name:"DeFiLlama",kind:"defi_data",integration:"new_isolated",credential:null,free_tier:"public-endpoints; limits may apply",terms_url:"https://defillama.com/docs/api"},
+  {id:"etherscan",name:"Etherscan",kind:"onchain_data",integration:"new_isolated",credential:"ETHERSCAN_API_KEY",free_tier:"plan-dependent",terms_url:"https://docs.etherscan.io/"},
+  {id:"blockscout",name:"Blockscout",kind:"onchain_data",integration:"new_isolated",credential:null,free_tier:"public-instance; limits may apply",terms_url:"https://docs.blockscout.com/"},
+  {id:"goplus",name:"GoPlus Security",kind:"security",integration:"existing",credential:null,free_tier:"public-api; limits may apply",terms_url:"https://docs.gopluslabs.io/"},
+  {id:"honeypot",name:"Honeypot.is",kind:"security",integration:"existing",credential:null,free_tier:"public-api; limits may apply",terms_url:"https://docs.honeypot.is/"},
+  {id:"gemini",name:"Google Gemini",kind:"ai",integration:"existing",credential:"GEMINI_API_KEY",free_tier:"model-and-region-dependent",terms_url:"https://ai.google.dev/gemini-api/terms"},
+  {id:"groq",name:"GroqCloud",kind:"ai",integration:"existing",credential:"GROQ_API_KEY",free_tier:"model-and-account-dependent",terms_url:"https://console.groq.com/docs"},
+  {id:"cloudflare",name:"Cloudflare Workers AI",kind:"ai",integration:"existing",credential:"AI binding",free_tier:"account-and-model-dependent",terms_url:"https://developers.cloudflare.com/workers-ai/"},
+  {id:"sambanova",name:"SambaNova",kind:"ai",integration:"existing",credential:"SAMBANOVA_API_KEY",free_tier:"account-dependent",terms_url:"https://docs.sambanova.ai/"},
+  {id:"cohere",name:"Cohere",kind:"ai",integration:"existing",credential:"COHERE_API_KEY",free_tier:"plan-and-model-dependent",terms_url:"https://docs.cohere.com/"}
+];
+
+function ciProviderCredentialAvailable(env,provider){
+  if(provider==="cloudflare")return Boolean(env.AI&&typeof env.AI.run==="function");
+  const item=CI_PROVIDER_CATALOGUE.find(value=>value.id===provider);
+  return Boolean(item&&item.credential&&env[item.credential]);
+}
+
+function ciProviderConfigured(env,provider){
+  if(["dexscreener","geckoterminal","defillama","blockscout","goplus","honeypot"].includes(provider))return true;
+  return ciProviderCredentialAvailable(env,provider);
+}
+
+async function ensureCIProviderManagementTables(db){
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_provider_registry (
+      provider_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+      authorized INTEGER NOT NULL DEFAULT 0, daily_limit INTEGER,
+      monthly_limit INTEGER, quota_reset_at TEXT, terms_reviewed_at TEXT,
+      last_test_at TEXT, last_test_status TEXT, last_error TEXT,
+      updated_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_provider_test_history (
+      test_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, test_type TEXT NOT NULL,
+      status TEXT NOT NULL, http_status INTEGER, latency_ms INTEGER,
+      details_json TEXT NOT NULL, tested_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_provider_usage_metrics (
+      metric_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, operation TEXT,
+      success INTEGER NOT NULL, status_code INTEGER, latency_ms INTEGER,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_provider_metrics_provider_date ON ci_provider_usage_metrics(provider_id,created_at)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_provider_tests_provider_date ON ci_provider_test_history(provider_id,tested_at)")
+  ]);
+  for(const item of CI_PROVIDER_CATALOGUE){
+    await db.prepare("INSERT OR IGNORE INTO ci_provider_registry (provider_id,enabled,authorized,updated_at) VALUES (?,0,0,?)").bind(item.id,nowISO()).run();
+  }
+}
+
+function ciProviderEnvironmentStatus(env,item){
+  const configured=ciProviderConfigured(env,item.id);
+  return {
+    id:item.id,name:item.name,kind:item.kind,integration:item.integration,
+    credential_name:item.credential,credential_configured:configured,
+    status:configured?"credentials_or_public_endpoint_available":"not_configured",
+    free_tier:item.free_tier,terms_url:item.terms_url,
+    quota_is_provider_plan_dependent:true
+  };
+}
+
+async function getCIProviderDashboard(db,env){
+  await ensureCIProviderManagementTables(db);
+  const registry=await db.prepare("SELECT * FROM ci_provider_registry ORDER BY provider_id").all();
+  const registryMap=new Map((registry.results||[]).map(row=>[row.provider_id,row]));
+  const daily=await db.prepare("SELECT provider_id,COUNT(*) AS calls,SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS successes,SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failures,MAX(created_at) AS last_call FROM ci_provider_usage_metrics WHERE created_at>=? GROUP BY provider_id").bind(new Date(Date.now()-86400000).toISOString()).all();
+  const dailyMap=new Map((daily.results||[]).map(row=>[row.provider_id,row]));
+  const oldUsage=await db.prepare("SELECT provider,COUNT(*) AS calls,SUM(success) AS successes,MAX(created_at) AS last_call FROM ci_provider_usage WHERE created_at>=? GROUP BY provider").bind(new Date(Date.now()-86400000).toISOString()).all();
+  const oldMap=new Map((oldUsage.results||[]).map(row=>[row.provider,row]));
+  const providers=CI_PROVIDER_CATALOGUE.map(item=>{
+    const config=registryMap.get(item.id)||{};
+    const metric=dailyMap.get(item.id)||oldMap.get(item.id)||{};
+    const environment=ciProviderEnvironmentStatus(env,item);
+    return {
+      ...environment,enabled:Boolean(config.enabled),authorized:Boolean(config.authorized),
+      daily_limit:config.daily_limit??null,monthly_limit:config.monthly_limit??null,
+      calls_last_24h:Number(metric.calls)||0,successes_last_24h:Number(metric.successes)||0,
+      failures_last_24h:Number(metric.failures)||0,last_call:metric.last_call||null,
+      last_test_at:config.last_test_at||null,last_test_status:config.last_test_status||"not_tested",
+      last_error:config.last_error||null,terms_reviewed_at:config.terms_reviewed_at||null,
+      reset_at:config.quota_reset_at||null,
+      live_connection_verified:false
+    };
+  });
+  return {
+    catalogue_version:CI_PROVIDER_CATALOGUE_VERSION,providers,
+    safeguards:{paid_subscriptions:false,automatic_paid_upgrade:false,automatic_credit_purchase:false,overage_spend:false,new_sources_require_explicit_authorization:true,credentials_in_worker_environment_only:true,quotas_without_provider_confirmation_are_unknown:true}
+  };
+}
+
+async function configureCIProvider(db,env,body){
+  await ensureCIProviderManagementTables(db);
+  const id=safeString(body.provider_id||"",60).toLowerCase();
+  const item=CI_PROVIDER_CATALOGUE.find(value=>value.id===id);
+  if(!item)throw new Error("Fournisseur inconnu du catalogue.");
+  if(body.authorized!==true)throw new Error("Une autorisation explicite true est requise pour activer ce fournisseur.");
+  if(body.enabled!==true)throw new Error("L'activation doit être explicitement demandée avec enabled=true.");
+  const daily=body.daily_limit===undefined?null:Number(body.daily_limit);
+  const monthly=body.monthly_limit===undefined?null:Number(body.monthly_limit);
+  if((daily!==null&&(!Number.isInteger(daily)||daily<1))||(monthly!==null&&(!Number.isInteger(monthly)||monthly<1)))throw new Error("Les plafonds configurés doivent être des entiers positifs.");
+  const timestamp=nowISO();
+  await db.prepare("UPDATE ci_provider_registry SET enabled=1,authorized=1,daily_limit=?,monthly_limit=?,terms_reviewed_at=?,updated_at=? WHERE provider_id=?").bind(
+    daily,monthly,body.terms_reviewed===true?timestamp:null,timestamp,id
+  ).run();
+  await audit(db,"provider_authorized",id+" activé après autorisation explicite; aucun achat ni dépassement payant autorisé.");
+  return {provider_id:id,enabled:true,authorized:true,daily_limit:daily,monthly_limit:monthly,terms_reviewed_at:body.terms_reviewed===true?timestamp:null,credentials_configured:ciProviderConfigured(env,id),paid_spend_enabled:false};
+}
+
+async function testCIProvider(db,env,providerId,body={}){
+  await ensureCIProviderManagementTables(db);
+  const id=safeString(providerId||"",60).toLowerCase();
+  const item=CI_PROVIDER_CATALOGUE.find(value=>value.id===id);
+  if(!item)throw new Error("Fournisseur inconnu.");
+  const config=await db.prepare("SELECT enabled,authorized FROM ci_provider_registry WHERE provider_id=?").bind(id).first();
+  if(!config||!config.enabled||!config.authorized)throw new Error("Test refusé : le fournisseur doit d'abord être autorisé et activé.");
+  const started=Date.now();
+  let status="failed",httpStatus=null,details={},failure=null;
+  try{
+    if(["gemini","groq","cloudflare","sambanova","cohere"].includes(id)){
+      if(!ciProviderCredentialAvailable(env,id))throw new Error("Identifiants ou binding indisponibles dans l'environnement Worker.");
+      const raw=await callAIProvider(id,env,'Réponds uniquement en JSON valide avec {"provider_test":"ok"}. Ne fournis aucune autre donnée.');
+      const parsed=parseAIResponse(raw);
+      details={response_received:Boolean(raw),json_parsed:!parsed.parsing_warning,provider_response_excerpt:safeString(raw,300)};
+      status=raw?"completed":"empty_response";
+      httpStatus=200;
+    }else if(id==="coingecko"){
+      const result=await externalJSON("https://api.coingecko.com/api/v3/ping",{headers:env.COINGECKO_API_KEY?{"x-cg-demo-api-key":env.COINGECKO_API_KEY}:{}});httpStatus=result.status;details={ping_received:Boolean(result.data.gecko_says)};
+      status="completed";
+    }else if(id==="dexscreener"){
+      const result=await externalJSON("https://api.dexscreener.com/latest/dex/search?q=bitcoin");httpStatus=result.status;details={pairs_returned:Array.isArray(result.data.pairs)?result.data.pairs.length:0};status="completed";
+    }else if(id==="geckoterminal"){
+      const result=await externalJSON("https://api.geckoterminal.com/api/v2/networks");httpStatus=result.status;details={networks_returned:Array.isArray(result.data.data)?result.data.data.length:0};status="completed";
+    }else if(id==="defillama"){
+      const result=await externalJSON("https://api.llama.fi/protocols");httpStatus=result.status;details={protocols_returned:Array.isArray(result.data)?result.data.length:0};status="completed";
+    }else if(id==="blockscout"){
+      const result=await externalJSON("https://eth.blockscout.com/api/v2/stats");httpStatus=result.status;details={response_received:Boolean(result.data)};status="completed";
+    }else if(id==="coinmarketcap"){
+      if(!env.COINMARKETCAP_API_KEY)throw new Error("Secret COINMARKETCAP_API_KEY absent des secrets Worker.");
+      const result=await externalJSON("https://pro-api.coinmarketcap.com/v1/cryptocurrency/map?limit=1",{headers:{"X-CMC_PRO_API_KEY":env.COINMARKETCAP_API_KEY}});httpStatus=result.status;details={assets_returned:Array.isArray(result.data.data)?result.data.data.length:0};status="completed";
+    }else if(id==="etherscan"){
+      if(!env.ETHERSCAN_API_KEY)throw new Error("Secret ETHERSCAN_API_KEY absent des secrets Worker.");
+      const endpoint=new URL("https://api.etherscan.io/v2/api");endpoint.searchParams.set("chainid","1");endpoint.searchParams.set("module","proxy");endpoint.searchParams.set("action","eth_blockNumber");endpoint.searchParams.set("apikey",env.ETHERSCAN_API_KEY);
+      const result=await externalJSON(endpoint.toString());httpStatus=result.status;details={rpc_response_received:Boolean(result.data.result)};status=result.data.result?"completed":"provider_error";
+    }else if(id==="goplus"||id==="honeypot"){
+      const address=safeString(body.contract_address||"",100);
+      if(!/^0x[a-fA-F0-9]{40}$/.test(address))throw new Error("Ce test nécessite une adresse de contrat EVM fournie explicitement.");
+      if(id==="goplus"){
+        const result=await externalJSON("https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses="+encodeURIComponent(address));httpStatus=result.status;details={security_result_received:Boolean(result.data.result)};status="completed";
+      }else{
+        const result=await externalJSON("https://api.honeypot.is/v2/IsHoneypot?chainID=1&address="+encodeURIComponent(address));httpStatus=result.status;details={analysis_received:Boolean(result.data.honeypotResult||result.data.simulationResult)};status="completed";
+      }
+    }else{
+      throw new Error("Test isolé non défini pour ce fournisseur.");
+    }
+  }catch(error){
+    failure=safeString(error.message||"Échec du test fournisseur.",700);
+    httpStatus=error.status||httpStatus;
+  }
+  const latency=Date.now()-started,timestamp=nowISO(),testId=cryptoRandomId();
+  await db.prepare("INSERT INTO ci_provider_test_history (test_id,provider_id,test_type,status,http_status,latency_ms,details_json,tested_at) VALUES (?,?,?,?,?,?,?,?)").bind(
+    testId,id,"isolated_connection_probe",status,httpStatus,latency,JSON.stringify({...details,error:failure}),timestamp
+  ).run();
+  await db.prepare("UPDATE ci_provider_registry SET last_test_at=?,last_test_status=?,last_error=?,updated_at=? WHERE provider_id=?").bind(
+    timestamp,status,failure,timestamp,id
+  ).run();
+  await db.prepare("INSERT INTO ci_provider_usage_metrics (metric_id,provider_id,operation,success,status_code,latency_ms,created_at) VALUES (?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),id,"isolated_connection_probe",status==="completed"?1:0,httpStatus,latency,timestamp
+  ).run();
+  return {test_id:testId,provider_id:id,status,http_status:httpStatus,latency_ms:latency,details,error:failure,live_test_performed:true,asset_specific_test:id==="goplus"||id==="honeypot"};
+}
+
+async function getCIProviderUsageHistory(db,limit=100){
+  await ensureCIProviderManagementTables(db);
+  const rows=await db.prepare("SELECT provider_id,operation,success,status_code,latency_ms,created_at FROM ci_provider_usage_metrics ORDER BY created_at DESC LIMIT ?").bind(Math.max(1,Math.min(500,Number(limit)||100))).all();
+  const tests=await db.prepare("SELECT provider_id,test_type,status,http_status,latency_ms,details_json,tested_at FROM ci_provider_test_history ORDER BY tested_at DESC LIMIT ?").bind(Math.max(1,Math.min(200,Number(limit)||100))).all();
+  return {usage:rows.results||[],tests:tests.results||[]};
+}
+
+ARCHIVE_TABLES.push("ci_provider_registry","ci_provider_test_history","ci_provider_usage_metrics");
+
+const conanChapter14OriginalProtectedRoutes = handleProtectedRoutes;
+handleProtectedRoutes = async function(request,env,ctx,route){
+  const {path,method,url}=route;
+  const providerPaths=["/api/providers","/api/providers/usage","/api/providers/configure","/api/providers/test","/api/providers/ai"];
+  if(providerPaths.includes(path)){
+    const db=getDB(env);
+    await initializeBackendTables(db);
+    await ensureCIProviderManagementTables(db);
+    if(method==="GET"&&path==="/api/providers"){
+      return json({success:true,...await getCIProviderDashboard(db,env)});
+    }
+    if(method==="GET"&&path==="/api/providers/ai"){
+      const dashboard=await getCIProviderDashboard(db,env);
+      return json({success:true,providers:dashboard.providers.filter(item=>item.kind==="ai"),safeguards:dashboard.safeguards});
+    }
+    if(method==="GET"&&path==="/api/providers/usage"){
+      return json({success:true,...await getCIProviderUsageHistory(db,url.searchParams.get("limit"))});
+    }
+    if(method==="POST"&&path==="/api/providers/configure"){
+      try{return json({success:true,...await configureCIProvider(db,env,await readBody(request))});}
+      catch(error){return errorResponse(safeString(error.message||"Configuration fournisseur refusée.",1000),400);}
+    }
+    if(method==="POST"&&path==="/api/providers/test"){
+      const body=await readBody(request);
+      try{return json({success:true,...await testCIProvider(db,env,body.provider_id,body)});}
+      catch(error){return errorResponse(safeString(error.message||"Test fournisseur refusé.",1000),400);}
+    }
+  }
+  return await conanChapter14OriginalProtectedRoutes(request,env,ctx,route);
+};
