@@ -6567,6 +6567,155 @@ async function recordConanPredictionObservation(db,cycle,asset,cycleDay){
   return {status:"observed",price_usd:market.price_usd,source:market.source,observed_at:timestamp};
 }
 
+
+/* CHAPITRE 9 — BARÈME CONAN /100, PONDÉRATIONS OFFICIELLES */
+const CONAN_SCORE_METHODOLOGY = "conan-score-100-v1";
+const CONAN_SCORE_WEIGHTS = Object.freeze({
+  direction:25,
+  target_technical:15,
+  probability_calibration:10,
+  project_quality:20,
+  market_activity:15,
+  risk_management:15
+});
+
+function conanSafeParse(value,fallback){
+  try{return JSON.parse(value??"");}catch{return fallback;}
+}
+function conanClamp(value,min=0,max=100){
+  const number=Number(value);
+  return Number.isFinite(number)?Math.max(min,Math.min(max,number)):min;
+}
+function conanHasCriticalRisk(value,depth=0){
+  if(depth>6||value===null||value===undefined)return false;
+  if(typeof value==="string")return /confirmed[_ -]?(scam|rug[_ -]?pull)|honeypot[_ -]?confirmed|cannot[_ -]?sell|malicious[_ -]?contract|critical[_ -]?risk/i.test(value);
+  if(Array.isArray(value))return value.some(item=>conanHasCriticalRisk(item,depth+1));
+  if(typeof value==="object"){
+    for(const [key,item] of Object.entries(value)){
+      if(/critical[_ -]?risk|risk[_ -]?veto|security[_ -]?veto|confirmed[_ -]?(scam|rug[_ -]?pull)|honeypot[_ -]?confirmed|cannot[_ -]?sell|malicious[_ -]?contract/i.test(key)&&item===true)return true;
+      if((key==="risk_flags"||key==="critical_risks"||key==="veto_reasons")&&conanHasCriticalRisk(item,depth+1))return true;
+      if(conanHasCriticalRisk(item,depth+1))return true;
+    }
+  }
+  return false;
+}
+
+async function calculateAndPersistConanScore(db,cycle){
+  const predictionsResult=await db.prepare("SELECT * FROM ci_conan_predictions WHERE cycle_id=? ORDER BY locked_at ASC").bind(cycle.cycle_id).all();
+  const predictions=predictionsResult.results||[];
+  const resultRows=await db.prepare("SELECT * FROM ci_conan_prediction_results WHERE cycle_id=?").bind(cycle.cycle_id).all();
+  const resultsById=new Map((resultRows.results||[]).map(item=>[item.prediction_id,item]));
+  const evaluated=predictions.filter(item=>resultsById.get(item.prediction_id)?.outcome_status==="evaluated");
+  const unverifiable=(resultRows.results||[]).filter(item=>item.outcome_status==="unverifiable").length;
+  if(!evaluated.length){
+    const noData={reason:"Aucune prédiction vérifiable : score total non calculable, aucune note artificielle.",weights:CONAN_SCORE_WEIGHTS};
+    await db.prepare("INSERT OR IGNORE INTO ci_conan_score_history (score_id,cycle_id,score_total,direction_score,targets_technical_score,probability_calibration_score,project_quality_score,market_activity_score,risk_management_score,evaluated_predictions,unverifiable_predictions,methodology_version,components_json,created_at) VALUES (?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?,?,?,?)").bind(
+      cryptoRandomId(),cycle.cycle_id,0,unverifiable,CONAN_SCORE_METHODOLOGY,JSON.stringify(noData),nowISO()
+    ).run();
+    return {score_total:null,score_status:"not_calculable",reason:noData.reason,weights:CONAN_SCORE_WEIGHTS};
+  }
+
+  let directionCorrect=0,targetTechnicalTotal=0,calibrationTotal=0,projectTotal=0,activityTotal=0,riskTotal=0;
+  let targetCount=0,calibrationCount=0;
+  const assetEvidence=[];
+  for(const prediction of evaluated){
+    const result=resultsById.get(prediction.prediction_id);
+    if(Number(result.direction_correct)===1)directionCorrect++;
+    const progressRow=await db.prepare("SELECT targets_progress_json FROM ci_conan_prediction_progress WHERE prediction_id=?").bind(prediction.prediction_id).first();
+    const progress=conanSafeParse(progressRow?.targets_progress_json,[]);
+    const targets=Array.isArray(progress)?progress:[];
+    let targetAttainment=0,targetCalibration=0;
+    for(const target of targets){
+      const probability=conanClamp(target.probability_percent,0,100)/100;
+      const touched=Boolean(target.touched_at);
+      const held=Boolean(target.held_1h_at);
+      targetAttainment+=held?1:touched?0.5:0;
+      targetCalibration+=(probability-(touched?1:0))**2;
+      targetCount++;calibrationCount++;
+    }
+    const technical=targets.length?15*targetAttainment/targets.length:0;
+    const calibration=targets.length?10*(1-targetCalibration/targets.length):0;
+    targetTechnicalTotal+=technical;
+    calibrationTotal+=calibration;
+
+    const [investment,report,observations,opinions]=await Promise.all([
+      db.prepare("SELECT overall_score,coverage_percent,confidence_percent,critical_risk,evaluation_status FROM ci_investment_evaluations WHERE discovery_key=? ORDER BY evaluated_at DESC LIMIT 1").bind(prediction.discovery_key).first(),
+      db.prepare("SELECT coverage_percent,confidence_percent,report_status FROM ci_investigation_reports WHERE discovery_key=? ORDER BY report_version DESC LIMIT 1").bind(prediction.discovery_key).first(),
+      db.prepare("SELECT price_usd,liquidity_usd,volume_24h_usd,buys_24h,sells_24h,observed_at FROM ci_conan_prediction_observations WHERE cycle_id=? AND discovery_key=? AND observed_at>=? ORDER BY observed_at ASC").bind(cycle.cycle_id,prediction.discovery_key,prediction.locked_at).all(),
+      db.prepare("SELECT role,status,opinion_json,error_message FROM ci_conan_prediction_opinions WHERE prediction_id=?").bind(prediction.prediction_id).all()
+    ]);
+    const evalScore=investment?conanClamp(investment.overall_score):0;
+    const evalCoverage=investment?conanClamp(investment.coverage_percent):0;
+    const reportCoverage=report?conanClamp(report.coverage_percent):0;
+    const project=investment?20*(evalScore/100)*((0.7*evalCoverage+0.3*reportCoverage)/100):0;
+    projectTotal+=project;
+
+    const samples=observations.results||[];
+    const hasLiquidity=samples.some(item=>radarFiniteMetric(item.liquidity_usd)!==null);
+    const hasVolume=samples.some(item=>radarFiniteMetric(item.volume_24h_usd)!==null);
+    const hasBuys=samples.some(item=>radarFiniteMetric(item.buys_24h)!==null);
+    const hasSells=samples.some(item=>radarFiniteMetric(item.sells_24h)!==null);
+    const activityCoverage=[hasLiquidity,hasVolume,hasBuys,hasSells].filter(Boolean).length/4;
+    const transactionCount=samples.reduce((sum,item)=>sum+Math.max(0,Number(item.buys_24h)||0)+Math.max(0,Number(item.sells_24h)||0),0);
+    const transactionActivity=Math.min(1,Math.log1p(transactionCount)/Math.log(101));
+    const persistence=Math.min(1,samples.length/3);
+    const activity=5*activityCoverage+5*transactionActivity+5*persistence;
+    activityTotal+=activity;
+
+    const opinionRows=opinions.results||[];
+    const securityOpinion=opinionRows.find(item=>item.role==="security"&&item.status==="completed");
+    const arbiterOpinion=opinionRows.find(item=>item.role==="arbiter"&&item.status==="completed");
+    const risks=conanSafeParse(prediction.risks_json,[]);
+    const opinionPayloads=opinionRows.map(item=>conanSafeParse(item.opinion_json,{}));
+    const criticalRisk=Number(investment?.critical_risk)===1||conanHasCriticalRisk(risks)||opinionPayloads.some(item=>conanHasCriticalRisk(item));
+    const invalidation=radarFiniteMetric(prediction.invalidation_price_usd)!==null;
+    const riskRegister=Array.isArray(risks)&&risks.length>0;
+    let riskManagement=criticalRisk?0:
+      (invalidation?5:0)+(riskRegister?3:0)+(securityOpinion?3:0)+(arbiterOpinion?2:0)+(!criticalRisk?2:0);
+    riskManagement=conanClamp(riskManagement,0,15);
+    riskTotal+=riskManagement;
+    assetEvidence.push({
+      prediction_id:prediction.prediction_id,discovery_key:prediction.discovery_key,
+      direction_correct:Number(result.direction_correct)===1,
+      target_count:targets.length,target_attainment_score:technical,probability_calibration_score:calibration,
+      investment_evaluation_available:Boolean(investment),investment_score:investment?evalScore:null,
+      investment_coverage_percent:investment?evalCoverage:null,investigation_coverage_percent:report?reportCoverage:null,
+      market_observation_count:samples.length,transaction_count:transactionCount,
+      market_activity_score:activity,security_opinion_available:Boolean(securityOpinion),
+      arbiter_opinion_available:Boolean(arbiterOpinion),invalidation_defined:invalidation,
+      risk_register_present:riskRegister,critical_risk_detected:criticalRisk,risk_management_score:riskManagement
+    });
+  }
+  const count=evaluated.length;
+  const directionScore=25*directionCorrect/count;
+  const targetsTechnicalScore=targetTechnicalTotal/count;
+  const probabilityCalibrationScore=calibrationTotal/count;
+  const projectQualityScore=projectTotal/count;
+  const marketActivityScore=activityTotal/count;
+  const riskManagementScore=riskTotal/count;
+  const total=conanClamp(directionScore+targetsTechnicalScore+probabilityCalibrationScore+projectQualityScore+marketActivityScore+riskManagementScore,0,100);
+  const components={
+    weights:CONAN_SCORE_WEIGHTS,
+    direction:{score:directionScore,max:25,correct:directionCorrect,evaluated:count,formula:"25 × directions correct / prédictions évaluées"},
+    target_technical:{score:targetsTechnicalScore,max:15,formula:"Par cible : 1 si maintenue une heure, 0.5 si seulement touchée, 0 sinon; moyenne par prédiction puis moyenne du cycle."},
+    probability_calibration:{score:probabilityCalibrationScore,max:10,formula:"10 × (1 − Brier moyen); événement cible = cible touchée, probabilité exprimée entre 0 et 1."},
+    project_quality:{score:projectQualityScore,max:20,formula:"20 × score investissement/100 × (70 % couverture évaluation + 30 % couverture dossier)/100; données absentes = 0 et signalées."},
+    market_activity:{score:marketActivityScore,max:15,formula:"5 points couverture liquidité/volume/achats/ventes + 5 activité transactionnelle logarithmique plafonnée à 100 transactions + 5 persistance plafonnée à 3 observations."},
+    risk_management:{score:riskManagementScore,max:15,formula:"5 invalidation définie + 3 registre de risques + 3 avis sécurité + 2 avis arbitre + 2 absence de veto critique; risque critique détecté = 0 pour cette prédiction."},
+    evaluated_predictions:count,unverifiable_predictions:unverifiable,asset_evidence:assetEvidence,
+    missing_data_policy:"Les données absentes ne sont pas inventées et ne rapportent aucun point dans leur composante.",
+    target_calibration_note:"La calibration est une mesure Brier descriptive sur les cibles touchées; elle ne prouve pas la qualité statistique à faible échantillon.",
+    methodology_version:CONAN_SCORE_METHODOLOGY
+  };
+  await db.prepare("INSERT OR IGNORE INTO ci_conan_score_history (score_id,cycle_id,score_total,direction_score,targets_technical_score,probability_calibration_score,project_quality_score,market_activity_score,risk_management_score,evaluated_predictions,unverifiable_predictions,methodology_version,components_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),cycle.cycle_id,total,directionScore,targetsTechnicalScore,probabilityCalibrationScore,projectQualityScore,marketActivityScore,riskManagementScore,count,unverifiable,CONAN_SCORE_METHODOLOGY,JSON.stringify(components),nowISO()
+  ).run();
+  return {score_total:total,score_status:"calculated",components:{
+    direction:directionScore,targets_technical:targetsTechnicalScore,probability_calibration:probabilityCalibrationScore,
+    project_quality:projectQualityScore,market_activity:marketActivityScore,risk_management:riskManagementScore
+  },evaluated_predictions:count,unverifiable_predictions:unverifiable,methodology_version:CONAN_SCORE_METHODOLOGY};
+}
+
 async function evaluateConanPredictionCycle(db,cycle){
   const predictions=await db.prepare("SELECT * FROM ci_conan_predictions WHERE cycle_id=? ORDER BY locked_at ASC").bind(cycle.cycle_id).all();
   const evaluated=[];
