@@ -360,6 +360,8 @@ async function initializeBackendTables(db) {
       CREATE INDEX IF NOT EXISTS idx_ci_radar_pairs_seen
       ON ci_radar_pairs(first_seen_at DESC)
     `)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_verifications (discovery_key TEXT PRIMARY KEY, provider TEXT NOT NULL DEFAULT 'Honeypot.is', outcome TEXT NOT NULL DEFAULT 'unknown', simulation_success INTEGER, risk TEXT, checked_at TEXT NOT NULL, next_check_at TEXT, evidence_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_verifications_next ON ci_radar_verifications(next_check_at, outcome)`)
 
   ]);
 }
@@ -2197,6 +2199,41 @@ async function persistRadarPairs(db, discoveries) {
   }
   return inserted;
 }
+function honeypotChainId(chain) {
+  const normalized = safeString(chain, 80).trim().toLowerCase();
+  const supported = { ethereum: '1', eth: '1', '1': '1', bsc: '56', binance: '56', 'binance-smart-chain': '56', '56': '56', base: '8453', '8453': '8453' };
+  return supported[normalized] || null;
+}
+async function verifyRadarTokenWithHoneypot(db, item) {
+  const chainId = honeypotChainId(item.chain_id); const checkedAt = nowISO();
+  if (!chainId) return { discovery_key: item.discovery_key, outcome: 'unsupported', simulation_success: null, risk: 'unknown', checked_at: checkedAt, next_check_at: null, evidence: { chain_id: item.chain_id, reason: 'Réseau non pris en charge par Honeypot.is.' }, error_message: null };
+  const params = new URLSearchParams({ address: item.contract_address, chainID: chainId });
+  let pairAddress = null; try { const pairs = JSON.parse(item.pair_addresses_json || '[]'); if (Array.isArray(pairs) && pairs.length) pairAddress = pairs[0]; } catch {}
+  if (pairAddress) params.set('pair', pairAddress);
+  try {
+    const { data, status } = await externalJSON('https://api.honeypot.is/v2/IsHoneypot?' + params.toString());
+    await recordProviderUsage(db, 'honeypot_is', true, status);
+    const simulationSuccess = data?.simulationSuccess === true; const hasVerdict = typeof data?.honeypotResult?.isHoneypot === 'boolean';
+    const isHoneypot = data?.honeypotResult?.isHoneypot === true;
+    const outcome = isHoneypot ? 'honeypot_detected' : simulationSuccess && hasVerdict ? 'simulation_passed' : 'unknown';
+    return { discovery_key: item.discovery_key, outcome, simulation_success: simulationSuccess ? 1 : 0, risk: safeString(data?.summary?.risk || 'unknown', 40), checked_at: checkedAt, next_check_at: new Date(Date.now() + (outcome === 'unknown' ? 6 : 24) * 60 * 60 * 1000).toISOString(), evidence: { provider: 'Honeypot.is', chain_id: chainId, token: data?.token || null, summary: data?.summary || null, honeypot_result: data?.honeypotResult || null, simulation_result: data?.simulationResult || null, contract_code: data?.contractCode || null, pair: data?.pair || null, flags: data?.summary?.flags || data?.flags || [], simulation_error: data?.simulationError || null }, error_message: null };
+  } catch (error) {
+    await recordProviderUsage(db, 'honeypot_is', false, error.status || 500);
+    return { discovery_key: item.discovery_key, outcome: 'unknown', simulation_success: null, risk: 'unknown', checked_at: checkedAt, next_check_at: new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString(), evidence: { provider: 'Honeypot.is', chain_id: chainId }, error_message: safeString(error.message || 'Vérification indisponible.', 500) };
+  }
+}
+async function runRadarVerification(db) {
+  const pending = await db.prepare(`SELECT d.discovery_key, d.chain_id, d.contract_address, d.pair_addresses_json FROM ci_radar_discoveries d LEFT JOIN ci_radar_verifications v ON v.discovery_key = d.discovery_key WHERE d.status = 'quarantine' AND (v.discovery_key IS NULL OR (v.next_check_at IS NOT NULL AND v.next_check_at <= ?)) ORDER BY d.first_seen_at ASC LIMIT 5`).bind(nowISO()).all();
+  const summary = { attempted: 0, honeypot_detected: 0, simulation_passed: 0, unknown: 0, unsupported: 0, errors: 0, batch_limit: 5 };
+  for (const item of pending.results || []) {
+    const result = await verifyRadarTokenWithHoneypot(db, item);
+    await db.prepare(`INSERT INTO ci_radar_verifications (discovery_key, provider, outcome, simulation_success, risk, checked_at, next_check_at, evidence_json, error_message) VALUES (?, 'Honeypot.is', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(discovery_key) DO UPDATE SET provider = excluded.provider, outcome = excluded.outcome, simulation_success = excluded.simulation_success, risk = excluded.risk, checked_at = excluded.checked_at, next_check_at = excluded.next_check_at, evidence_json = excluded.evidence_json, error_message = excluded.error_message`).bind(result.discovery_key, result.outcome, result.simulation_success, result.risk, result.checked_at, result.next_check_at, JSON.stringify(result.evidence), result.error_message).run();
+    summary.attempted++;
+    if (result.outcome === 'honeypot_detected') summary.honeypot_detected++; else if (result.outcome === 'simulation_passed') summary.simulation_passed++; else if (result.outcome === 'unsupported') summary.unsupported++; else summary.unknown++;
+    if (result.error_message) summary.errors++;
+  }
+  return summary;
+}
 
 async function runRadarDiscovery(db) {
   await initializeBackendTables(db);
@@ -2277,10 +2314,12 @@ async function runRadarDiscovery(db) {
   try {
     inserted = await persistRadarDiscoveries(db, [...unique.values()]);
     const discoveredPairs = await persistRadarPairs(db, discoveries);
+    const securityVerification = await runRadarVerification(db);
     sourceResults.discovered_pairs = discoveredPairs;
     const successfulSources = Object.values(sourceResults).filter((value) => value.success).length;
     status = successfulSources === endpoints.length ? "completed" :
       successfulSources > 0 ? "partial" : "failed";
+    sourceResults.security_verification = securityVerification;
     if (status === "failed") errorSummary = "Aucune source de découverte n'a répondu correctement.";
   } catch (error) {
     status = "failed";
@@ -3119,6 +3158,11 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     });
   }
 
+  if (method === "GET" && path === "/api/radar/verifications") {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const result = await db.prepare(`SELECT v.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol FROM ci_radar_verifications v JOIN ci_radar_discoveries d ON d.discovery_key = v.discovery_key ORDER BY v.checked_at DESC LIMIT ?`).bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, verifications: result.results || [] });
+  }
   if (method === "GET" && path === "/api/radar/status") {
     const [totals, latest] = await Promise.all([
       db.prepare("SELECT status, COUNT(*) AS count FROM ci_radar_discoveries GROUP BY status").all(),
