@@ -2277,6 +2277,7 @@ async function runRadarDiscovery(db) {
   try {
     inserted = await persistRadarDiscoveries(db, [...unique.values()]);
     const discoveredPairs = await persistRadarPairs(db, discoveries);
+    sourceResults.discovered_pairs = discoveredPairs;
     const successfulSources = Object.values(sourceResults).filter((value) => value.success).length;
     status = successfulSources === endpoints.length ? "completed" :
       successfulSources > 0 ? "partial" : "failed";
@@ -2302,6 +2303,7 @@ async function runRadarDiscovery(db) {
   return {
     scan_id: scanId, status, newly_discovered_contracts: inserted,
     newly_discovered_pairs: discoveredPairs,
+    newly_discovered_pairs: sourceResults.discovered_pairs || 0,
     candidates_received: discoveries.length, sources: sourceResults,
     quarantine: true, scanned_at: startedAt, completed_at: nowISO()
   };
