@@ -8347,3 +8347,247 @@ handleProtectedRoutes = async function(request,env,ctx,route){
   }
   return await ciChapter14RoutesBeforeData(request,env,ctx,route);
 };
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 15 — ORCHESTRATION CENTRALE DES API, QUOTAS ET PRIORITÉS           */
+/* -------------------------------------------------------------------------- */
+
+const CI_PROVIDER_PRIORITY = {
+  critical_security:1,
+  new_token_pair:2,
+  monitored_asset_change:3,
+  opportunity_check:4,
+  normal_refresh:5,
+  historical_analysis:6
+};
+const CI_PROVIDER_PRIORITY_LABELS = Object.keys(CI_PROVIDER_PRIORITY);
+
+async function ensureCIProviderOrchestratorTables(db){
+  await ensureCIProviderManagementTables(db);
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_provider_runtime_state (
+      provider_id TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0,
+      cooldown_until TEXT, consecutive_errors INTEGER NOT NULL DEFAULT 0,
+      last_http_429_at TEXT, last_error TEXT, updated_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_provider_request_queue (
+      request_id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL,
+      provider_id TEXT NOT NULL, operation TEXT NOT NULL,
+      priority INTEGER NOT NULL, priority_label TEXT NOT NULL,
+      payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 3,
+      next_attempt_at TEXT NOT NULL, result_json TEXT, last_error TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_provider_queue_ready ON ci_provider_request_queue(status,priority,next_attempt_at,created_at)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_provider_queue_dedupe ON ci_provider_request_queue(dedupe_key,status)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_provider_quota_events (
+      event_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL,
+      event_type TEXT NOT NULL, period_key TEXT, observed_count INTEGER,
+      configured_limit INTEGER, details_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_provider_quota_events_provider_date ON ci_provider_quota_events(provider_id,created_at)")
+  ]);
+  for(const item of CI_PROVIDER_CATALOGUE){
+    await db.prepare("INSERT OR IGNORE INTO ci_provider_runtime_state (provider_id,updated_at) VALUES (?,?)").bind(item.id,nowISO()).run();
+  }
+}
+
+function ciProviderPeriodKeys(timestamp=new Date()){
+  return {day:timestamp.toISOString().slice(0,10),month:timestamp.toISOString().slice(0,7)};
+}
+
+async function ciProviderRuntimeGate(db,providerId){
+  await ensureCIProviderOrchestratorTables(db);
+  const state=await db.prepare("SELECT * FROM ci_provider_runtime_state WHERE provider_id=?").bind(providerId).first();
+  if(state?.paused)return {allowed:false,reason:"provider_paused",retry_at:null};
+  if(state?.cooldown_until&&Date.parse(state.cooldown_until)>Date.now())return {allowed:false,reason:"provider_backoff",retry_at:state.cooldown_until};
+  const registry=await db.prepare("SELECT daily_limit,monthly_limit FROM ci_provider_registry WHERE provider_id=?").bind(providerId).first();
+  const keys=ciProviderPeriodKeys();
+  const counts=await db.prepare(`SELECT
+    SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS daily_count,
+    SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS monthly_count
+    FROM ci_provider_usage_metrics WHERE provider_id=?`).bind(
+      new Date(Date.now()-86400000).toISOString(),new Date(Date.now()-30*86400000).toISOString(),providerId
+    ).first();
+  const daily=Number(counts?.daily_count)||0,monthly=Number(counts?.monthly_count)||0;
+  if(registry?.daily_limit!==null&&registry?.daily_limit!==undefined&&daily>=Number(registry.daily_limit)){
+    await ciProviderQuotaEvent(db,providerId,"daily_limit_reached",keys.day,daily,Number(registry.daily_limit),{});
+    return {allowed:false,reason:"daily_limit_reached",retry_at:new Date(Date.now()+86400000).toISOString(),daily_count:daily,monthly_count:monthly};
+  }
+  if(registry?.monthly_limit!==null&&registry?.monthly_limit!==undefined&&monthly>=Number(registry.monthly_limit)){
+    await ciProviderQuotaEvent(db,providerId,"monthly_limit_reached",keys.month,monthly,Number(registry.monthly_limit),{});
+    return {allowed:false,reason:"monthly_limit_reached",retry_at:null,daily_count:daily,monthly_count:monthly};
+  }
+  return {allowed:true,daily_count:daily,monthly_count:monthly,daily_limit:registry?.daily_limit??null,monthly_limit:registry?.monthly_limit??null};
+}
+
+async function ciProviderQuotaEvent(db,providerId,eventType,periodKey,count,limit,details){
+  await db.prepare("INSERT INTO ci_provider_quota_events (event_id,provider_id,event_type,period_key,observed_count,configured_limit,details_json,created_at) VALUES (?,?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),providerId,eventType,periodKey,count,limit,JSON.stringify(details||{}),nowISO()
+  ).run();
+}
+
+async function ciRecordManagedProviderResult(db,providerId,operation,success,statusCode,latencyMs,errorMessage=null){
+  await ensureCIProviderOrchestratorTables(db);
+  const timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_provider_usage_metrics (metric_id,provider_id,operation,success,status_code,latency_ms,created_at) VALUES (?,?,?,?,?,?,?)").bind(
+    cryptoRandomId(),providerId,operation,success?1:0,statusCode||null,Math.max(0,Number(latencyMs)||0),timestamp
+  ).run();
+  const state=await db.prepare("SELECT consecutive_errors FROM ci_provider_runtime_state WHERE provider_id=?").bind(providerId).first();
+  const errors=success?0:(Number(state?.consecutive_errors)||0)+1;
+  const retryDelay=success?0:Math.min(15*60,Math.pow(2,Math.min(errors-1,4))*60);
+  const cooldown=success?null:new Date(Date.now()+retryDelay*1000).toISOString();
+  await db.prepare("UPDATE ci_provider_runtime_state SET consecutive_errors=?,cooldown_until=?,last_http_429_at=CASE WHEN ?=429 THEN ? ELSE last_http_429_at END,last_error=?,updated_at=? WHERE provider_id=?").bind(
+    errors,cooldown,Number(statusCode)||0,timestamp,errorMessage?safeString(errorMessage,700):null,timestamp,providerId
+  ).run();
+  if(!success)await ciProviderQuotaEvent(db,providerId,Number(statusCode)===429?"http_429_backoff":"provider_failure",null,errors,null,{status_code:statusCode||null,retry_at:cooldown,error:errorMessage||null});
+  return {consecutive_errors:errors,cooldown_until:cooldown};
+}
+
+async function enqueueCIProviderRequest(db,body){
+  await ensureCIProviderOrchestratorTables(db);
+  const provider=safeString(body.provider_id||"",60).toLowerCase();
+  const operation=safeString(body.operation||"",60).toLowerCase();
+  const priorityLabel=safeString(body.priority||"normal_refresh",50);
+  const priority=CI_PROVIDER_PRIORITY[priorityLabel];
+  if(!CI_PROVIDER_CATALOGUE.some(item=>item.id===provider))throw new Error("Fournisseur inconnu.");
+  if(!priority)throw new Error("Priorité inconnue.");
+  const payload={symbol:safeString(body.symbol||"",20).toUpperCase()};
+  if(body.contract_address)payload.contract_address=safeString(body.contract_address,100);
+  const allowed={
+    defillama:["protocols"],blockscout:["stats"],etherscan:["latest_block"],
+    coinmarketcap:["quotes_latest"]
+  };
+  if(!allowed[provider]?.includes(operation))throw new Error("Opération absente de la liste blanche du gestionnaire central.");
+  if(operation==="quotes_latest"&&!/^[A-Z0-9]{2,20}$/.test(payload.symbol))throw new Error("Symbole valide obligatoire.");
+  const dedupeKey=provider+":"+operation+":"+payload.symbol+":"+payload.contract_address;
+  const existing=await db.prepare("SELECT request_id,status FROM ci_provider_request_queue WHERE dedupe_key=? AND status IN ('pending','running') ORDER BY created_at DESC LIMIT 1").bind(dedupeKey).first();
+  if(existing)return {request_id:existing.request_id,status:existing.status,deduplicated:true,priority:priorityLabel};
+  const id=cryptoRandomId(),timestamp=nowISO();
+  await db.prepare("INSERT INTO ci_provider_request_queue (request_id,dedupe_key,provider_id,operation,priority,priority_label,payload_json,status,attempts,max_attempts,next_attempt_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'pending',0,3,?,?,?)").bind(
+    id,dedupeKey,provider,operation,priority,priorityLabel,JSON.stringify(payload),timestamp,timestamp,timestamp
+  ).run();
+  return {request_id:id,status:"pending",deduplicated:false,priority:priorityLabel};
+}
+
+async function processCIProviderQueue(db,env,limit=5){
+  await ensureCIProviderOrchestratorTables(db);
+  const max=Math.max(1,Math.min(10,Number(limit)||5));
+  const ready=await db.prepare("SELECT * FROM ci_provider_request_queue WHERE status='pending' AND next_attempt_at<=? ORDER BY priority ASC,created_at ASC LIMIT ?").bind(nowISO(),max).all();
+  const results=[];
+  for(const job of ready.results||[]){
+    const gate=await ciProviderRuntimeGate(db,job.provider_id);
+    if(!gate.allowed){
+      results.push({request_id:job.request_id,status:"deferred",reason:gate.reason,retry_at:gate.retry_at});
+      if(gate.retry_at)await db.prepare("UPDATE ci_provider_request_queue SET next_attempt_at=?,updated_at=? WHERE request_id=? AND status='pending'").bind(gate.retry_at,nowISO(),job.request_id).run();
+      continue;
+    }
+    const claim=await db.prepare("UPDATE ci_provider_request_queue SET status='running',attempts=attempts+1,updated_at=? WHERE request_id=? AND status='pending'").bind(nowISO(),job.request_id).run();
+    if(!claim.meta?.changes)continue;
+    const started=Date.now();
+    try{
+      const payload=JSON.parse(job.payload_json||"{}");
+      const data=await fetchCIProviderReferenceData(db,env,{provider_id:job.provider_id,operation:job.operation,...payload});
+      await ciRecordManagedProviderResult(db,job.provider_id,job.operation,true,200,Date.now()-started,null);
+      await db.prepare("UPDATE ci_provider_request_queue SET status='completed',result_json=?,last_error=NULL,updated_at=? WHERE request_id=?").bind(JSON.stringify(data),nowISO(),job.request_id).run();
+      results.push({request_id:job.request_id,status:"completed",provider_id:job.provider_id,operation:job.operation});
+    }catch(error){
+      const message=safeString(error.message||"Erreur fournisseur.",700),statusCode=Number(error.status)||null;
+      const state=await ciRecordManagedProviderResult(db,job.provider_id,job.operation,false,statusCode,Date.now()-started,message);
+      const attempts=Number(job.attempts)+1,canRetry=attempts<Number(job.max_attempts);
+      const next=state.cooldown_until||new Date(Date.now()+60000).toISOString();
+      await db.prepare("UPDATE ci_provider_request_queue SET status=?,next_attempt_at=?,last_error=?,updated_at=? WHERE request_id=?").bind(
+        canRetry?"pending":"failed",next,message,nowISO(),job.request_id
+      ).run();
+      results.push({request_id:job.request_id,status:canRetry?"retry_scheduled":"failed",error:message,retry_at:canRetry?next:null});
+    }
+  }
+  return {processed:results.length,results,priority_order:"critical_security_to_historical_analysis",paid_overage:false};
+}
+
+async function getCIProviderQueueDashboard(db,limit=100){
+  await ensureCIProviderOrchestratorTables(db);
+  const jobs=await db.prepare("SELECT request_id,provider_id,operation,priority_label,status,attempts,max_attempts,next_attempt_at,last_error,created_at,updated_at FROM ci_provider_request_queue ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'running' THEN 1 ELSE 2 END,priority ASC,created_at ASC LIMIT ?").bind(Math.max(1,Math.min(300,Number(limit)||100))).all();
+  const states=await db.prepare("SELECT * FROM ci_provider_runtime_state ORDER BY provider_id").all();
+  const quota=await db.prepare("SELECT provider_id,event_type,period_key,observed_count,configured_limit,details_json,created_at FROM ci_provider_quota_events ORDER BY created_at DESC LIMIT ?").bind(Math.max(1,Math.min(200,Number(limit)||100))).all();
+  return {queue:jobs.results||[],provider_states:states.results||[],quota_events:quota.results||[],priorities:CI_PROVIDER_PRIORITY};
+}
+
+async function setCIProviderRuntimeControl(db,body){
+  await ensureCIProviderOrchestratorTables(db);
+  const id=safeString(body.provider_id||"",60).toLowerCase();
+  if(!CI_PROVIDER_CATALOGUE.some(item=>item.id===id))throw new Error("Fournisseur inconnu.");
+  if(typeof body.paused!=="boolean")throw new Error("paused doit être true ou false.");
+  const timestamp=nowISO();
+  await db.prepare("UPDATE ci_provider_runtime_state SET paused=?,cooldown_until=CASE WHEN ?=1 THEN NULL ELSE cooldown_until END,updated_at=? WHERE provider_id=?").bind(body.paused?1:0,body.paused?1:0,timestamp,id).run();
+  await audit(db,body.paused?"provider_paused":"provider_resumed",id);
+  return {provider_id:id,paused:body.paused,updated_at:timestamp};
+}
+
+const ciChapter15OriginalFetchProviderData = fetchCIProviderReferenceData;
+fetchCIProviderReferenceData = async function(db,env,body){
+  const id=safeString(body.provider_id||"",60).toLowerCase();
+  const operation=safeString(body.operation||"",60).toLowerCase();
+  const gate=await ciProviderRuntimeGate(db,id);
+  if(!gate.allowed){
+    const error=new Error("Requête fournisseur différée : "+gate.reason);
+    error.status=429;error.retry_at=gate.retry_at;throw error;
+  }
+  const started=Date.now();
+  try{
+    const result=await ciChapter15OriginalFetchProviderData(db,env,body);
+    await ciRecordManagedProviderResult(db,id,operation,true,200,Date.now()-started,null);
+    return result;
+  }catch(error){
+    if(error.status!==429||!String(error.message||"").includes("différée"))await ciRecordManagedProviderResult(db,id,operation,false,error.status||500,Date.now()-started,error.message);
+    throw error;
+  }
+};
+
+const ciChapter15OriginalCallAIProvider = callAIProvider;
+callAIProvider = async function(provider,env,prompt){
+  const db=env?.DB;
+  if(!db)return await ciChapter15OriginalCallAIProvider(provider,env,prompt);
+  const gate=await ciProviderRuntimeGate(db,provider);
+  if(!gate.allowed){
+    const error=new Error("Fournisseur IA différé par le gestionnaire central : "+gate.reason);
+    error.status=429;error.retry_at=gate.retry_at;throw error;
+  }
+  const started=Date.now();
+  try{
+    const result=await ciChapter15OriginalCallAIProvider(provider,env,prompt);
+    await ciRecordManagedProviderResult(db,provider,"ai_inference",true,200,Date.now()-started,null);
+    return result;
+  }catch(error){
+    await ciRecordManagedProviderResult(db,provider,"ai_inference",false,error.status||500,Date.now()-started,error.message);
+    throw error;
+  }
+};
+
+const ciChapter15PreviousRoutes = handleProtectedRoutes;
+handleProtectedRoutes = async function(request,env,ctx,route){
+  const {path,method,url}=route;
+  const managedPaths=["/api/providers/queue","/api/providers/queue/process","/api/providers/control"];
+  if(managedPaths.includes(path)){
+    const db=getDB(env);await initializeBackendTables(db);await ensureCIProviderOrchestratorTables(db);
+    if(method==="GET"&&path==="/api/providers/queue"){
+      return json({success:true,...await getCIProviderQueueDashboard(db,url.searchParams.get("limit"))});
+    }
+    if(method==="POST"&&path==="/api/providers/queue"){
+      try{return json({success:true,...await enqueueCIProviderRequest(db,await readBody(request))},201);}
+      catch(error){return errorResponse(safeString(error.message||"Mise en file refusée.",1000),400);}
+    }
+    if(method==="POST"&&path==="/api/providers/queue/process"){
+      try{return json({success:true,...await processCIProviderQueue(db,env,(await readBody(request)).limit)});}
+      catch(error){return errorResponse(safeString(error.message||"Traitement de file impossible.",1000),500);}
+    }
+    if(method==="POST"&&path==="/api/providers/control"){
+      try{return json({success:true,...await setCIProviderRuntimeControl(db,await readBody(request))});}
+      catch(error){return errorResponse(safeString(error.message||"Contrôle fournisseur refusé.",1000),400);}
+    }
+  }
+  return await ciChapter15PreviousRoutes(request,env,ctx,route);
+};
