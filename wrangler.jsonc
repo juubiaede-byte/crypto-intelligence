@@ -24,6 +24,11 @@
       "database_id": "a03f9008-0859-4134-8d9e-491af70c922b"
     }
   ],
+  "triggers": {
+    "crons": [
+      "*/5 * * * *"
+    ]
+  },
   "r2_buckets": [
     {
       "binding": "ARCHIVES",
