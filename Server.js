@@ -9095,3 +9095,197 @@ handleProtectedRoutes=async function(request,env,ctx,route){
   }
   return response;
 };
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 17 — JOURNAL CENTRAL, TRAÇABILITÉ ET HISTORIQUE DES SAUVEGARDES   */
+/* -------------------------------------------------------------------------- */
+
+const CI_HISTORY_METHODOLOGY="crypto-intelligence-append-only-history-v1";
+for(const table of ["ci_history_event_ledger","ci_archive_operation_history"]){
+  if(!ARCHIVE_TABLES.includes(table))ARCHIVE_TABLES.push(table);
+}
+
+async function ensureCIHistoryTables(db){
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_history_event_ledger (
+      event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL,
+      entity_type TEXT, entity_id TEXT, description TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL,
+      actor TEXT NOT NULL DEFAULT 'application', occurred_at TEXT NOT NULL,
+      previous_hash TEXT, event_hash TEXT NOT NULL,
+      integrity_version TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_history_ledger_time ON ci_history_event_ledger(occurred_at DESC,event_id DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_history_ledger_entity ON ci_history_event_ledger(entity_type,entity_id,occurred_at DESC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_history_ledger_type ON ci_history_event_ledger(event_type,occurred_at DESC)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_archive_operation_history (
+      operation_id TEXT PRIMARY KEY, operation_type TEXT NOT NULL,
+      snapshot_id TEXT, snapshot_key TEXT, manifest_key TEXT,
+      checksum TEXT, checksum_algorithm TEXT, size_bytes INTEGER,
+      table_count INTEGER, total_rows INTEGER, operation_status TEXT NOT NULL,
+      details_json TEXT NOT NULL DEFAULT '{}', occurred_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_archive_operation_time ON ci_archive_operation_history(occurred_at DESC)")
+  ]);
+}
+
+async function recordCIHistoryEvent(db,eventType,description,options={}){
+  await ensureCIHistoryTables(db);
+  const eventId=cryptoRandomId(),occurredAt=nowISO();
+  const details=options.details&&typeof options.details==="object"?options.details:{};
+  const entityType=options.entity_type?safeString(options.entity_type,100):null;
+  const entityId=options.entity_id?safeString(options.entity_id,180):null;
+  const source=safeString(options.source||"application_audit",100);
+  const actor=safeString(options.actor||"application",100);
+  const cleanDescription=safeString(description||eventType,2000);
+  const previous=await db.prepare("SELECT event_hash FROM ci_history_event_ledger ORDER BY occurred_at DESC,event_id DESC LIMIT 1").first();
+  const previousHash=previous?.event_hash||null;
+  const core={event_id:eventId,event_type:safeString(eventType,120),entity_type:entityType,entity_id:entityId,description:cleanDescription,details,source,actor,occurred_at:occurredAt,previous_hash:previousHash,integrity_version:CI_HISTORY_METHODOLOGY};
+  const eventHash=await sha256(JSON.stringify(core));
+  await db.prepare("INSERT INTO ci_history_event_ledger (event_id,event_type,entity_type,entity_id,description,details_json,source,actor,occurred_at,previous_hash,event_hash,integrity_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+    eventId,core.event_type,entityType,entityId,cleanDescription,JSON.stringify(details),source,actor,occurredAt,previousHash,eventHash,CI_HISTORY_METHODOLOGY
+  ).run();
+  return {event_id:eventId,event_hash:eventHash,occurred_at:occurredAt};
+}
+
+async function recordCIArchiveOperation(db,operationType,result,status="completed",details={}){
+  await ensureCIHistoryTables(db);
+  const timestamp=nowISO();
+  const snapshotKey=result?.snapshot_key||result?.archive?.snapshot_key||null;
+  const snapshotId=result?.snapshot_id||result?.archive?.snapshot_id||null;
+  const checksum=result?.checksum||result?.archive?.checksum||null;
+  const values={
+    operation_id:cryptoRandomId(),operation_type:safeString(operationType,80),
+    snapshot_id:snapshotId,snapshot_key:snapshotKey,
+    manifest_key:result?.manifest_key||null,checksum,
+    checksum_algorithm:result?.checksum_algorithm||"SHA-256",
+    size_bytes:Number.isFinite(Number(result?.size_bytes))?Number(result.size_bytes):null,
+    table_count:Number.isFinite(Number(result?.table_count))?Number(result.table_count):null,
+    total_rows:Number.isFinite(Number(result?.total_rows))?Number(result.total_rows):null,
+    operation_status:safeString(status,40),details_json:JSON.stringify(details||{}),occurred_at:timestamp
+  };
+  await db.prepare("INSERT INTO ci_archive_operation_history (operation_id,operation_type,snapshot_id,snapshot_key,manifest_key,checksum,checksum_algorithm,size_bytes,table_count,total_rows,operation_status,details_json,occurred_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(
+    values.operation_id,values.operation_type,values.snapshot_id,values.snapshot_key,values.manifest_key,values.checksum,values.checksum_algorithm,values.size_bytes,values.table_count,values.total_rows,values.operation_status,values.details_json,timestamp
+  ).run();
+  await recordCIHistoryEvent(db,"archive_"+values.operation_type,"Opération d'archive "+values.operation_type+": "+values.operation_status,{
+    entity_type:"archive",entity_id:snapshotId||snapshotKey||values.operation_id,
+    source:"archive_service",details:{snapshot_key:snapshotKey,checksum,status, ...details}
+  });
+  return values;
+}
+
+async function verifyCIHistoryLedger(db,limit=5000){
+  await ensureCIHistoryTables(db);
+  const safeLimit=Math.max(1,Math.min(10000,Number(limit)||5000));
+  const rows=await db.prepare("SELECT * FROM ci_history_event_ledger ORDER BY occurred_at ASC,event_id ASC LIMIT ?").bind(safeLimit).all();
+  const events=rows.results||[];
+  let previousHash=null,verified=0,firstFailure=null;
+  for(const event of events){
+    let details={};
+    try{details=JSON.parse(event.details_json||"{}");}catch{}
+    const core={
+      event_id:event.event_id,event_type:event.event_type,entity_type:event.entity_type,
+      entity_id:event.entity_id,description:event.description,details,
+      source:event.source,actor:event.actor,occurred_at:event.occurred_at,
+      previous_hash:event.previous_hash||null,integrity_version:event.integrity_version
+    };
+    const calculated=await sha256(JSON.stringify(core));
+    const linkValid=(event.previous_hash||null)===previousHash;
+    if(calculated!==event.event_hash||!linkValid){
+      firstFailure={event_id:event.event_id,hash_valid:calculated===event.event_hash,previous_link_valid:linkValid};
+      break;
+    }
+    previousHash=event.event_hash;verified++;
+  }
+  const total=await db.prepare("SELECT COUNT(*) AS count FROM ci_history_event_ledger").first();
+  return {methodology:CI_HISTORY_METHODOLOGY,checked_events:events.length,total_events:Number(total?.count||0),verified_events:verified,complete_scan:events.length===Number(total?.count||0),integrity_valid:!firstFailure&&events.length===Number(total?.count||0),first_failure:firstFailure,scope:"Contrôle SHA-256 des événements parcourus et de leurs liens; ne constitue pas une preuve externe contre un administrateur D1/R2."};
+}
+
+async function getCIHistoryEvents(db,options={}){
+  await ensureCIHistoryTables(db);
+  const limit=Math.max(1,Math.min(500,Number(options.limit)||100));
+  const type=options.event_type?safeString(options.event_type,120):null;
+  const entity=options.entity_id?safeString(options.entity_id,180):null;
+  let query="SELECT event_id,event_type,entity_type,entity_id,description,details_json,source,actor,occurred_at,previous_hash,event_hash FROM ci_history_event_ledger WHERE 1=1";
+  const bindings=[];
+  if(type){query+=" AND event_type=?";bindings.push(type);}
+  if(entity){query+=" AND entity_id=?";bindings.push(entity);}
+  query+=" ORDER BY occurred_at DESC,event_id DESC LIMIT ?";
+  bindings.push(limit);
+  const result=await db.prepare(query).bind(...bindings).all();
+  return {events:(result.results||[]).map(row=>({...row,details:(()=>{try{return JSON.parse(row.details_json||"{}");}catch{return {};}})()})),count:result.results?.length||0,limit,filters:{event_type:type,entity_id:entity}};
+}
+
+async function getCIHistorySummary(db){
+  await ensureCIHistoryTables(db);
+  const totals=await db.prepare("SELECT COUNT(*) AS total_events,MIN(occurred_at) AS first_event,MAX(occurred_at) AS last_event FROM ci_history_event_ledger").first();
+  const types=await db.prepare("SELECT event_type,COUNT(*) AS count,MAX(occurred_at) AS last_event FROM ci_history_event_ledger GROUP BY event_type ORDER BY count DESC LIMIT 100").all();
+  const archives=await db.prepare("SELECT COUNT(*) AS operations, SUM(CASE WHEN operation_status='completed' THEN 1 ELSE 0 END) AS completed, SUM(CASE WHEN operation_status!='completed' THEN 1 ELSE 0 END) AS failed, MAX(occurred_at) AS last_operation FROM ci_archive_operation_history").first();
+  const audit=await db.prepare("SELECT COUNT(*) AS count FROM ci_audit").first();
+  return {methodology:CI_HISTORY_METHODOLOGY,events:totals||{},event_types:types.results||[],legacy_audit_rows:Number(audit?.count||0),archive_operations:archives||{},retention:"Aucune suppression automatique de l'historique ou des archives n'est ajoutée."};
+}
+
+/* Le journal centralise tous les événements déjà transmis à l'audit existant. */
+const ciChapter17OriginalAudit=audit;
+audit=async function(db,type,description){
+  await ciChapter17OriginalAudit(db,type,description);
+  try{
+    await recordCIHistoryEvent(db,type,description,{source:"ci_audit"});
+  }catch(error){console.error("Central history ledger error:",safeString(error.message||"Erreur.",500));}
+};
+
+const ciChapter17OriginalCreateArchive=createDatabaseArchive;
+createDatabaseArchive=async function(db,env){
+  try{
+    const result=await ciChapter17OriginalCreateArchive(db,env);
+    await recordCIArchiveOperation(db,"backup",result,"completed",{provider:"Cloudflare R2"});
+    return result;
+  }catch(error){
+    try{await recordCIArchiveOperation(db,"backup",{}, "failed",{error:safeString(error.message||"Erreur.",1000)});}catch{}
+    throw error;
+  }
+};
+
+const ciChapter17OriginalRestoreArchive=restoreDatabaseArchive;
+restoreDatabaseArchive=async function(db,env,key,checksum,confirmation){
+  try{
+    const result=await ciChapter17OriginalRestoreArchive(db,env,key,checksum,confirmation);
+    await recordCIArchiveOperation(db,"restore",{snapshot_key:key,checksum},"completed",{
+      success:Boolean(result?.success),inserted_rows:Number(result?.inserted_rows||0),
+      post_restore_verified:Boolean(result?.post_restore_verified),
+      safety_backup:result?.safety_backup?.snapshot_key||null
+    });
+    return result;
+  }catch(error){
+    try{await recordCIArchiveOperation(db,"restore",{snapshot_key:key,checksum},"failed",{error:safeString(error.message||"Erreur.",1000)});}catch{}
+    throw error;
+  }
+};
+
+const ciChapter17PreviousProtectedRoutes=handleProtectedRoutes;
+handleProtectedRoutes=async function(request,env,ctx,route){
+  const {path,method,url}=route;
+  const historyPaths=["/api/history/summary","/api/history/events","/api/history/verify","/api/archives/operations"];
+  if(historyPaths.includes(path)){
+    const db=getDB(env);await initializeBackendTables(db);await ensureCIHistoryTables(db);
+    if(method==="GET"&&path==="/api/history/summary"){
+      return json({success:true,history:await getCIHistorySummary(db)});
+    }
+    if(method==="GET"&&path==="/api/history/events"){
+      return json({success:true,...await getCIHistoryEvents(db,{
+        limit:url.searchParams.get("limit")||100,
+        event_type:url.searchParams.get("event_type"),
+        entity_id:url.searchParams.get("entity_id")
+      })});
+    }
+    if(method==="GET"&&path==="/api/history/verify"){
+      return json({success:true,verification:await verifyCIHistoryLedger(db,url.searchParams.get("limit")||5000)});
+    }
+    if(method==="GET"&&path==="/api/archives/operations"){
+      const rows=await db.prepare("SELECT * FROM ci_archive_operation_history ORDER BY occurred_at DESC LIMIT ?").bind(Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100))).all();
+      return json({success:true,count:rows.results?.length||0,operations:(rows.results||[]).map(row=>({...row,details:(()=>{try{return JSON.parse(row.details_json||"{}");}catch{return {};}})()}))});
+    }
+  }
+  return await ciChapter17PreviousProtectedRoutes(request,env,ctx,route);
+};
