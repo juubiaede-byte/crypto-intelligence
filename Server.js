@@ -100,7 +100,9 @@ const ARCHIVE_TABLES = [
   "ci_radar_onchain_liquidity_assessments",
   "ci_radar_onchain_pool_history",
   "ci_tasks",
-  "ci_audit"
+  "ci_audit",
+  "ci_investment_evaluations",
+  "ci_investment_decisions"
 ];
 
 const ARCHIVE_PREFIX = "conan/backups/";
@@ -398,6 +400,39 @@ async function initializeBackendTables(db) {
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_identity_checks_discovery ON ci_radar_identity_checks(discovery_key, checked_at DESC)`)
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_onchain_liquidity_assessments (assessment_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT NOT NULL, pair_address TEXT NOT NULL, checked_at TEXT NOT NULL, outcome TEXT NOT NULL, estimated_pool_depth_usd REAL, quote_token_price_usd REAL, base_token_price_usd REAL, estimated_buy_impact_json TEXT NOT NULL DEFAULT '[]', estimated_sell_impact_json TEXT NOT NULL DEFAULT '[]', evidence_json TEXT NOT NULL DEFAULT '{}')`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_liquidity_discovery ON ci_radar_onchain_liquidity_assessments(discovery_key, checked_at DESC)`)
+
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_investment_evaluations (
+      evaluation_id TEXT PRIMARY KEY,
+      discovery_key TEXT NOT NULL,
+      overall_score REAL NOT NULL DEFAULT 0,
+      coverage_percent REAL NOT NULL DEFAULT 0,
+      confidence_percent REAL NOT NULL DEFAULT 0,
+      evaluation_status TEXT NOT NULL,
+      critical_risk INTEGER NOT NULL DEFAULT 0,
+      criteria_json TEXT NOT NULL DEFAULT '{}',
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      missing_data_json TEXT NOT NULL DEFAULT '[]',
+      risk_flags_json TEXT NOT NULL DEFAULT '[]',
+      methodology_version TEXT NOT NULL,
+      evaluated_at TEXT NOT NULL,
+      evaluator TEXT NOT NULL DEFAULT 'api'
+    )`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_investment_evaluations_asset ON ci_investment_evaluations(discovery_key, evaluated_at DESC)`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_investment_evaluations_status ON ci_investment_evaluations(evaluation_status, overall_score DESC, evaluated_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_investment_decisions (
+      decision_id TEXT PRIMARY KEY,
+      discovery_key TEXT NOT NULL,
+      evaluation_id TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      from_stage TEXT NOT NULL,
+      to_stage TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      decided_at TEXT NOT NULL,
+      actor TEXT NOT NULL DEFAULT 'api'
+    )`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_investment_decisions_asset ON ci_investment_decisions(discovery_key, decided_at DESC)`)
+
 
   ]);
 }
@@ -4557,6 +4592,54 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     });
   }
 
+
+  /* ---------------- CHAPITRE 3 — CERCLE DES INVESTISSEMENTS ---------------- */
+
+  if (method === "POST" && path === "/api/radar/investment/evaluate") {
+    const body = await readBody(request);
+    const discoveryKey = safeString(body.discovery_key || "", 200);
+    if (!discoveryKey) return errorResponse("discovery_key requis.");
+    const asset = await db.prepare("SELECT discovery_key FROM ci_radar_discoveries WHERE discovery_key = ?").bind(discoveryKey).first();
+    if (!asset) return errorResponse("Actif radar introuvable.", 404);
+    const lifecycle = await db.prepare("SELECT current_stage FROM ci_radar_asset_lifecycle WHERE discovery_key = ?").bind(discoveryKey).first();
+    if (!lifecycle) return errorResponse("Cycle de vie de l'actif indisponible.", 409);
+    const evaluation = calculateRadarInvestmentEvaluation({ ...body, lifecycle_stage: lifecycle.current_stage });
+    const saved = await persistRadarInvestmentEvaluation(db, discoveryKey, evaluation, body.evaluator || "api");
+    await audit(db, "investment_evaluation_created", discoveryKey + " — score " + saved.overall_score + "/100 — " + saved.evaluation_status);
+    return json({ success: true, evaluation: saved }, 201);
+  }
+
+  if (method === "GET" && path === "/api/radar/investment/evaluations") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const result = discoveryKey
+      ? await db.prepare("SELECT * FROM ci_investment_evaluations WHERE discovery_key = ? ORDER BY evaluated_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_investment_evaluations ORDER BY evaluated_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, evaluations: result.results || [], methodology: { version: RADAR_INVESTMENT_METHODOLOGY_VERSION, criteria: RADAR_INVESTMENT_CRITERIA } });
+  }
+
+  if (method === "GET" && path === "/api/radar/investment-circle") {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const members = await getRadarInvestmentCircle(db, limit);
+    return json({ success: true, count: members.length, members, methodology: { version: RADAR_INVESTMENT_METHODOLOGY_VERSION, criteria: RADAR_INVESTMENT_CRITERIA, entry_thresholds: { score: 70, coverage_percent: 80, confidence_percent: 60 }, critical_risk_blocks_entry: true } });
+  }
+
+  if (method === "POST" && path === "/api/radar/investment/decision") {
+    const body = await readBody(request);
+    const result = await recordRadarInvestmentDecision(db, body);
+    if (result.error) return errorResponse(result.error, 409);
+    return json({ success: true, decision: result }, 201);
+  }
+
+  if (method === "GET" && path === "/api/radar/investment/decisions") {
+    const discoveryKey = safeString(url.searchParams.get("discovery_key") || "", 200);
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 200));
+    const result = discoveryKey
+      ? await db.prepare("SELECT * FROM ci_investment_decisions WHERE discovery_key = ? ORDER BY decided_at DESC LIMIT ?").bind(discoveryKey, limit).all()
+      : await db.prepare("SELECT * FROM ci_investment_decisions ORDER BY decided_at DESC LIMIT ?").bind(limit).all();
+    return json({ success: true, count: result.results?.length || 0, decisions: result.results || [] });
+  }
+
   return errorResponse("Route API introuvable.", 404);
 }
 
@@ -4817,6 +4900,204 @@ async function runRadarContractVerification(db) {
     if (result.error_message) summary.errors++;
   }
   return summary;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* CHAPITRE 3 — CERCLE DES INVESTISSEMENTS POTENTIELS                         */
+/* -------------------------------------------------------------------------- */
+
+const RADAR_INVESTMENT_METHODOLOGY_VERSION = "1.0.0";
+const RADAR_INVESTMENT_CRITERIA = [
+  { key: "security", label: "Sécurité du contrat et des transactions", weight: 25 },
+  { key: "liquidity", label: "Liquidité, profondeur et facilité de sortie", weight: 20 },
+  { key: "market_activity", label: "Activité de marché et qualité des échanges", weight: 15 },
+  { key: "fundamentals", label: "Projet, utilité, développement et adoption", weight: 20 },
+  { key: "tokenomics", label: "Tokenomics, distribution et dilution", weight: 10 },
+  { key: "transparency", label: "Transparence, identité et qualité des sources", weight: 10 }
+];
+
+function normalizeRadarInvestmentEvidence(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const sources = Array.isArray(value.sources) ? value.sources : (value.source ? [value.source] : []);
+  const observations = Array.isArray(value.observations) ? value.observations : (value.observation ? [value.observation] : []);
+  const cleanSources = sources.map(item => safeString(item, 500)).filter(Boolean);
+  const cleanObservations = observations.map(item => safeString(item, 1500)).filter(Boolean);
+  if (!cleanSources.length || !cleanObservations.length) return null;
+  return {
+    sources: [...new Set(cleanSources)],
+    observations: cleanObservations,
+    observed_at: safeString(value.observed_at || "", 80) || null,
+    source_quality: safeString(value.source_quality || "unrated", 40),
+    notes: safeString(value.notes || "", 1000) || null
+  };
+}
+
+function calculateRadarInvestmentEvaluation(body) {
+  const supplied = body.criteria && typeof body.criteria === "object" && !Array.isArray(body.criteria) ? body.criteria : {};
+  const riskFlags = Array.isArray(body.risk_flags) ? body.risk_flags.map(item => safeString(item, 300)).filter(Boolean).slice(0, 50) : [];
+  const criticalRisk = body.critical_risk === true || safeString(body.risk_level || "", 40).toLowerCase() === "critical";
+  const criteria = {};
+  const evidence = {};
+  const missing = [];
+  let weightedScore = 0;
+  let coveredWeight = 0;
+  let confidenceWeighted = 0;
+
+  for (const definition of RADAR_INVESTMENT_CRITERIA) {
+    const item = supplied[definition.key];
+    const score = item && item.score !== undefined ? Number(item.score) : NaN;
+    const confidence = item && item.confidence !== undefined ? Number(item.confidence) : NaN;
+    const normalizedEvidence = normalizeRadarInvestmentEvidence(item?.evidence);
+    if (!Number.isFinite(score) || score < 0 || score > 100 || !Number.isFinite(confidence) || confidence < 0 || confidence > 100 || !normalizedEvidence) {
+      missing.push({ criterion: definition.key, label: definition.label, weight: definition.weight, reason: "Note (0–100), confiance (0–100), source et observation vérifiables requis." });
+      criteria[definition.key] = { label: definition.label, weight: definition.weight, score: null, confidence: null, status: "missing" };
+      continue;
+    }
+    criteria[definition.key] = { label: definition.label, weight: definition.weight, score, confidence, status: "assessed" };
+    evidence[definition.key] = normalizedEvidence;
+    weightedScore += score * definition.weight / 100;
+    confidenceWeighted += confidence * definition.weight;
+    coveredWeight += definition.weight;
+  }
+
+  const overallScore = Math.round(weightedScore * 100) / 100;
+  const coverage = coveredWeight;
+  const confidence = coveredWeight ? Math.round((confidenceWeighted / coveredWeight) * (coverage / 100) * 100) / 100 : 0;
+  const lifecycleStage = safeString(body.lifecycle_stage || "", 80);
+  let status = "insufficient_data";
+  if (criticalRisk) status = "blocked_critical_risk";
+  else if (overallScore < 50 && coverage >= 50) status = "not_recommended";
+  else if (overallScore >= 70 && coverage >= 80 && confidence >= 60 &&
+    (lifecycleStage === "investigation_lab" || lifecycleStage === "potential_investment_circle")) status = "eligible";
+  else if (coverage >= 50) status = "watchlist_review";
+  return {
+    overall_score: overallScore,
+    coverage_percent: coverage,
+    confidence_percent: confidence,
+    evaluation_status: status,
+    critical_risk: criticalRisk,
+    criteria,
+    evidence,
+    missing_data: missing,
+    risk_flags: riskFlags,
+    methodology_version: RADAR_INVESTMENT_METHODOLOGY_VERSION,
+    thresholds: {
+      eligible_score_minimum: 70,
+      eligible_coverage_minimum_percent: 80,
+      eligible_confidence_minimum_percent: 60,
+      critical_risk_blocks_entry: true
+    },
+    interpretation: "Le score est la somme des contributions pondérées sur 100; un critère absent contribue zéro. La couverture indique le poids des critères réellement documentés. La confiance est pondérée puis réduite par la couverture. Une donnée manquante n'est jamais assimilée à une preuve positive."
+  };
+}
+
+async function persistRadarInvestmentEvaluation(db, discoveryKey, evaluation, evaluator = "api") {
+  const evaluationId = cryptoRandomId();
+  const evaluatedAt = nowISO();
+  await db.prepare(`INSERT INTO ci_investment_evaluations
+    (evaluation_id, discovery_key, overall_score, coverage_percent, confidence_percent,
+     evaluation_status, critical_risk, criteria_json, evidence_json, missing_data_json,
+     risk_flags_json, methodology_version, evaluated_at, evaluator)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      evaluationId, discoveryKey, evaluation.overall_score, evaluation.coverage_percent,
+      evaluation.confidence_percent, evaluation.evaluation_status, evaluation.critical_risk ? 1 : 0,
+      JSON.stringify(evaluation.criteria), JSON.stringify(evaluation.evidence),
+      JSON.stringify(evaluation.missing_data), JSON.stringify(evaluation.risk_flags),
+      evaluation.methodology_version, evaluatedAt, safeString(evaluator, 80) || "api"
+    ).run();
+  return { evaluation_id: evaluationId, evaluated_at: evaluatedAt, ...evaluation };
+}
+
+async function getLatestRadarInvestmentEvaluation(db, discoveryKey) {
+  return db.prepare("SELECT * FROM ci_investment_evaluations WHERE discovery_key = ? ORDER BY evaluated_at DESC LIMIT 1")
+    .bind(discoveryKey).first();
+}
+
+async function recordRadarInvestmentDecision(db, body) {
+  const discoveryKey = safeString(body.discovery_key || "", 200);
+  const decision = safeString(body.decision || "", 30).toLowerCase();
+  const reason = safeString(body.reason || "", 2000);
+  if (!discoveryKey || !["enter", "retain", "exit"].includes(decision) || !reason) {
+    return { error: "discovery_key, decision (enter/retain/exit) et reason documentée sont requis." };
+  }
+  const asset = await db.prepare("SELECT discovery_key FROM ci_radar_discoveries WHERE discovery_key = ?").bind(discoveryKey).first();
+  if (!asset) return { error: "Actif radar introuvable." };
+  const lifecycle = await db.prepare("SELECT current_stage FROM ci_radar_asset_lifecycle WHERE discovery_key = ?").bind(discoveryKey).first();
+  if (!lifecycle) return { error: "Cycle de vie de l'actif indisponible; initialisez d'abord son cycle." };
+  const latest = await getLatestRadarInvestmentEvaluation(db, discoveryKey);
+  if (!latest) return { error: "Une évaluation documentée est obligatoire avant toute décision." };
+  if (decision !== "exit" && (latest.evaluation_status !== "eligible" || Number(latest.critical_risk) === 1)) {
+    return { error: "Entrée ou maintien refusé : dernière évaluation non éligible ou risque critique." };
+  }
+  if (decision === "enter" && lifecycle.current_stage !== "investigation_lab") {
+    return { error: "L'entrée dans le cercle exige que l'actif soit actuellement au laboratoire d'investigation." };
+  }
+  if (decision === "retain" && lifecycle.current_stage !== "potential_investment_circle") {
+    return { error: "Le maintien exige que l'actif soit déjà dans le cercle d'investissement." };
+  }
+  if (decision === "exit" && lifecycle.current_stage !== "potential_investment_circle") {
+    return { error: "La sortie exige que l'actif soit actuellement dans le cercle d'investissement." };
+  }
+
+  const fromStage = lifecycle.current_stage;
+  const toStage = decision === "enter" ? "potential_investment_circle" :
+    decision === "exit" ? "investigation_lab" : fromStage;
+  const evidence = {
+    source: "ci_investment_evaluations",
+    observation: {
+      evaluation_id: latest.evaluation_id,
+      overall_score: latest.overall_score,
+      coverage_percent: latest.coverage_percent,
+      confidence_percent: latest.confidence_percent,
+      evaluation_status: latest.evaluation_status,
+      methodology_version: latest.methodology_version
+    },
+    decision_evidence: {
+      criteria: JSON.parse(latest.criteria_json || "{}"),
+      evidence: JSON.parse(latest.evidence_json || "{}"),
+      missing_data: JSON.parse(latest.missing_data_json || "[]"),
+      risk_flags: JSON.parse(latest.risk_flags_json || "[]")
+    }
+  };
+  if (decision !== "retain") {
+    const transition = await transitionRadarAssetLifecycle(db, {
+      discovery_key: discoveryKey,
+      to_stage: toStage,
+      reason,
+      evidence,
+      actor: safeString(body.actor || "investment_circle", 80)
+    });
+    if (transition.error) return { error: transition.error };
+  }
+
+  const decisionId = cryptoRandomId();
+  const decidedAt = nowISO();
+  await db.prepare(`INSERT INTO ci_investment_decisions
+    (decision_id, discovery_key, evaluation_id, decision, from_stage, to_stage, reason, evidence_json, decided_at, actor)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      decisionId, discoveryKey, latest.evaluation_id, decision, fromStage, toStage,
+      reason, JSON.stringify(evidence), decidedAt, safeString(body.actor || "api", 80) || "api"
+    ).run();
+  await audit(db, "investment_circle_" + decision, discoveryKey + " — " + reason);
+  return { decision_id: decisionId, discovery_key: discoveryKey, evaluation_id: latest.evaluation_id, decision, from_stage: fromStage, to_stage: toStage, reason, decided_at: decidedAt, evidence };
+}
+
+async function getRadarInvestmentCircle(db, limit = 100) {
+  const result = await db.prepare(`SELECT d.discovery_key, d.chain_id, d.contract_address,
+    d.token_name, d.token_symbol, d.first_seen_at, d.last_seen_at,
+    l.current_stage, l.entered_stage_at, e.evaluation_id, e.overall_score,
+    e.coverage_percent, e.confidence_percent, e.evaluation_status,
+    e.critical_risk, e.evaluated_at
+    FROM ci_radar_asset_lifecycle l
+    JOIN ci_radar_discoveries d ON d.discovery_key = l.discovery_key
+    LEFT JOIN ci_investment_evaluations e ON e.evaluation_id = (
+      SELECT e2.evaluation_id FROM ci_investment_evaluations e2
+      WHERE e2.discovery_key = d.discovery_key ORDER BY e2.evaluated_at DESC LIMIT 1
+    )
+    WHERE l.current_stage = 'potential_investment_circle'
+    ORDER BY e.overall_score DESC, l.entered_stage_at DESC LIMIT ?`).bind(Math.max(1, Math.min(500, Number(limit) || 100))).all();
+  return result.results || [];
 }
 
 export default {
