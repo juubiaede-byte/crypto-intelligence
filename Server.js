@@ -94,6 +94,8 @@ const ARCHIVE_TABLES = [
   "ci_cache",
   "ci_provider_usage",
   "ci_radar_lp_history",
+  "ci_radar_identity_checks",
+  "ci_radar_onchain_liquidity_assessments",
   "ci_radar_onchain_pool_history",
   "ci_tasks",
   "ci_audit"
@@ -386,6 +388,10 @@ async function initializeBackendTables(db) {
     ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_onchain_pool_history (snapshot_id TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT NOT NULL, pair_address TEXT NOT NULL, checked_at TEXT NOT NULL, outcome TEXT NOT NULL, token0_address TEXT, token1_address TEXT, reserve0_adjusted REAL, reserve1_adjusted REAL, token0_decimals INTEGER, token1_decimals INTEGER, block_timestamp INTEGER, previous_snapshot_id TEXT, reserve0_change_percent REAL, reserve1_change_percent REAL, risk_signal TEXT NOT NULL DEFAULT 'none', evidence_json TEXT NOT NULL DEFAULT '{}')`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_history_pair ON ci_radar_onchain_pool_history(chain_id, pair_address, checked_at DESC)`)
     ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_pool_history_discovery ON ci_radar_onchain_pool_history(discovery_key, checked_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_identity_checks (check_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'GeckoTerminal', outcome TEXT NOT NULL DEFAULT 'unknown', checked_at TEXT NOT NULL, network_id TEXT, token_address TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', error_message TEXT)`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_identity_checks_discovery ON ci_radar_identity_checks(discovery_key, checked_at DESC)`)
+    ,db.prepare(`CREATE TABLE IF NOT EXISTS ci_radar_onchain_liquidity_assessments (assessment_key TEXT PRIMARY KEY, discovery_key TEXT NOT NULL, chain_id TEXT NOT NULL, pair_address TEXT NOT NULL, checked_at TEXT NOT NULL, outcome TEXT NOT NULL, estimated_pool_depth_usd REAL, quote_token_price_usd REAL, base_token_price_usd REAL, estimated_buy_impact_json TEXT NOT NULL DEFAULT '[]', estimated_sell_impact_json TEXT NOT NULL DEFAULT '[]', evidence_json TEXT NOT NULL DEFAULT '{}')`)
+    ,db.prepare(`CREATE INDEX IF NOT EXISTS idx_ci_radar_onchain_liquidity_discovery ON ci_radar_onchain_liquidity_assessments(discovery_key, checked_at DESC)`)
 
   ]);
 }
@@ -2640,6 +2646,79 @@ async function persistRadarOnchainPoolHistory(db, result) {
   };
 }
 
+
+async function persistRadarOnchainLiquidityAssessment(db,item,pair,result) {
+  if (!result || result.outcome!=="onchain_reserves_read" ||
+      !(result.reserve0_adjusted>0) || !(result.reserve1_adjusted>0)) {
+    return {saved:false,outcome:"onchain_reserves_unavailable"};
+  }
+  const baseAddress=safeString(pair?.baseToken?.address || "",160).toLowerCase();
+  const quoteAddress=safeString(pair?.quoteToken?.address || "",160).toLowerCase();
+  const token0=safeString(result.token0_address || "",160).toLowerCase();
+  const token1=safeString(result.token1_address || "",160).toLowerCase();
+  let baseReserve=null,quoteReserve=null;
+  if(token0===baseAddress && token1===quoteAddress) {
+    baseReserve=result.reserve0_adjusted; quoteReserve=result.reserve1_adjusted;
+  } else if(token1===baseAddress && token0===quoteAddress) {
+    baseReserve=result.reserve1_adjusted; quoteReserve=result.reserve0_adjusted;
+  } else {
+    return {saved:false,outcome:"reserve_token_identity_mismatch"};
+  }
+  const basePriceUsd=radarFiniteMetric(pair?.priceUsd);
+  if(!(basePriceUsd>0) || !(baseReserve>0) || !(quoteReserve>0)) {
+    return {saved:false,outcome:"usd_conversion_unavailable"};
+  }
+  const quotePriceUsd=basePriceUsd*baseReserve/quoteReserve;
+  if(!(quotePriceUsd>0) || !Number.isFinite(quotePriceUsd)) {
+    return {saved:false,outcome:"quote_price_unavailable"};
+  }
+  const sizes=[100,500,1000,5000];
+  const buy=sizes.map(tradeUsd=>{
+    const quoteIn=tradeUsd/quotePriceUsd;
+    const received=baseReserve*(quoteIn*0.997)/(quoteReserve+quoteIn*0.997);
+    const impact=received>0?Math.max(0,((tradeUsd/received)/basePriceUsd-1)*100):null;
+    return {trade_size_usd:tradeUsd,estimated_price_impact_percent:impact};
+  });
+  const sell=sizes.map(tradeUsd=>{
+    const tokenIn=tradeUsd/basePriceUsd;
+    const quoteOut=quoteReserve*(tokenIn*0.997)/(baseReserve+tokenIn*0.997);
+    const outputUsd=quoteOut*quotePriceUsd;
+    return {trade_size_usd:tradeUsd,estimated_price_impact_percent:Math.max(0,(1-outputUsd/tradeUsd)*100)};
+  });
+  const depthUsd=2*quoteReserve*quotePriceUsd;
+  const evidence={
+    reserve_source:"PublicNode on-chain eth_call",
+    price_reference_source:"DexScreener pair priceUsd",
+    quote_price_method:"derived_from_base_price_and_onchain_reserve_ratio",
+    pool_depth_usd_is_estimate:true,
+    model:"constant_product_xy_k",
+    assumed_fee_percent:0.3,
+    gas_router_tax_mev_and_slippage_tolerance_excluded:true,
+    executable_quote_not_requested:true,
+    token0_address:token0,token1_address:token1,
+    base_token_address:baseAddress,quote_token_address:quoteAddress,
+    warning:"Estimation USD hybride : réserves lues on-chain, prix de référence fourni par DexScreener. Ce n'est ni une cotation exécutable ni une garantie de vente."
+  };
+  const key=(item.discovery_key+":"+result.chain_id+":"+result.pair_address).toLowerCase();
+  await db.prepare(`INSERT INTO ci_radar_onchain_liquidity_assessments
+    (assessment_key,discovery_key,chain_id,pair_address,checked_at,outcome,
+     estimated_pool_depth_usd,quote_token_price_usd,base_token_price_usd,
+     estimated_buy_impact_json,estimated_sell_impact_json,evidence_json)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(assessment_key) DO UPDATE SET checked_at=excluded.checked_at,outcome=excluded.outcome,
+    estimated_pool_depth_usd=excluded.estimated_pool_depth_usd,
+    quote_token_price_usd=excluded.quote_token_price_usd,
+    base_token_price_usd=excluded.base_token_price_usd,
+    estimated_buy_impact_json=excluded.estimated_buy_impact_json,
+    estimated_sell_impact_json=excluded.estimated_sell_impact_json,evidence_json=excluded.evidence_json`).bind(
+      key,item.discovery_key,result.chain_id,result.pair_address,result.checked_at,
+      "estimated_from_onchain_reserves_and_provider_price",depthUsd,quotePriceUsd,basePriceUsd,
+      JSON.stringify(buy),JSON.stringify(sell),JSON.stringify(evidence)
+    ).run();
+  return {saved:true,outcome:"estimated_from_onchain_reserves_and_provider_price",
+    estimated_pool_depth_usd:depthUsd,buy_impact:buy,sell_impact:sell,evidence};
+}
+
 async function runRadarOnchainPoolChecks(db, item, marketResult) {
   const pairs = Array.isArray(marketResult?.evidence?.returned_pairs) ? marketResult.evidence.returned_pairs.filter((pair) => pair?.pairAddress).slice(0, 2) : [];
   const summary = { attempted: 0, onchain_reserves_read: 0, unsupported_pair_interface: 0, unsupported_chain: 0, unknown: 0, batch_limit_per_token: 2 };
@@ -2653,6 +2732,7 @@ async function runRadarOnchainPoolChecks(db, item, marketResult) {
     ).run();
     const onchainHistory = await persistRadarOnchainPoolHistory(db, result);
     result.history_snapshot = onchainHistory;
+    result.usd_liquidity_assessment = await persistRadarOnchainLiquidityAssessment(db, item, pair, result);
     summary.attempted++;
     if (result.outcome === "onchain_reserves_read") summary.onchain_reserves_read++;
     if (result.outcome === "unsupported_pair_interface" || result.outcome === "reserves_read_decimals_unknown") summary.unsupported_pair_interface++;
@@ -2660,6 +2740,76 @@ async function runRadarOnchainPoolChecks(db, item, marketResult) {
     if (result.outcome === "unknown") summary.unknown++;
   }
   return summary;
+}
+
+
+async function verifyRadarTokenIdentityWithGeckoTerminal(db, item) {
+  const aliases = {
+    "1":"eth", ethereum:"eth", eth:"eth",
+    "56":"bsc", bsc:"bsc", binance:"bsc", "binance-smart-chain":"bsc",
+    "8453":"base", base:"base",
+    "solana":"solana", "42161":"arbitrum", arbitrum:"arbitrum",
+    "137":"polygon_pos", polygon:"polygon_pos", polygon_pos:"polygon_pos",
+    "10":"optimism", optimism:"optimism",
+    "43114":"avax", avalanche:"avax", avax:"avax",
+    "250":"ftm", fantom:"ftm", "59144":"linea", linea:"linea",
+    "534352":"scroll", scroll:"scroll"
+  };
+  const network = aliases[safeString(item.chain_id || "",80).toLowerCase()] || null;
+  const address = safeString(item.contract_address || "",160);
+  const checkedAt = nowISO();
+  const checkKey = item.discovery_key + ":geckoterminal_identity";
+  if (!network || !address) {
+    return { check_key:checkKey, discovery_key:item.discovery_key, provider:"GeckoTerminal",
+      outcome:"unsupported", checked_at:checkedAt, network_id:network, token_address:address,
+      metadata:{}, error_message:null };
+  }
+  try {
+    const url = "https://api.geckoterminal.com/api/v2/networks/" +
+      encodeURIComponent(network) + "/tokens/" + encodeURIComponent(address) + "/info";
+    const {data,status}=await externalJSON(url);
+    await recordProviderUsage(db,"geckoterminal_token_info",true,status);
+    const attrs=data?.data?.attributes || {};
+    const metadata={
+      name:attrs.name || null,
+      symbol:attrs.symbol || null,
+      address:attrs.address || address,
+      description:attrs.description || null,
+      image_url:attrs.image_url || null,
+      websites:Array.isArray(attrs.websites)?attrs.websites:[],
+      discord_url:attrs.discord_url || null,
+      telegram_handle:attrs.telegram_handle || null,
+      twitter_handle:attrs.twitter_handle || null,
+      coingecko_coin_id:attrs.coingecko_coin_id || null,
+      categories:Array.isArray(attrs.categories)?attrs.categories:[],
+      gt_score:radarFiniteMetric(attrs.gt_score),
+      gt_verified:typeof attrs.gt_verified==="boolean"?attrs.gt_verified:null,
+      provider_updated_at:attrs.updated_at || null
+    };
+    const hasMetadata=Boolean(metadata.name || metadata.symbol || metadata.description ||
+      metadata.websites.length || metadata.twitter_handle || metadata.coingecko_coin_id);
+    return {check_key:checkKey,discovery_key:item.discovery_key,provider:"GeckoTerminal",
+      outcome:hasMetadata?"metadata_returned":"metadata_empty",checked_at:checkedAt,
+      network_id:network,token_address:address,metadata,error_message:null};
+  } catch(error) {
+    await recordProviderUsage(db,"geckoterminal_token_info",false,error.status || 500);
+    return {check_key:checkKey,discovery_key:item.discovery_key,provider:"GeckoTerminal",
+      outcome:"unknown",checked_at:checkedAt,network_id:network,token_address:address,
+      metadata:{},error_message:safeString(error.message || "Métadonnées indisponibles.",500)};
+  }
+}
+
+async function persistRadarIdentityCheck(db,result) {
+  await db.prepare(`INSERT INTO ci_radar_identity_checks
+    (check_key,discovery_key,provider,outcome,checked_at,network_id,token_address,metadata_json,error_message)
+    VALUES(?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(check_key) DO UPDATE SET outcome=excluded.outcome,checked_at=excluded.checked_at,
+    network_id=excluded.network_id,token_address=excluded.token_address,
+    metadata_json=excluded.metadata_json,error_message=excluded.error_message`).bind(
+      result.check_key,result.discovery_key,result.provider,result.outcome,result.checked_at,
+      result.network_id,result.token_address,JSON.stringify(result.metadata || {}),result.error_message
+    ).run();
+  return {outcome:result.outcome,provider:result.provider,checked_at:result.checked_at};
 }
 
 async function runRadarVerification(db) {
@@ -3785,6 +3935,47 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
     const result = await db.prepare("SELECT c.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol FROM ci_radar_contract_checks c JOIN ci_radar_discoveries d ON d.discovery_key = c.discovery_key ORDER BY c.checked_at DESC LIMIT ?").bind(limit).all();
     return json({ success: true, count: result.results?.length || 0, checks: result.results || [] });
+  }
+
+
+  if (method === "GET" && path === "/api/radar/identity-checks") {
+    const limit=Math.max(1,Math.min(500,Number(url.searchParams.get("limit"))||100));
+    const discoveryKey=safeString(url.searchParams.get("discovery_key")||"",200);
+    const result=discoveryKey
+      ? await db.prepare("SELECT * FROM ci_radar_identity_checks WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT ?").bind(discoveryKey,limit).all()
+      : await db.prepare("SELECT * FROM ci_radar_identity_checks ORDER BY checked_at DESC LIMIT ?").bind(limit).all();
+    return json({success:true,count:result.results?.length||0,checks:result.results||[]});
+  }
+  if (method === "GET" && path === "/api/radar/lp-history") {
+    const limit=Math.max(1,Math.min(1000,Number(url.searchParams.get("limit"))||200));
+    const discoveryKey=safeString(url.searchParams.get("discovery_key")||"",200);
+    const result=discoveryKey
+      ? await db.prepare("SELECT * FROM ci_radar_lp_history WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT ?").bind(discoveryKey,limit).all()
+      : await db.prepare("SELECT * FROM ci_radar_lp_history ORDER BY checked_at DESC LIMIT ?").bind(limit).all();
+    return json({success:true,count:result.results?.length||0,history:result.results||[],
+      note:"Les données de verrouillage reflètent uniquement les détenteurs et lockers rapportés par GoPlus; les inconnues restent inconnues."});
+  }
+  if (method === "GET" && path === "/api/radar/onchain-pool-history") {
+    const limit=Math.max(1,Math.min(1000,Number(url.searchParams.get("limit"))||200));
+    const discoveryKey=safeString(url.searchParams.get("discovery_key")||"",200);
+    const pairAddress=safeString(url.searchParams.get("pair_address")||"",160);
+    let query="SELECT * FROM ci_radar_onchain_pool_history WHERE 1=1";
+    const values=[];
+    if(discoveryKey){query+=" AND discovery_key = ?";values.push(discoveryKey);}
+    if(pairAddress){query+=" AND lower(pair_address)=lower(?)";values.push(pairAddress);}
+    query+=" ORDER BY checked_at DESC LIMIT ?";values.push(limit);
+    const result=await db.prepare(query).bind(...values).all();
+    return json({success:true,count:result.results?.length||0,history:result.results||[],
+      note:"Historique append-only des réserves observées on-chain; une baisse ne prouve pas à elle seule un retrait LP frauduleux."});
+  }
+  if (method === "GET" && path === "/api/radar/onchain-liquidity-assessments") {
+    const limit=Math.max(1,Math.min(1000,Number(url.searchParams.get("limit"))||200));
+    const discoveryKey=safeString(url.searchParams.get("discovery_key")||"",200);
+    const result=discoveryKey
+      ? await db.prepare("SELECT * FROM ci_radar_onchain_liquidity_assessments WHERE discovery_key = ? ORDER BY checked_at DESC LIMIT ?").bind(discoveryKey,limit).all()
+      : await db.prepare("SELECT * FROM ci_radar_onchain_liquidity_assessments ORDER BY checked_at DESC LIMIT ?").bind(limit).all();
+    return json({success:true,count:result.results?.length||0,assessments:result.results||[],
+      note:"Profondeur USD estimée à partir de réserves on-chain et d'un prix fournisseur; estimation non exécutable."});
   }
 
   if (method === "GET" && path === "/api/radar/status") {
