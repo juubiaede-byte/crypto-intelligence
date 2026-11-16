@@ -101,6 +101,7 @@ const ARCHIVE_PREFIX = "conan/backups/";
 const ARCHIVE_FORMAT = "crypto-intelligence-d1-backup-v1";
 const ARCHIVE_MAX_ROWS_PER_TABLE = 5000;
 const ARCHIVE_MAX_BYTES = 8 * 1024 * 1024;
+const ARCHIVE_MANIFEST_MAX_BYTES = 256 * 1024;
 const ARCHIVE_LIST_LIMIT = 1000;
 
 /*
@@ -758,9 +759,26 @@ async function verifyDatabaseArchive(
 
   const manifestObject = await bucket.get(manifestKey);
 
+  if (
+    manifestObject &&
+    Number.isFinite(Number(manifestObject.size)) &&
+    Number(manifestObject.size) > ARCHIVE_MANIFEST_MAX_BYTES
+  ) {
+    throw new Error("Le manifeste dépasse la taille maximale autorisée.");
+  }
+
   if (manifestObject) {
     try {
       const manifest = JSON.parse(await manifestObject.text());
+
+      if (
+        typeof snapshotMetadata.snapshot_id !== "string" ||
+        !snapshotMetadata.snapshot_id.trim() ||
+        typeof manifest.snapshot_id !== "string" ||
+        !manifest.snapshot_id.trim()
+      ) {
+        throw new Error("Identifiant de snapshot absent ou invalide dans le manifeste.");
+      }
 
       const manifestValid =
         manifest.application === APP_NAME &&
@@ -1178,6 +1196,15 @@ async function previewDatabaseArchive(db, env, requestedKey) {
       const hasUnknownRowColumns = rowColumns.some(
         (column) => !archivedColumnNames.has(column)
       );
+
+      const hasMissingRowColumns = archivedColumns.some(
+        (column) => !Object.prototype.hasOwnProperty.call(row, column)
+      );
+
+      if (hasMissingRowColumns) {
+        invalidRows++;
+        continue;
+      }
 
       if (hasUnknownRowColumns) {
         invalidRows++;
