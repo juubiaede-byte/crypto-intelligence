@@ -2555,6 +2555,16 @@ async function runRadarDiscovery(db) {
     });
   }
 
+  // Deuxième flux GeckoTerminal sur les mêmes réseaux : pools récemment actifs.
+  // Il complète les nouvelles paires sans déclarer ces pools comme nouvellement créés.
+  for (const network of radarNetworks) {
+    endpoints.push({
+      provider: "geckoterminal_network_trending_pools_" + network,
+      url: "https://api.geckoterminal.com/api/v2/networks/" +
+        encodeURIComponent(network) + "/trending_pools?include=base_token,quote_token,network,dex"
+    });
+  }
+
   const responses = await Promise.all(
     endpoints.map((source) => fetchRadarSource(db, source.provider, source.url))
   );
@@ -2604,6 +2614,28 @@ async function runRadarDiscovery(db) {
             pair_created_at: attrs.pool_created_at || null,
             reserve_in_usd: attrs.reserve_in_usd ?? null,
             volume_usd: attrs.volume_usd || null }
+        ));
+      }
+    }
+
+    if (provider.startsWith("geckoterminal_network_trending_pools_")) {
+      const pools = radarArray(response.data);
+      const included = response.data?.included || [];
+      for (const pool of pools) {
+        const token = geckoTokenAddress(pool, included);
+        if (!token) continue;
+        const network = pool.relationships?.network?.data?.id ||
+          String(pool.id || "").split("_")[0] ||
+          provider.slice("geckoterminal_network_trending_pools_".length);
+        const attrs = pool.attributes || {};
+        discoveries.push(normalizeRadarToken(
+          network, token.address, token.name, token.symbol, provider,
+          { pair_address: attrs.address || null, pair_name: attrs.name || null,
+            pair_created_at: attrs.pool_created_at || null,
+            reserve_in_usd: attrs.reserve_in_usd ?? null,
+            volume_usd: attrs.volume_usd || null,
+            trending_pool_discovery: true,
+            discovery_type: "trending_pool_not_confirmed_new" }
         ));
       }
     }
