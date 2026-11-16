@@ -2138,6 +2138,8 @@ function geckoTokenAddress(pool, included) {
 }
 
 
+function cryptoRandomId() { return crypto.randomUUID(); }
+
 const RADAR_LIFECYCLE_STAGES = [
   "crypto_universe",
   "quarantine",
@@ -4090,6 +4092,7 @@ async function handleProtectedRoutes(request, env, ctx, route) {
 
   if (method === "POST" && path === "/api/radar/lifecycle/transition") {
     const body = await readBody(request);
+    if (!body.evidence || typeof body.evidence !== "object" || Array.isArray(body.evidence) || Object.keys(body.evidence).length === 0) return errorResponse("Des preuves structurées non vides sont obligatoires pour chaque transition.");
     const result = await transitionRadarAssetLifecycle(db, body);
     if (result.error) return errorResponse(result.error, 400);
     return json({ success: true, transition: result }, 201);
