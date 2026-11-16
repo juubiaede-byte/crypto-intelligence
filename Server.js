@@ -2171,6 +2171,29 @@ async function syncRadarAssetLifecycle(db, limit = 1000) {
   return { scanned: rows.results?.length || 0, initialized };
 }
 
+
+async function syncRadarAssetLifecycleMissing(db, limit = 1000) {
+  const batchLimit = Math.max(1, Math.min(1000, Number(limit) || 1000));
+  const rows = await db.prepare(
+    "SELECT d.discovery_key, d.first_seen_at FROM ci_radar_discoveries d " +
+    "WHERE NOT EXISTS (SELECT 1 FROM ci_radar_asset_lifecycle l WHERE l.discovery_key = d.discovery_key) " +
+    "ORDER BY d.first_seen_at ASC LIMIT ?"
+  ).bind(batchLimit).all();
+  let initialized = 0;
+  for (const row of rows.results || []) {
+    const timestamp = row.first_seen_at || nowISO();
+    const reason = "Actif historique découvert par le radar; initialisation de son cycle en quarantaine avec traçabilité.";
+    await db.prepare(
+      "INSERT OR IGNORE INTO ci_radar_asset_lifecycle (discovery_key, current_stage, entered_stage_at, updated_at, last_transition_reason, evidence_json) VALUES (?, 'quarantine', ?, ?, ?, '{}')"
+    ).bind(row.discovery_key, timestamp, timestamp, reason).run();
+    await db.prepare(
+      "INSERT OR IGNORE INTO ci_radar_asset_lifecycle_history (event_id, discovery_key, from_stage, to_stage, reason, evidence_json, transitioned_at, actor) VALUES (?, ?, 'crypto_universe', 'quarantine', ?, '{}', ?, 'radar_backfill')"
+    ).bind(cryptoRandomId(), row.discovery_key, reason, timestamp).run();
+    initialized++;
+  }
+  return { scanned: rows.results?.length || 0, initialized, has_more: (rows.results || []).length === batchLimit };
+}
+
 function validateRadarLifecycleEvidence(evidence) {
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
     return "Les preuves doivent être un objet structuré.";
@@ -2222,6 +2245,7 @@ async function transitionRadarAssetLifecycle(db, body) {
   ).bind(discoveryKey).first();
   if (!state) {
     await syncRadarAssetLifecycle(db, 5000);
+    await syncRadarAssetLifecycleMissing(db, 1000);
     state = await db.prepare(
       "SELECT * FROM ci_radar_asset_lifecycle WHERE discovery_key = ?"
     ).bind(discoveryKey).first();
@@ -4110,6 +4134,7 @@ async function handleProtectedRoutes(request, env, ctx, route) {
 
   if (method === "GET" && path === "/api/radar/lifecycle") {
     const synchronization = await syncRadarAssetLifecycle(db, 5000);
+    const missingSynchronization = await syncRadarAssetLifecycleMissing(db, 1000);
     const stage = safeString(url.searchParams.get("stage") || "", 80);
     if (stage && !RADAR_LIFECYCLE_STAGES.includes(stage)) return errorResponse("Étape de cycle de vie invalide.");
     const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit")) || 200));
@@ -4117,7 +4142,7 @@ async function handleProtectedRoutes(request, env, ctx, route) {
       ? await db.prepare("SELECT l.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol, d.first_seen_at FROM ci_radar_asset_lifecycle l JOIN ci_radar_discoveries d ON d.discovery_key = l.discovery_key WHERE l.current_stage = ? ORDER BY l.updated_at DESC LIMIT ?").bind(stage, limit).all()
       : await db.prepare("SELECT l.*, d.chain_id, d.contract_address, d.token_name, d.token_symbol, d.first_seen_at FROM ci_radar_asset_lifecycle l JOIN ci_radar_discoveries d ON d.discovery_key = l.discovery_key ORDER BY l.updated_at DESC LIMIT ?").bind(limit).all();
     const counts = await db.prepare("SELECT current_stage, COUNT(*) AS count FROM ci_radar_asset_lifecycle GROUP BY current_stage").all();
-    return json({ success: true, stages: RADAR_LIFECYCLE_STAGES, counts: counts.results || [], count: result.results?.length || 0, assets: result.results || [], synchronization });
+    return json({ success: true, stages: RADAR_LIFECYCLE_STAGES, counts: counts.results || [], count: result.results?.length || 0, assets: result.results || [], synchronization, missing_synchronization: missingSynchronization });
   }
 
   if (method === "GET" && path === "/api/radar/lifecycle-history") {
