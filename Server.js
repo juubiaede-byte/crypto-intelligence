@@ -125,6 +125,9 @@ const ARCHIVE_TABLES = [
   ,"ci_conan_prediction_results"
   ,"ci_conan_learning_history"
   ,"ci_conan_score_history"
+  ,"ci_conan_growth_state"
+  ,"ci_conan_growth_history"
+  ,"ci_conan_surveillance_windows"
 ];
 
 const ARCHIVE_PREFIX = "conan/backups/";
@@ -6766,6 +6769,158 @@ async function evaluateConanPredictionCycle(db,cycle){
   await audit(db,"conan_prediction_score_calculated","Score Conan du cycle "+cycle.cycle_id+" : "+(conanScore.score_total===null?"non calculable":conanScore.score_total+"/100")+".");
   return {status:"completed",cycle_id:cycle.cycle_id,summary,evaluated};
 }
+
+
+/* CHAPITRE 10 — MATURITÉ DE CONAN ET DÉBLOCAGES PROGRESSIFS */
+const CONAN_GROWTH_METHODOLOGY = "conan-growth-first10-first100-v1";
+const conanChapter10OriginalEnsureTables = ensureConanPredictionTables;
+ensureConanPredictionTables = async function(db){
+  await conanChapter10OriginalEnsureTables(db);
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_growth_state (
+      state_id TEXT PRIMARY KEY,
+      maturity_stage TEXT NOT NULL DEFAULT 'child',
+      verified_evaluated_predictions INTEGER NOT NULL DEFAULT 0,
+      verified_correct_predictions INTEGER NOT NULL DEFAULT 0,
+      first_ten_evaluated INTEGER NOT NULL DEFAULT 0,
+      first_ten_correct INTEGER NOT NULL DEFAULT 0,
+      first_hundred_evaluated INTEGER NOT NULL DEFAULT 0,
+      first_hundred_correct INTEGER NOT NULL DEFAULT 0,
+      active_asset_slots INTEGER NOT NULL DEFAULT 2,
+      extra_surveillance_windows INTEGER NOT NULL DEFAULT 0,
+      methodology_version TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_growth_history (
+      event_id TEXT PRIMARY KEY,
+      from_stage TEXT,
+      to_stage TEXT NOT NULL,
+      evaluated_predictions INTEGER NOT NULL,
+      correct_predictions INTEGER NOT NULL,
+      threshold_json TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      methodology_version TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_growth_history_created ON ci_conan_growth_history(created_at DESC)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_surveillance_windows (
+      window_id TEXT PRIMARY KEY,
+      window_number INTEGER NOT NULL,
+      unlock_stage TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'unassigned',
+      discovery_key TEXT,
+      chain_id TEXT,
+      contract_address TEXT,
+      token_symbol TEXT,
+      unlocked_at TEXT NOT NULL,
+      assigned_at TEXT,
+      assignment_evidence_json TEXT NOT NULL DEFAULT '{}'
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_surveillance_windows_status ON ci_conan_surveillance_windows(status,window_number)")
+  ]);
+  await db.prepare("INSERT OR IGNORE INTO ci_conan_growth_state (state_id,maturity_stage,active_asset_slots,extra_surveillance_windows,methodology_version,updated_at) VALUES ('primary','child',2,0,?,?)").bind(CONAN_GROWTH_METHODOLOGY,nowISO()).run();
+};
+
+async function getConanGrowthState(db){
+  await ensureConanPredictionTables(db);
+  return await db.prepare("SELECT * FROM ci_conan_growth_state WHERE state_id='primary'").first();
+}
+
+async function updateConanGrowthAfterEvaluation(db,cycleId){
+  const all=await db.prepare("SELECT p.prediction_id,r.direction_correct,r.evaluated_at FROM ci_conan_predictions p JOIN ci_conan_prediction_results r ON r.prediction_id=p.prediction_id WHERE r.outcome_status='evaluated' AND r.direction_correct IS NOT NULL ORDER BY r.evaluated_at ASC,p.locked_at ASC LIMIT 100").all();
+  const evaluated=all.results||[];
+  const firstTen=evaluated.slice(0,10),firstHundred=evaluated.slice(0,100);
+  const correctTen=firstTen.filter(item=>Number(item.direction_correct)===1).length;
+  const correctHundred=firstHundred.filter(item=>Number(item.direction_correct)===1).length;
+  const state=await db.prepare("SELECT * FROM ci_conan_growth_state WHERE state_id='primary'").first();
+  const currentStage=state?.maturity_stage||"child";
+  let nextStage=currentStage,assetSlots=Number(state?.active_asset_slots)||2,extraWindows=Number(state?.extra_surveillance_windows)||0;
+  if(currentStage==="child"&&firstTen.length>=10&&correctTen>=7){
+    nextStage="adolescent";extraWindows=1;
+  }
+  if((currentStage==="adolescent"||nextStage==="adolescent")&&firstHundred.length>=100&&correctHundred>=70){
+    nextStage="adult";assetSlots=4;
+  }
+  const timestamp=nowISO();
+  await db.prepare("UPDATE ci_conan_growth_state SET maturity_stage=?,verified_evaluated_predictions=?,verified_correct_predictions=?,first_ten_evaluated=?,first_ten_correct=?,first_hundred_evaluated=?,first_hundred_correct=?,active_asset_slots=?,extra_surveillance_windows=?,methodology_version=?,updated_at=? WHERE state_id='primary'").bind(
+    nextStage,evaluated.length,evaluated.filter(item=>Number(item.direction_correct)===1).length,firstTen.length,correctTen,firstHundred.length,correctHundred,assetSlots,extraWindows,CONAN_GROWTH_METHODOLOGY,timestamp
+  ).run();
+  if(nextStage!==currentStage){
+    const thresholds={
+      child_to_adolescent:{required_evaluated:10,required_correct:7,minimum_accuracy_percent:70,unlock:"one extra surveillance window initially empty"},
+      adolescent_to_adult:{required_evaluated:100,required_correct:70,minimum_accuracy_percent:70,unlock:"four assets processed in deterministic sequential order per cycle"}
+    };
+    const transition=nextStage==="adolescent"?"child_to_adolescent":"adolescent_to_adult";
+    await db.prepare("INSERT INTO ci_conan_growth_history (event_id,from_stage,to_stage,evaluated_predictions,correct_predictions,threshold_json,evidence_json,methodology_version,created_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(
+      cryptoRandomId(),currentStage,nextStage,nextStage==="adolescent"?firstTen.length:firstHundred.length,nextStage==="adolescent"?correctTen:correctHundred,
+      JSON.stringify(thresholds[transition]),JSON.stringify({cycle_id:cycleId,first_ten:{evaluated:firstTen.length,correct:correctTen},first_hundred:{evaluated:firstHundred.length,correct:correctHundred},counting_rule:"Seules les prédictions avec outcome_status=evaluated et direction_correct non nul comptent; les résultats unverifiable sont exclus.",asset_slots:assetSlots,extra_surveillance_windows:extraWindows}),
+      CONAN_GROWTH_METHODOLOGY,timestamp
+    ).run();
+    if(nextStage==="adolescent"){
+      await db.prepare("INSERT OR IGNORE INTO ci_conan_surveillance_windows (window_id,window_number,unlock_stage,status,discovery_key,unlocked_at,assignment_evidence_json) VALUES (?,1,'adolescent','unassigned',NULL,?,'{}')").bind(cryptoRandomId(),timestamp).run();
+    }
+    await db.prepare("INSERT INTO ci_conan_learning_history (learning_id,cycle_id,learning_type,summary,evidence_json,created_at) VALUES (?,?,?,?,?,?)").bind(
+      cryptoRandomId(),cycleId,"growth_stage_unlocked","Conan passe de "+currentStage+" à "+nextStage+" après validation de ses prédictions.",JSON.stringify({first_ten:{evaluated:firstTen.length,correct:correctTen},first_hundred:{evaluated:firstHundred.length,correct:correctHundred},active_asset_slots:assetSlots,extra_surveillance_windows:extraWindows,methodology:CONAN_GROWTH_METHODOLOGY}),timestamp
+    ).run();
+    await audit(db,"conan_growth_stage_unlocked","Conan passe de "+currentStage+" à "+nextStage+"; "+(nextStage==="adolescent"?"une fenêtre de surveillance supplémentaire est débloquée, vide.":"quatre actifs seront traités séquentiellement."));
+  }
+  return {maturity_stage:nextStage,previous_stage:currentStage,changed:nextStage!==currentStage,verified_evaluated_predictions:evaluated.length,verified_correct_predictions:evaluated.filter(item=>Number(item.direction_correct)===1).length,first_ten:{evaluated:firstTen.length,correct:correctTen,required_correct:7},first_hundred:{evaluated:firstHundred.length,correct:correctHundred,required_correct:70},active_asset_slots:assetSlots,extra_surveillance_windows:extraWindows,methodology_version:CONAN_GROWTH_METHODOLOGY};
+}
+
+const conanChapter10OriginalSelectAssets = selectConanCycleAssets;
+selectConanCycleAssets = async function(db,requestedCount=2){
+  const result=await db.prepare("SELECT d.discovery_key,d.chain_id,d.contract_address,d.token_name,d.token_symbol,m.pair_address,m.price_usd,m.source,m.observed_at,m.liquidity_usd,m.volume_24h_usd FROM ci_radar_discoveries d JOIN ci_radar_pool_metrics m ON m.metric_key=(SELECT pm.metric_key FROM ci_radar_pool_metrics pm WHERE pm.discovery_key=d.discovery_key AND pm.price_usd>0 ORDER BY pm.observed_at DESC LIMIT 1) WHERE m.price_usd>0 ORDER BY RANDOM() LIMIT 100").all();
+  const candidates=result.results||[];
+  if(candidates.length<requestedCount)return {assets:[],mode:"unavailable",reason:"Il faut "+requestedCount+" actifs distincts avec un prix source exploitable; disponibles : "+candidates.length+"."};
+  const historyResult=await db.prepare("SELECT p.discovery_key,AVG(CASE WHEN r.direction_correct=1 THEN 100 WHEN r.direction_correct=0 THEN 0 ELSE NULL END) AS accuracy,COUNT(r.result_id) AS sample_count FROM ci_conan_predictions p JOIN ci_conan_prediction_results r ON r.prediction_id=p.prediction_id WHERE r.outcome_status='evaluated' GROUP BY p.discovery_key").all();
+  const history=new Map((historyResult.results||[]).map(row=>[row.discovery_key,{accuracy:radarFiniteMetric(row.accuracy),count:Number(row.sample_count)||0}]));
+  const experienced=history.size>0;
+  if(!experienced){
+    for(let i=candidates.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[candidates[i],candidates[j]]=[candidates[j],candidates[i]];}
+  }else{
+    candidates.sort((a,b)=>{
+      const ah=history.get(a.discovery_key),bh=history.get(b.discovery_key);
+      const av=ah?ah.accuracy+Math.min(ah.count,10)*0.25:50;
+      const bv=bh?bh.accuracy+Math.min(bh.count,10)*0.25:50;
+      return bv-av||(Math.random()-0.5);
+    });
+  }
+  return {assets:candidates.slice(0,requestedCount),mode:experienced?"experience_weighted_with_exploration":"random_initial",reason:experienced?"Sélection pondérée par les résultats antérieurs évalués, avec exploration des actifs sans historique; ordre de surveillance séquentiel conservé.":"Sélection initiale aléatoire parmi les actifs possédant un prix observé; ordre de surveillance séquentiel conservé."};
+};
+
+createConanPredictionCycle = async function(db){
+  const today=conanUtcDate();
+  const completed=await db.prepare("SELECT cycle_id FROM ci_conan_prediction_cycles WHERE status='completed' AND completed_at>=? LIMIT 1").bind(today+"T00:00:00.000Z").first();
+  if(completed)return {status:"cycle_completed_today",cycle_id:completed.cycle_id};
+  const growth=await getConanGrowthState(db);
+  const desiredCount=growth?.maturity_stage==="adult"?4:2;
+  const selection=await selectConanCycleAssets(db,desiredCount);
+  if(selection.assets.length!==desiredCount)return {status:"waiting_for_assets",required_assets:desiredCount,reason:selection.reason,maturity_stage:growth?.maturity_stage||"child"};
+  const id=cryptoRandomId(),timestamp=nowISO(),stage=growth?.maturity_stage||"child";
+  await db.prepare("INSERT INTO ci_conan_prediction_cycles (cycle_id,status,cycle_start_date,current_day,selection_mode,learning_stage,methodology_version,created_at,updated_at) VALUES (?,'observing',?,1,?,?,?,?,?)").bind(id,today,selection.mode,stage,CONAN_PREDICTION_METHODOLOGY,timestamp,timestamp).run();
+  for(let i=0;i<selection.assets.length;i++){
+    const asset=selection.assets[i];
+    await db.prepare("INSERT INTO ci_conan_prediction_assets (asset_row_id,cycle_id,asset_order,discovery_key,chain_id,contract_address,token_name,token_symbol,pair_address,selected_at,selection_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(
+      cryptoRandomId(),id,i+1,asset.discovery_key,asset.chain_id,asset.contract_address,asset.token_name,asset.token_symbol,asset.pair_address,timestamp,selection.reason+" Ordre séquentiel "+(i+1)+"/"+selection.assets.length+"."
+    ).run();
+    await recordConanPredictionObservation(db,{cycle_id:id},asset,1);
+  }
+  await db.prepare("INSERT INTO ci_conan_learning_history (learning_id,cycle_id,learning_type,summary,evidence_json,created_at) VALUES (?,?,?,?,?,?)").bind(
+    cryptoRandomId(),id,"cycle_started","Début du cycle de 15 jours : "+selection.assets.length+" actifs distincts; observation et traitement dans l'ordre séquentiel.",JSON.stringify({selection_mode:selection.mode,selection_reason:selection.reason,maturity_stage:stage,asset_count:selection.assets.length,monitoring_order:"sequential_by_asset_order",assets:selection.assets.map(item=>({discovery_key:item.discovery_key,chain_id:item.chain_id,contract_address:item.contract_address,pair_address:item.pair_address,price_usd:item.price_usd,source:item.source,observed_at:item.observed_at}))}),timestamp
+  ).run();
+  await audit(db,"conan_prediction_cycle_started","Cycle "+id+" lancé au stade "+stage+" avec "+selection.assets.length+" actifs traités dans l'ordre séquentiel.");
+  return {status:"started",cycle_id:id,cycle_start_date:today,maturity_stage:stage,selection_mode:selection.mode,monitoring_order:"sequential_by_asset_order",assets:selection.assets.map((item,index)=>({order:index+1,discovery_key:item.discovery_key,chain_id:item.chain_id,contract_address:item.contract_address,symbol:item.token_symbol,price_usd:item.price_usd,source:item.source}))};
+};
+
+const conanChapter10OriginalEvaluateCycle = evaluateConanPredictionCycle;
+evaluateConanPredictionCycle = async function(db,cycle){
+  const result=await conanChapter10OriginalEvaluateCycle(db,cycle);
+  if(result?.status==="completed"){
+    const growth=await updateConanGrowthAfterEvaluation(db,cycle.cycle_id);
+    result.growth=growth;
+  }
+  return result;
+};
 
 async function runConanPredictionCycle(db,env){
   try{
