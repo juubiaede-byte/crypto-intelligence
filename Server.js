@@ -6634,7 +6634,13 @@ export default {
   async scheduled(controller, env, ctx) {
     const db = getDB(env);
     const task = runRadarDiscovery(db);
+    const conanTask = task.then(
+      () => runConanPredictionCycle(db, env),
+      () => runConanPredictionCycle(db, env)
+    );
     if (ctx?.waitUntil) ctx.waitUntil(task);
     else await task;
+    if (ctx?.waitUntil) ctx.waitUntil(conanTask);
+    else await conanTask;
   }
 };
