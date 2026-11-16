@@ -3107,6 +3107,18 @@ async function handleProtectedRoutes(request, env, ctx, route) {
     return json({ success: true, count: result.results?.length || 0, discoveries: result.results || [] });
   }
 
+  if (method === "GET" && path === "/api/radar/pairs") {
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+    const result = await db.prepare(
+      "SELECT * FROM ci_radar_pairs ORDER BY first_seen_at DESC LIMIT ?"
+    ).bind(limit).all();
+    return json({
+      success: true,
+      count: result.results?.length || 0,
+      pairs: result.results || []
+    });
+  }
+
   if (method === "GET" && path === "/api/radar/status") {
     const [totals, latest] = await Promise.all([
       db.prepare("SELECT status, COUNT(*) AS count FROM ci_radar_discoveries GROUP BY status").all(),
