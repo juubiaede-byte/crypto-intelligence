@@ -2334,6 +2334,110 @@ async function persistRadarPoolMetrics(db, discoveryKey, marketResult) {
 }
 
 
+/* Estimation indicative de l'impact AMM à partir des réserves observées.
+ * Les résultats restent des estimations théoriques, jamais une preuve d'exécution.
+ */
+async function estimateRadarPoolExecutionImpact(db, discoveryKey) {
+  const rows = await db.prepare(`
+    SELECT metric_key, chain_id, pair_address, base_token_address,
+           quote_token_address, price_usd, base_reserve, quote_reserve,
+           evidence_json
+    FROM ci_radar_pool_metrics
+    WHERE discovery_key = ?
+    ORDER BY liquidity_usd DESC
+    LIMIT 20
+  `).bind(discoveryKey).all();
+  const tradeSizesUsd = [100, 500, 1000, 5000];
+  let assessed = 0;
+  let insufficient = 0;
+  for (const row of rows.results || []) {
+    const baseReserve = radarFiniteMetric(row.base_reserve);
+    const quoteReserve = radarFiniteMetric(row.quote_reserve);
+    const basePriceUsd = radarFiniteMetric(row.price_usd);
+    const baseAddress = safeString(row.base_token_address || "", 160).toLowerCase();
+    const quoteAddress = safeString(row.quote_token_address || "", 160).toLowerCase();
+    const targetAddress = safeString(
+      (await db.prepare("SELECT contract_address FROM ci_radar_discoveries WHERE discovery_key = ?")
+        .bind(discoveryKey).first())?.contract_address || "", 160
+    ).toLowerCase();
+    let tokenReserve = null;
+    let counterReserve = null;
+    let tokenPriceUsd = null;
+    let counterPriceUsd = null;
+    if (baseAddress && baseAddress === targetAddress && baseReserve > 0 &&
+        quoteReserve > 0 && basePriceUsd > 0) {
+      tokenReserve = baseReserve;
+      counterReserve = quoteReserve;
+      tokenPriceUsd = basePriceUsd;
+      counterPriceUsd = basePriceUsd * baseReserve / quoteReserve;
+    } else if (quoteAddress && quoteAddress === targetAddress && baseReserve > 0 &&
+        quoteReserve > 0 && basePriceUsd > 0) {
+      tokenReserve = quoteReserve;
+      counterReserve = baseReserve;
+      tokenPriceUsd = basePriceUsd * baseReserve / quoteReserve;
+      counterPriceUsd = basePriceUsd;
+    }
+    if (!(tokenReserve > 0 && counterReserve > 0 &&
+          tokenPriceUsd > 0 && counterPriceUsd > 0)) {
+      insufficient++;
+      continue;
+    }
+    const scenarios = tradeSizesUsd.map((tradeUsd) => {
+      const inputCounter = tradeUsd / counterPriceUsd;
+      const inputToken = tradeUsd / tokenPriceUsd;
+      const feeAdjustedCounter = inputCounter * 0.997;
+      const feeAdjustedToken = inputToken * 0.997;
+      const boughtToken = tokenReserve * feeAdjustedCounter /
+        (counterReserve + feeAdjustedCounter);
+      const receivedCounter = counterReserve * feeAdjustedToken /
+        (tokenReserve + feeAdjustedToken);
+      const spotCounterPerToken = counterReserve / tokenReserve;
+      const buyImpact = boughtToken > 0
+        ? Math.max(0, ((inputCounter / boughtToken) / spotCounterPerToken - 1) * 100)
+        : null;
+      const sellImpact = inputToken > 0
+        ? Math.max(0, (1 - (receivedCounter / inputToken) / spotCounterPerToken) * 100)
+        : null;
+      return {
+        trade_size_usd: tradeUsd,
+        estimated_buy_price_impact_percent: buyImpact,
+        estimated_sell_price_impact_percent: sellImpact
+      };
+    });
+    let prior = {};
+    try { prior = JSON.parse(row.evidence_json || "{}"); } catch { prior = {}; }
+    const enriched = {
+      ...prior,
+      amm_execution_impact_estimate: {
+        status: "estimated_from_reported_reserves",
+        model: "constant_product_xy_k",
+        assumed_fee_percent: 0.3,
+        trade_sizes_usd: tradeSizesUsd,
+        scenarios,
+        token_reserve: tokenReserve,
+        counter_reserve: counterReserve,
+        token_price_usd_reference: tokenPriceUsd,
+        counter_price_usd_inferred: counterPriceUsd,
+        reserve_source: "DexScreener",
+        independently_verified_reserves: false,
+        gas_and_router_fees_included: false,
+        warning: "Estimation indicative; réserves rapportées par le fournisseur, frais supposés à 0,3 %, hors gas, taxes token, MEV, routage et variation de réserves."
+      }
+    };
+    await db.prepare("UPDATE ci_radar_pool_metrics SET evidence_json = ? WHERE metric_key = ?")
+      .bind(JSON.stringify(enriched), row.metric_key).run();
+    assessed++;
+  }
+  return {
+    pools_assessed: assessed,
+    pools_without_sufficient_reserves: insufficient,
+    trade_sizes_usd: tradeSizesUsd,
+    model: "constant_product_xy_k",
+    status: assessed ? "estimated_not_executable_quote" : "insufficient_data"
+  };
+}
+
+
 async function persistRadarPoolMetricAssetLinks(db, discoveryKey, marketResult) {
   const pairs = Array.isArray(marketResult?.evidence?.returned_pairs) ? marketResult.evidence.returned_pairs.slice(0, 20) : [];
   let linked = 0;
@@ -2500,6 +2604,7 @@ async function runRadarVerification(db) {
     const marketResult = await verifyRadarMarketData(db, item);
     await persistRadarMarketCheck(db, marketResult);
     marketResult.pool_metrics = await persistRadarPoolMetrics(db, item.discovery_key, marketResult);
+    marketResult.execution_impact_estimates = await estimateRadarPoolExecutionImpact(db, item.discovery_key);
     marketResult.pool_metrics.asset_links_saved = await persistRadarPoolMetricAssetLinks(db, item.discovery_key, marketResult);
     marketResult.pool_metric_history = await persistRadarPoolMetricHistory(db, item.discovery_key, marketResult);
     marketResult.onchain_pool_checks = await runRadarOnchainPoolChecks(db, item, marketResult);
