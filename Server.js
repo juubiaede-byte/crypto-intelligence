@@ -8702,3 +8702,45 @@ verifyRadarTokenWithGoPlus=async function(db,item){
   if(!gate.allowed)return {check_key:item.discovery_key+":goplus",discovery_key:item.discovery_key,provider:"GoPlus",outcome:"unknown",checked_at:nowISO(),evidence:{deferred_by_provider_manager:true,reason:gate.reason},error_message:null};
   return await ciChapter15OriginalGoPlus(db,item);
 };
+
+
+/* Chapitre 15 — comptabilisation exacte des appels et exécution unique des jobs. */
+recordProviderUsage=async function(db,provider,success,statusCode){
+  await ciChapter15OriginalRecordProviderUsage(db,provider,success,statusCode);
+  const id=ciProviderIdFromLegacyName(provider);
+  if(id){
+    try{await ciRecordManagedProviderResult(db,id,"legacy_provider_call",Boolean(success),statusCode||null,0,success?null:"Échec signalé par l'adaptateur existant.");}
+    catch(error){console.error("Central provider metrics error:",error);}
+  }
+};
+
+processCIProviderQueue=async function(db,env,limit=5){
+  await ensureCIProviderOrchestratorTables(db);
+  const max=Math.max(1,Math.min(10,Number(limit)||5));
+  const ready=await db.prepare("SELECT * FROM ci_provider_request_queue WHERE status='pending' AND next_attempt_at<=? ORDER BY priority ASC,created_at ASC LIMIT ?").bind(nowISO(),max).all();
+  const results=[];
+  for(const job of ready.results||[]){
+    const gate=await ciProviderRuntimeGate(db,job.provider_id);
+    if(!gate.allowed){
+      results.push({request_id:job.request_id,status:"deferred",reason:gate.reason,retry_at:gate.retry_at});
+      if(gate.retry_at)await db.prepare("UPDATE ci_provider_request_queue SET next_attempt_at=?,updated_at=? WHERE request_id=? AND status='pending'").bind(gate.retry_at,nowISO(),job.request_id).run();
+      continue;
+    }
+    const claim=await db.prepare("UPDATE ci_provider_request_queue SET status='running',attempts=attempts+1,updated_at=? WHERE request_id=? AND status='pending'").bind(nowISO(),job.request_id).run();
+    if(!claim.meta?.changes)continue;
+    try{
+      const payload=JSON.parse(job.payload_json||"{}");
+      const data=await fetchCIProviderReferenceData(db,env,{provider_id:job.provider_id,operation:job.operation,...payload});
+      await db.prepare("UPDATE ci_provider_request_queue SET status='completed',result_json=?,last_error=NULL,updated_at=? WHERE request_id=?").bind(JSON.stringify(data),nowISO(),job.request_id).run();
+      results.push({request_id:job.request_id,status:"completed",provider_id:job.provider_id,operation:job.operation});
+    }catch(error){
+      const message=safeString(error.message||"Erreur fournisseur.",700);
+      const attempts=Number(job.attempts)+1,canRetry=attempts<Number(job.max_attempts);
+      const state=await db.prepare("SELECT cooldown_until FROM ci_provider_runtime_state WHERE provider_id=?").bind(job.provider_id).first();
+      const next=state?.cooldown_until||new Date(Date.now()+60000).toISOString();
+      await db.prepare("UPDATE ci_provider_request_queue SET status=?,next_attempt_at=?,last_error=?,updated_at=? WHERE request_id=?").bind(canRetry?"pending":"failed",next,message,nowISO(),job.request_id).run();
+      results.push({request_id:job.request_id,status:canRetry?"retry_scheduled":"failed",error:message,retry_at:canRetry?next:null});
+    }
+  }
+  return {processed:results.length,results,priority_order:"critical_security_to_historical_analysis",paid_overage:false};
+};
