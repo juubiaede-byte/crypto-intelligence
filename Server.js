@@ -2257,6 +2257,13 @@ async function persistRadarDiscoveries(db, discoveries) {
         JSON.stringify(sourceDetails), timestamp, timestamp,
         item.pair_created_at, timestamp, timestamp
       ).run();
+      const lifecycleReason = "Première détection : actif enregistré dans l'univers crypto puis placé en quarantaine pour vérification.";
+      await db.prepare(
+        "INSERT OR IGNORE INTO ci_radar_asset_lifecycle (discovery_key, current_stage, entered_stage_at, updated_at, last_transition_reason, evidence_json) VALUES (?, 'quarantine', ?, ?, ?, '{}')"
+      ).bind(key, timestamp, timestamp, lifecycleReason).run();
+      await db.prepare(
+        "INSERT OR IGNORE INTO ci_radar_asset_lifecycle_history (event_id, discovery_key, from_stage, to_stage, reason, evidence_json, transitioned_at, actor) VALUES (?, ?, 'crypto_universe', 'quarantine', ?, '{}', ?, 'radar')"
+      ).bind(cryptoRandomId(), key, lifecycleReason, timestamp).run();
       inserted++;
     } else {
       await db.prepare(`
