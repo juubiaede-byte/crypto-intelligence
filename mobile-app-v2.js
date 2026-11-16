@@ -41,7 +41,7 @@
     providers:["/api/providers","/api/providers/ai","/api/providers/usage","/api/providers/queue"],
     telegram:["/api/telegram/history","/api/telegram/queue"],
     history:["/api/history/summary","/api/history/events","/api/history/verify","/api/archives/operations"],
-    settings:["/api/health","/api/archives/status","/api/providers","/api/providers/usage","/api/telegram/verify"]
+    settings:["/api/health","/api/archives/status","/api/archives/restore/status","/api/providers","/api/providers/usage"]
   };
   const TITLES=Object.fromEntries(NAV.map(x=>[x[0],x[1]]));
   let page="dashboard",cache={},busy=false,assetKey="";
@@ -67,7 +67,7 @@
         <div class="m-layout">
           <nav class="m-nav" aria-label="Navigation principale">
             <div class="m-nav-caption">LES 18 ESPACES</div>
-            ${NAV.map(([id,label,desc],i)=>'<button class="m-nav-item" data-page="'+id+'"><span class="m-nav-num">'+String(i+1).padStart(2,"0")+'</span><span><b>'+esc(label)+'</b><small>'+esc(desc)+'</small></span></button>').join("")}
+            ${NAV.map(([id,label,desc],i)=>'<button class="m-nav-item" data-m-page="'+id+'"><span class="m-nav-num">'+String(i+1).padStart(2,"0")+'</span><span><b>'+esc(label)+'</b><small>'+esc(desc)+'</small></span></button>').join("")}
           </nav>
           <main class="m-main">
             <div class="m-page-heading"><div><span class="m-kicker">ESPACE DE TRAVAIL</span><h1 id="m-title">Tableau de bord</h1></div><span class="m-live">DONNÉES BACKEND</span></div>
@@ -77,7 +77,7 @@
           </main>
         </div>
         <nav class="m-mobile-tabs" aria-label="Navigation rapide">
-          <button data-page="dashboard">⌂<small>Accueil</small></button><button data-page="radar">◎<small>Radar</small></button><button data-page="predictions">✦<small>Conan</small></button><button data-page="history">◷<small>Historique</small></button><button data-page="settings">⚙<small>Réglages</small></button>
+          <button data-m-page="dashboard">⌂<small>Accueil</small></button><button data-m-page="radar">◎<small>Radar</small></button><button data-m-page="predictions">✦<small>Conan</small></button><button data-m-page="history">◷<small>Historique</small></button><button data-m-page="settings">⚙<small>Réglages</small></button>
         </nav>
       </div>`;
     styles();health();
@@ -150,7 +150,7 @@
     handleAssetResult(box,results);
   }
   document.addEventListener("click",e=>{
-    const nav=e.target.closest("[data-page]");if(nav){setPage(nav.dataset.page);return;}
+    const nav=e.target.closest("[data-m-page]");if(nav){setPage(nav.dataset.page);return;}
     const act=e.target.closest("[data-action]");if(act?.dataset.action==="refresh")load();if(act?.dataset.action==="home")setPage("dashboard");
   });
   document.addEventListener("submit",e=>{
