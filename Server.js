@@ -5379,7 +5379,7 @@ function calculateRadarInvestmentEvaluation(body) {
   const supplied = body.criteria && typeof body.criteria === "object" && !Array.isArray(body.criteria) ? body.criteria : {};
   const riskFlags = Array.isArray(body.risk_flags) ? body.risk_flags.map(item => safeString(item, 300)).filter(Boolean).slice(0, 50) : [];
   const criticalRiskFlags = new Set(["is_honeypot", "honeypot_confirmed", "cannot_sell", "cannot_sell_all", "confirmed_scam", "confirmed_rug_pull", "malicious_contract"]);
-  const criticalRiskFromFlags = riskFlags.some(flag => criticalRiskFlags.has(flag.toLowerCase().replace(/[\s-]+/g, "_")));
+  const criticalRiskFromFlags = riskFlags.some(flag => criticalRiskFlags.has(flag.toLowerCase().replace(/[\\s-]+/g, "_")));
   const criticalRisk = body.critical_risk === true || safeString(body.risk_level || "", 40).toLowerCase() === "critical" || criticalRiskFromFlags;
   const criteria = {};
   const evidence = {};
@@ -7667,8 +7667,8 @@ handleProtectedRoutes = async function(request,env,ctx,route){
 };
 
 
-// Corrected final validator declaration; later function declaration takes precedence
-// while preserving every previously committed line (append-only chapter history).
+// Final corrected validator declaration. This is appended so every previously
+// committed application and incubator line remains byte-for-byte unchanged.
 function validateConanOwnedCodeSource(source){
   const code=String(source??"");
   const issues=[];
