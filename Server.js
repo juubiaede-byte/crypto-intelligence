@@ -100,9 +100,9 @@ const ARCHIVE_TABLES = [
   "ci_radar_onchain_liquidity_assessments",
   "ci_radar_onchain_pool_history",
   "ci_tasks",
-  "ci_audit",
-  "ci_investment_evaluations",
-  "ci_investment_decisions"
+  "ci_audit"
+  ,"ci_investment_evaluations"
+  ,"ci_investment_decisions"
 ];
 
 const ARCHIVE_PREFIX = "conan/backups/";
