@@ -6746,13 +6746,14 @@ async function evaluateConanPredictionCycle(db,cycle){
   const valid=(rows.results||[]).filter(item=>item.outcome_status==="evaluated"),correct=valid.filter(item=>Number(item.direction_correct)===1).length;
   const assetCount=await db.prepare("SELECT COUNT(*) AS count FROM ci_conan_prediction_assets WHERE cycle_id=?").bind(cycle.cycle_id).first();
   const predictionCount=await db.prepare("SELECT COUNT(*) AS count FROM ci_conan_predictions WHERE cycle_id=?").bind(cycle.cycle_id).first();
-  const summary={selected_assets:Number(assetCount?.count||0),locked_predictions:Number(predictionCount?.count||0),assets_without_locked_prediction:Math.max(0,Number(assetCount?.count||0)-Number(predictionCount?.count||0)),evaluated_predictions:valid.length,unverifiable_predictions:(rows.results||[]).filter(item=>item.outcome_status==="unverifiable").length,direction_correct:correct,direction_accuracy_percent:valid.length?correct/valid.length*100:null,formal_conan_score:"Calculé selon la pondération officielle au chapitre 9; non anticipé ici."};
+  const conanScore=await calculateAndPersistConanScore(db,cycle);
+  const summary={selected_assets:Number(assetCount?.count||0),locked_predictions:Number(predictionCount?.count||0),assets_without_locked_prediction:Math.max(0,Number(assetCount?.count||0)-Number(predictionCount?.count||0)),evaluated_predictions:valid.length,unverifiable_predictions:(rows.results||[]).filter(item=>item.outcome_status==="unverifiable").length,direction_correct:correct,direction_accuracy_percent:valid.length?correct/valid.length*100:null,conan_score:conanScore.score_total,conan_score_status:conanScore.score_status,conan_score_components:conanScore.components||null,conan_score_methodology:CONAN_SCORE_METHODOLOGY};
   const timestamp=nowISO();
   await db.prepare("INSERT INTO ci_conan_learning_history (learning_id,cycle_id,learning_type,summary,evidence_json,created_at) VALUES (?,?,?,?,?,?)").bind(
     cryptoRandomId(),cycle.cycle_id,"cycle_evaluation","Évaluation du cycle de 15 jours : résultats, erreurs, cibles touchées et cibles maintenues.",JSON.stringify(summary),timestamp
   ).run();
   await db.prepare("UPDATE ci_conan_prediction_cycles SET status='completed',current_day=15,updated_at=?,completed_at=? WHERE cycle_id=?").bind(timestamp,timestamp,cycle.cycle_id).run();
-  await audit(db,"conan_prediction_cycle_completed","Cycle "+cycle.cycle_id+" évalué : "+valid.length+" prévisions vérifiables, "+correct+" directions correctes.");
+  await audit(db,"conan_prediction_cycle_completed","Cycle "+cycle.cycle_id+" évalué : "+valid.length+" prévisions vérifiables, "+correct+" directions correctes; score Conan "+(conanScore.score_total===null?"non calculable":conanScore.score_total+"/100")+".");
   return {status:"completed",cycle_id:cycle.cycle_id,summary,evaluated};
 }
 
