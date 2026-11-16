@@ -1337,6 +1337,372 @@ async function previewDatabaseArchive(db, env, requestedKey) {
   };
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* RESTAURATION RÉELLE CONTRÔLÉE — INSERTIONS UNIQUEMENT                       */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * La restauration exige une confirmation distincte de l'utilisateur.
+ * Elle ne met jamais à jour ni ne supprime une ligne existante.
+ * D1 batch exécute l'ensemble des insertions dans une transaction atomique.
+ */
+async function restoreDatabaseArchive(
+  db,
+  env,
+  requestedKey,
+  expectedChecksum,
+  confirmation
+) {
+  const confirmationPhrase = "RESTAURER CETTE ARCHIVE";
+
+  if (confirmation !== confirmationPhrase) {
+    throw new Error(
+      "Confirmation refusée. La phrase exacte requise est : " +
+      confirmationPhrase
+    );
+  }
+
+  const loaded = await loadArchiveForPreview(env, requestedKey);
+
+  if (
+    typeof expectedChecksum !== "string" ||
+    !constantTimeEqual(
+      expectedChecksum,
+      loaded.verification.expected_checksum
+    )
+  ) {
+    throw new Error(
+      "Le checksum fourni ne correspond pas à l'archive vérifiée."
+    );
+  }
+
+  const initialPreview = await previewDatabaseArchive(
+    db,
+    env,
+    loaded.snapshotKey
+  );
+
+  const previewIsSafe = (preview) =>
+    preview.compatibility?.compatible === true &&
+    Number(preview.totals?.conflict_rows) === 0 &&
+    Number(preview.totals?.invalid_rows) === 0 &&
+    Number(preview.totals?.unidentifiable_rows) === 0 &&
+    Number(preview.totals?.missing_tables) === 0 &&
+    Number(preview.totals?.incompatible_tables) === 0;
+
+  if (!previewIsSafe(initialPreview)) {
+    throw new Error(
+      "Restauration bloquée : la prévisualisation détecte une incompatibilité, " +
+      "un conflit ou une ligne invalide. Aucune donnée n'a été restaurée."
+    );
+  }
+
+  const safetyBackup = await createDatabaseArchive(db, env);
+
+  try {
+    const freshPreview = await previewDatabaseArchive(
+      db,
+      env,
+      loaded.snapshotKey
+    );
+
+    if (!previewIsSafe(freshPreview)) {
+      throw new Error(
+        "Restauration annulée : l'état D1 a changé depuis le premier contrôle. " +
+        "Aucune insertion de restauration n'a été lancée."
+      );
+    }
+
+    const archive = loaded.archive;
+    const pendingByTable = new Map();
+    const columnsByTable = new Map();
+
+    for (const tableReport of freshPreview.tables) {
+      const tableName = tableReport.table;
+      const archivedTable = archive.tables[tableName];
+      const columns = archivedTable.columns;
+      const primaryKeys = tableReport.primary_key;
+
+      if (!Array.isArray(primaryKeys) || !primaryKeys.length) {
+        throw new Error(
+          "Restauration bloquée : clé primaire absente pour " + tableName + "."
+        );
+      }
+
+      const tableSQL = quoteSQLIdentifier(tableName);
+      const whereSQL = primaryKeys
+        .map((column) => quoteSQLIdentifier(column) + " = ?")
+        .join(" AND ");
+      const selectSQL =
+        "SELECT * FROM " + tableSQL + " WHERE " + whereSQL + " LIMIT 1";
+
+      const pendingRows = [];
+
+      for (const row of archivedTable.rows) {
+        const keyValues = primaryKeys.map((column) => row[column]);
+
+        if (keyValues.some((value) => value === undefined || value === null)) {
+          throw new Error(
+            "Restauration bloquée : clé primaire invalide dans " + tableName + "."
+          );
+        }
+
+        const existing = await db.prepare(selectSQL)
+          .bind(...keyValues)
+          .first();
+
+        if (!existing) {
+          pendingRows.push(row);
+          continue;
+        }
+
+        const identical = columns.every((column) =>
+          archiveValuesEqual(row[column], existing[column])
+        );
+
+        if (!identical) {
+          throw new Error(
+            "Restauration bloquée : une ligne existante a changé dans " +
+            tableName + ". Aucune ligne ne sera écrasée."
+          );
+        }
+      }
+
+      pendingByTable.set(tableName, pendingRows);
+      columnsByTable.set(tableName, columns);
+    }
+
+    const pendingTableNames = Array.from(pendingByTable.keys())
+      .filter((tableName) => pendingByTable.get(tableName).length > 0);
+    const pendingSet = new Set(pendingTableNames);
+    const dependencies = new Map();
+
+    for (const tableName of pendingTableNames) {
+      const foreignKeys = await db.prepare(
+        "PRAGMA foreign_key_list(" + quoteSQLIdentifier(tableName) + ")"
+      ).all();
+
+      const parents = new Set();
+
+      for (const foreignKey of foreignKeys.results || []) {
+        if (
+          typeof foreignKey.table === "string" &&
+          pendingSet.has(foreignKey.table)
+        ) {
+          parents.add(foreignKey.table);
+        }
+      }
+
+      dependencies.set(tableName, parents);
+    }
+
+    const orderedTables = [];
+    const remaining = new Set(pendingTableNames);
+
+    while (remaining.size) {
+      const ready = pendingTableNames.filter((tableName) =>
+        remaining.has(tableName) &&
+        Array.from(dependencies.get(tableName) || [])
+          .every((parent) => !remaining.has(parent))
+      );
+
+      if (!ready.length) {
+        throw new Error(
+          "Restauration bloquée : dépendance circulaire entre clés étrangères. " +
+          "Aucune insertion n'a été exécutée."
+        );
+      }
+
+      for (const tableName of ready) {
+        orderedTables.push(tableName);
+        remaining.delete(tableName);
+      }
+    }
+
+    const statements = [];
+    let plannedInsertRows = 0;
+    const maximumBindingsPerStatement = 900;
+    const maximumBatchStatements = 500;
+
+    for (const tableName of orderedTables) {
+      const columns = columnsByTable.get(tableName);
+      const rows = pendingByTable.get(tableName);
+
+      if (!columns.length) {
+        throw new Error("Aucune colonne restaurable dans " + tableName + ".");
+      }
+
+      if (columns.length > maximumBindingsPerStatement) {
+        throw new Error(
+          "Restauration bloquée : trop de colonnes dans " + tableName + "."
+        );
+      }
+
+      const tableSQL = quoteSQLIdentifier(tableName);
+      const columnsSQL = columns
+        .map((column) => quoteSQLIdentifier(column))
+        .join(", ");
+      const rowsPerStatement = Math.max(
+        1,
+        Math.floor(maximumBindingsPerStatement / columns.length)
+      );
+
+      for (let offset = 0; offset < rows.length; offset += rowsPerStatement) {
+        const chunk = rows.slice(offset, offset + rowsPerStatement);
+        const bindings = [];
+
+        const valuesSQL = chunk.map((row) => {
+          const placeholders = columns.map((column) => {
+            const value = row[column];
+
+            if (
+              value !== null &&
+              typeof value !== "string" &&
+              typeof value !== "number" &&
+              typeof value !== "boolean"
+            ) {
+              throw new Error(
+                "Restauration bloquée : valeur non scalaire non prise en charge " +
+                "dans " + tableName + "." + column + "."
+              );
+            }
+
+            if (typeof value === "number" && !Number.isFinite(value)) {
+              throw new Error(
+                "Restauration bloquée : valeur numérique invalide dans " +
+                tableName + "." + column + "."
+              );
+            }
+
+            bindings.push(typeof value === "boolean" ? Number(value) : value);
+            return "?";
+          });
+
+          return "(" + placeholders.join(", ") + ")";
+        });
+
+        statements.push(
+          db.prepare(
+            "INSERT INTO " + tableSQL + " (" + columnsSQL + ") VALUES " +
+            valuesSQL.join(", ")
+          ).bind(...bindings)
+        );
+
+        plannedInsertRows += chunk.length;
+      }
+    }
+
+    if (statements.length + 1 > maximumBatchStatements) {
+      throw new Error(
+        "Restauration bloquée : le nombre d'instructions dépasse la limite " +
+        "transactionnelle de sécurité."
+      );
+    }
+
+    statements.push(
+      db.prepare(
+        "INSERT INTO ci_audit (event_type, description, created_at) VALUES (?, ?, ?)"
+      ).bind(
+        "archive_restore_applied",
+        safeString(
+          "Restauration demandée pour " + loaded.snapshotKey +
+          "; " + plannedInsertRows + " ligne(s) à insérer; sauvegarde de sécurité " +
+          safetyBackup.snapshot_key,
+          2000
+        ),
+        nowISO()
+      )
+    );
+
+    await db.batch(statements);
+
+    const postRestorePreview = await previewDatabaseArchive(
+      db,
+      env,
+      loaded.snapshotKey
+    );
+
+    const postRestoreVerified =
+      previewIsSafe(postRestorePreview) &&
+      Number(postRestorePreview.totals?.insertable_rows) === 0 &&
+      Number(postRestorePreview.totals?.conflict_rows) === 0;
+
+    await audit(
+      db,
+      postRestoreVerified
+        ? "archive_restore_verified"
+        : "archive_restore_postcheck_failed",
+      "Contrôle après restauration de " + loaded.snapshotKey + " : " +
+      (postRestoreVerified ? "validé" : "échec") +
+      "; " + plannedInsertRows + " ligne(s) insérée(s); sauvegarde de sécurité " +
+      safetyBackup.snapshot_key
+    );
+
+    return {
+      success: postRestoreVerified,
+      application: APP_NAME,
+      operation: "archive_restore",
+      restoration_executed: true,
+      database_modified: plannedInsertRows > 0,
+      inserted_rows: plannedInsertRows,
+      post_restore_verified: postRestoreVerified,
+      archive: {
+        snapshot_key: loaded.snapshotKey,
+        checksum: loaded.verification.expected_checksum
+      },
+      safety_backup: {
+        snapshot_key: safetyBackup.snapshot_key,
+        checksum: safetyBackup.checksum,
+        created_at: safetyBackup.created_at
+      },
+      safety: {
+        existing_rows_overwritten: false,
+        rows_deleted: false,
+        tables_created: false,
+        original_archive_preserved: true,
+        transaction_used: true
+      },
+      post_restore_totals: postRestorePreview.totals,
+      message: postRestoreVerified
+        ? "Restauration terminée et vérifiée. Aucune ligne existante n'a été écrasée."
+        : "Les insertions transactionnelles ont été exécutées, mais le contrôle final nécessite une vérification."
+    };
+  } catch (error) {
+    await audit(
+      db,
+      "archive_restore_failed",
+      "Restauration de " + loaded.snapshotKey + " interrompue : " +
+      safeString(error.message, 1000) +
+      "; sauvegarde de sécurité " + safetyBackup.snapshot_key
+    );
+
+    return {
+      success: false,
+      application: APP_NAME,
+      operation: "archive_restore",
+      restoration_executed: false,
+      database_modified: false,
+      archive: {
+        snapshot_key: loaded.snapshotKey,
+        checksum: loaded.verification.expected_checksum
+      },
+      safety_backup: {
+        snapshot_key: safetyBackup.snapshot_key,
+        checksum: safetyBackup.checksum,
+        created_at: safetyBackup.created_at
+      },
+      message: safeString(error.message, 1000),
+      safety: {
+        existing_rows_overwritten: false,
+        rows_deleted: false,
+        tables_created: false,
+        original_archive_preserved: true
+      }
+    };
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* FOURNISSEURS DE DONNÉES CRYPTO                                             */
 /* -------------------------------------------------------------------------- */
@@ -2275,6 +2641,45 @@ async function handleProtectedRoutes(request, env, ctx, route) {
       success: true,
       preview: result
     });
+  }
+
+
+  if (method === "GET" && path === "/api/archives/restore/status") {
+    return json({
+      success: true,
+      restoration: {
+        implemented: true,
+        enabled: true,
+        requires_explicit_confirmation: true,
+        confirmation_phrase: "RESTAURER CETTE ARCHIVE",
+        safety_backup_required: true,
+        inserts_only: true,
+        updates: false,
+        deletions: false,
+        transactional_batch: true,
+        post_restore_verification: true
+      }
+    });
+  }
+
+  if (method === "POST" && path === "/api/archives/restore") {
+    const body = await readBody(request, 20000);
+
+    if (!body.snapshot_key || !body.checksum || !body.confirmation) {
+      return errorResponse(
+        "snapshot_key, checksum et confirmation explicite sont requis."
+      );
+    }
+
+    const result = await restoreDatabaseArchive(
+      db,
+      env,
+      body.snapshot_key,
+      body.checksum,
+      body.confirmation
+    );
+
+    return json(result, result.success ? 200 : 409);
   }
 
   /* ------------------------------ ACTIFS --------------------------------- */
