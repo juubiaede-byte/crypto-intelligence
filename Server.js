@@ -2421,6 +2421,7 @@ async function verifyRadarOnchainPool(db, item, pair) {
       radarRpcCall(rpc.url, "eth_call", [{ to: pairAddress, data: "0x0dfe1681" }, "latest"]),
       radarRpcCall(rpc.url, "eth_call", [{ to: pairAddress, data: "0xd21220a7" }, "latest"])
     ]);
+    await recordProviderUsage(db, "publicnode_rpc", true, 200);
     const reserve0Word = radarHexWord(results[0], 0);
     const reserve1Word = radarHexWord(results[0], 1);
     const timestampWord = radarHexWord(results[0], 2);
