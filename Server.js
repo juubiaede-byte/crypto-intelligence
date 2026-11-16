@@ -5379,7 +5379,7 @@ function calculateRadarInvestmentEvaluation(body) {
   const supplied = body.criteria && typeof body.criteria === "object" && !Array.isArray(body.criteria) ? body.criteria : {};
   const riskFlags = Array.isArray(body.risk_flags) ? body.risk_flags.map(item => safeString(item, 300)).filter(Boolean).slice(0, 50) : [];
   const criticalRiskFlags = new Set(["is_honeypot", "honeypot_confirmed", "cannot_sell", "cannot_sell_all", "confirmed_scam", "confirmed_rug_pull", "malicious_contract"]);
-  const criticalRiskFromFlags = riskFlags.some(flag => criticalRiskFlags.has(flag.toLowerCase().replace(/[\\s-]+/g, "_")));
+  const criticalRiskFromFlags = riskFlags.some(flag => criticalRiskFlags.has(flag.toLowerCase().replace(/[\s-]+/g, "_")));
   const criticalRisk = body.critical_risk === true || safeString(body.risk_level || "", 40).toLowerCase() === "critical" || criticalRiskFromFlags;
   const criteria = {};
   const evidence = {};
@@ -7527,15 +7527,15 @@ function validateConanOwnedCodeSource(source){
   if(!code.trim())issues.push("Le code ne peut pas être vide.");
   if(code.length>30000)issues.push("La taille maximale d'une révision est de 30 000 caractères.");
   const forbidden=[
-    {pattern:/\\beval\\s*\\(/i,label:"eval"},
-    {pattern:/\\bnew\\s+Function\\s*\\(/i,label:"Function constructor"},
-    {pattern:/\\bimport\\s*\\(/i,label:"dynamic import"},
-    {pattern:/\\bfetch\\s*\\(/i,label:"network fetch"},
-    {pattern:/\\bglobalThis\\b/i,label:"globalThis"},
-    {pattern:/\\bprocess\\b/i,label:"process"},
-    {pattern:/\\brequire\\s*\\(/i,label:"require"},
-    {pattern:/\\bDeno\\b/i,label:"Deno"},
-    {pattern:/\\bWebAssembly\\b/i,label:"WebAssembly"}
+    {pattern:/\beval\s*\(/i,label:"eval"},
+    {pattern:/\bnew\s+Function\s*\(/i,label:"Function constructor"},
+    {pattern:/\bimport\s*\(/i,label:"dynamic import"},
+    {pattern:/\bfetch\s*\(/i,label:"network fetch"},
+    {pattern:/\bglobalThis\b/i,label:"globalThis"},
+    {pattern:/\bprocess\b/i,label:"process"},
+    {pattern:/\brequire\s*\(/i,label:"require"},
+    {pattern:/\bDeno\b/i,label:"Deno"},
+    {pattern:/\bWebAssembly\b/i,label:"WebAssembly"}
   ];
   for(const item of forbidden)if(item.pattern.test(code))issues.push("API non autorisée dans l'espace de code isolé : "+item.label+".");
   return {valid:issues.length===0,issues,source_characters:code.length,execution_status:"not_executable_by_application_worker",note:"Validation statique uniquement; aucune exécution de code arbitraire n'est autorisée."};
