@@ -3238,8 +3238,11 @@ async function runRadarDiscovery(db) {
     { provider: "dexscreener_boosts_top", url: "https://api.dexscreener.com/token-boosts/top/v1" },
     { provider: "geckoterminal_new_pools", url: "https://api.geckoterminal.com/api/v2/networks/new_pools?include=base_token,quote_token,network,dex" }
   ];
-  // Sept réseaux supplémentaires parcourus par rotation pour élargir progressivement
-  // la couverture sans dépasser huit appels GeckoTerminal par cycle (flux global inclus).
+  // Sept réseaux supplémentaires parcourus par rotation.
+  // Le flux global + sept flux réseau garantissent un maximum de huit appels GeckoTerminal par cycle.
+  // Les flux new_pools et trending_pools alternent d'un cycle de cinq minutes à l'autre :
+  // les deux fonctionnalités sont conservées sans doubler les appels réseau.
+  const radarCycle = Math.floor(Date.now() / (5 * 60 * 1000));
   let radarNetworks = ["eth", "bsc", "base", "solana", "arbitrum", "polygon_pos", "optimism"];
   try {
     const networkCatalog = await getGeckoTerminalNetworks(db);
@@ -3247,7 +3250,7 @@ async function runRadarDiscovery(db) {
       (networkCatalog.networks || []).map((item) => safeString(item.id, 80)).filter(Boolean)
     )];
     if (availableNetworks.length) {
-      const rotation = Math.floor(Date.now() / (5 * 60 * 1000)) % availableNetworks.length;
+      const rotation = radarCycle % availableNetworks.length;
       radarNetworks = Array.from({ length: Math.min(7, availableNetworks.length) }, (_, index) =>
         availableNetworks[(rotation + index) % availableNetworks.length]
       );
@@ -3255,21 +3258,18 @@ async function runRadarDiscovery(db) {
   } catch {
     // Le radar conserve les sept réseaux de repli si le catalogue est indisponible.
   }
-  for (const network of radarNetworks) {
+  for (let index = 0; index < radarNetworks.length; index++) {
+    const network = radarNetworks[index];
+    const useTrendingPools = (radarCycle + index) % 2 === 1;
+    const feed = useTrendingPools ? "trending_pools" : "new_pools";
+    const providerPrefix = useTrendingPools
+      ? "geckoterminal_network_trending_pools_"
+      : "geckoterminal_network_new_pools_";
     endpoints.push({
-      provider: "geckoterminal_network_new_pools_" + network,
+      provider: providerPrefix + network,
       url: "https://api.geckoterminal.com/api/v2/networks/" +
-        encodeURIComponent(network) + "/new_pools?include=base_token,quote_token,network,dex"
-    });
-  }
-
-  // Deuxième flux GeckoTerminal sur les mêmes réseaux : pools récemment actifs.
-  // Il complète les nouvelles paires sans déclarer ces pools comme nouvellement créés.
-  for (const network of radarNetworks) {
-    endpoints.push({
-      provider: "geckoterminal_network_trending_pools_" + network,
-      url: "https://api.geckoterminal.com/api/v2/networks/" +
-        encodeURIComponent(network) + "/trending_pools?include=base_token,quote_token,network,dex"
+        encodeURIComponent(network) + "/" + feed +
+        "?include=base_token,quote_token,network,dex"
     });
   }
 
