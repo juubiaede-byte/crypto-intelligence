@@ -3388,11 +3388,12 @@ async function runRadarDiscovery(db) {
   }
 
   let inserted = 0;
+  let discoveredPairs = 0;
   let status = "partial";
   let errorSummary = null;
   try {
     inserted = await persistRadarDiscoveries(db, [...unique.values()]);
-    const discoveredPairs = await persistRadarPairs(db, discoveries);
+    discoveredPairs = await persistRadarPairs(db, discoveries);
     const securityVerification = await runRadarVerification(db);
     const contractVerification = await runRadarContractVerification(db);
     sourceResults.discovered_pairs = discoveredPairs;
