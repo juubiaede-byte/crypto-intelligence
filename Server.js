@@ -7698,7 +7698,7 @@ const CONAN_MEMORY_TIERS = ["essential","useful","experimental","archives"];
 
 async function ensureConanMemoryTables(db){
   await db.batch([
-    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_records (
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_memory_records (
       memory_id TEXT PRIMARY KEY,
       memory_scope TEXT NOT NULL,
       tier TEXT NOT NULL,
@@ -7718,19 +7718,19 @@ async function ensureConanMemoryTables(db){
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    )\`),
+    )`),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_memory_scope_tier ON ci_conan_memory_records(memory_scope,tier,status,updated_at DESC)"),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_memory_fingerprint ON ci_conan_memory_records(memory_scope,content_fingerprint)"),
-    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_links (
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_memory_links (
       link_id TEXT PRIMARY KEY,
       from_memory_id TEXT NOT NULL,
       to_memory_id TEXT NOT NULL,
       relation_type TEXT NOT NULL,
       details_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL
-    )\`),
+    )`),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_memory_links_from ON ci_conan_memory_links(from_memory_id,created_at DESC)"),
-    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_recall_log (
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_memory_recall_log (
       recall_id TEXT PRIMARY KEY,
       memory_scope TEXT NOT NULL,
       query_text TEXT NOT NULL,
@@ -7738,8 +7738,8 @@ async function ensureConanMemoryTables(db){
       results_json TEXT NOT NULL DEFAULT '[]',
       methodology TEXT NOT NULL,
       created_at TEXT NOT NULL
-    )\`),
-    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_tier_history (
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_memory_tier_history (
       event_id TEXT PRIMARY KEY,
       memory_id TEXT NOT NULL,
       from_tier TEXT,
@@ -7747,8 +7747,8 @@ async function ensureConanMemoryTables(db){
       reason TEXT NOT NULL,
       evidence_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL
-    )\`),
-    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_personal_memory (
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_personal_memory (
       personal_memory_id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       content TEXT NOT NULL,
@@ -7759,16 +7759,16 @@ async function ensureConanMemoryTables(db){
       content_fingerprint TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    )\`),
+    )`),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_ci_conan_personal_memory_fingerprint ON ci_conan_personal_memory(content_fingerprint)"),
-    db.prepare(\`CREATE TABLE IF NOT EXISTS ci_conan_memory_backups (
+    db.prepare(`CREATE TABLE IF NOT EXISTS ci_conan_memory_backups (
       backup_id TEXT PRIMARY KEY,
       memory_scope TEXT NOT NULL,
       snapshot_json TEXT NOT NULL,
       checksum TEXT NOT NULL,
       verified INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
-    )\`)
+    )`)
   ]);
   for(const table of ["ci_conan_memory_records","ci_conan_memory_links","ci_conan_memory_recall_log","ci_conan_memory_tier_history","ci_conan_personal_memory","ci_conan_memory_backups"]){
     if(!ARCHIVE_TABLES.includes(table))ARCHIVE_TABLES.push(table);
