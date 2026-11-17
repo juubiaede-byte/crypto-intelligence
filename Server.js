@@ -3202,7 +3202,6 @@ async function runRadarVerification(db) {
     if (goPlusResult.outcome !== 'unsupported' && goPlusResult.outcome !== 'unknown') {
       goPlusResult.outcome = goPlusSignals.length ? 'risk_signals' : 'no_flags_returned';
       goPlusResult.evidence = { ...(goPlusResult.evidence || {}), interpreted_risk_signals: goPlusSignals, risk_assessment_version: 2 };
-      goPlusResult.evidence.liquidity_assessment = goPlusLiquidityAssessment(goPlusResult.evidence.token_security);
       goPlusResult.evidence.liquidity_assessment = goPlusLiquidityAssessmentV2(goPlusResult.evidence.token_security);
     }
     await persistRadarLpHistory(db, goPlusResult);
@@ -3212,7 +3211,6 @@ async function runRadarVerification(db) {
     marketResult.execution_impact_estimates = await estimateRadarPoolExecutionImpact(db, item.discovery_key);
     marketResult.pool_metrics.asset_links_saved = await persistRadarPoolMetricAssetLinks(db, item.discovery_key, marketResult);
     marketResult.pool_metric_history = await persistRadarPoolMetricHistory(db, item.discovery_key, marketResult);
-    marketResult.onchain_pool_checks = await runRadarOnchainPoolChecks(db, item, marketResult);
     marketResult.onchain_pool_checks = await runRadarOnchainPoolChecks(db, item, marketResult);
     await persistRadarSecurityCheck(db, goPlusResult);
     await db.prepare(`INSERT INTO ci_radar_verifications (discovery_key, provider, outcome, simulation_success, risk, checked_at, next_check_at, evidence_json, error_message) VALUES (?, 'Honeypot.is', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(discovery_key) DO UPDATE SET provider = excluded.provider, outcome = excluded.outcome, simulation_success = excluded.simulation_success, risk = excluded.risk, checked_at = excluded.checked_at, next_check_at = excluded.next_check_at, evidence_json = excluded.evidence_json, error_message = excluded.error_message`).bind(result.discovery_key, result.outcome, result.simulation_success, result.risk, result.checked_at, result.next_check_at, JSON.stringify(result.evidence), result.error_message).run();
@@ -3424,7 +3422,6 @@ async function runRadarDiscovery(db) {
   return {
     scan_id: scanId, status, newly_discovered_contracts: inserted,
     newly_discovered_pairs: discoveredPairs,
-    newly_discovered_pairs: sourceResults.discovered_pairs || 0,
     candidates_received: discoveries.length, sources: sourceResults,
     quarantine: true, scanned_at: startedAt, completed_at: nowISO()
   };
